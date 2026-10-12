@@ -27,8 +27,8 @@ Maintain and improve a **small, reliable, resumable** Python pipeline that impor
 
 ## Non-negotiable invariants
 
-- **Do not invent recipe content.** Extract only what is supported by the image/PDF. Preserve original quantities, units, oven temperatures, durations, ordering, ingredient wording, and instructions.
-- **Distinguish source omissions from extraction failures.** A scan can be perfectly legible yet omit required information; a stronger model cannot recover information that is absent from the source. Never use model escalation as permission to fabricate missing steps or quantities.
+- **Never represent inferred content as source transcription.** Extract only what is supported by the image/PDF into authoritative recipe fields. Preserve original quantities, units, oven temperatures, durations, ordering, ingredient wording, and instructions. Gemini **may separately propose clearly labeled, unverified completions** for information absent from the source, but those suggestions must never be auto-imported or applied without explicit human approval/editing.
+- **Distinguish source omissions from extraction failures.** A scan can be perfectly legible yet omit required information; a stronger model cannot recover source evidence that was never present. A model may offer a speculative completion *in a separate review proposal*, not as an extracted fact. Never use escalation to fabricate authoritative steps or quantities.
 - **Never silently duplicate imported recipes.** Preserve existing state files and identifiers. A retry must not re-import already successful entries, including when only one recipe within a multi-recipe image failed.
 - **Do not treat an ambiguous Mealie response as a definite failure.** On network timeout or uncertain server outcome, flag for reconciliation instead of blindly reposting.
 - **Do not discard original source files or cached extractions.** Preserve useful prior output when retrying, and keep provenance (source path/hash, model, extraction attempt, status) inspectable.
@@ -40,10 +40,10 @@ Maintain and improve a **small, reliable, resumable** Python pipeline that impor
 ### 1. Extraction diagnostics and quality control
 
 - Record, **per recipe**, what is `missing_from_source`, `unreadable`, `ambiguous`, or `not_extracted` (the latter means visible evidence appears present but parsing failed).
-- Provide concise human-readable details and location/evidence where possible, plus suggested action. Never guess missing values.
+- Provide concise human-readable details and location/evidence where possible, plus suggested action. **For genuinely missing content, ask Gemini to suggest one or more plausible completions as explicit unverified proposals**, with affected field, proposed value, concise rationale, uncertainty, and `pending` review status. Never merge a proposal into the authoritative recipe or Mealie payload before a user approves or edits it.
 - Separate **critical** data (e.g., missing ingredient quantities when needed, missing essential direction/time/temperature) from **optional** metadata (e.g., yield absent from the original). Optional fields must not automatically make a recipe incomplete.
-- Add a `NEEDS_REVIEW` workflow and an actionable `needs_review.csv` while preserving existing status meanings and reports.
-- A recipe may have both ingredients and instructions and still need review because crucial details are missing or ambiguous.
+- Add a `NEEDS_REVIEW` workflow and an actionable `needs_review.csv` with source, diagnosis, suggested completion, confidence/uncertainty, and review disposition (`pending`, `approved`, `edited`, `rejected`), while preserving existing status meanings and reports.
+- A recipe may have both ingredients and instructions and still need review because crucial details are missing or ambiguous. **Only a recorded human approval/edit may promote a suggested value to recipe data**; store the original suggestion and approved value separately for audit. Any update to an already-imported recipe must be a separate explicit operation.
 
 ### 2. Safe retries and model escalation
 
@@ -77,23 +77,23 @@ Write automated tests **before** behavior changes when practical, and verify loc
 
 - One image -> one recipe; one image -> multiple recipes.
 - A multi-recipe image where one recipe was imported and another needs retry.
-- A legible scan that genuinely lacks an ingredient quantity or instruction: report missing source data without inventing it.
-- Unreadable/cropped source; optional metadata absent; critical detail ambiguous.
+- A legible scan that genuinely lacks an ingredient quantity or instruction: report missing source data, optionally propose a plausible **unverified** completion separately, and verify no suggestion enters the import payload until a human approves or edits it.
+- Unreadable/cropped source; optional metadata absent; critical detail ambiguous; suggestions with confidence/uncertainty and review dispositions (`pending`, `approved`, `edited`, `rejected`).
 - Primary model failure -> eligible fallback; quality escalation; all models quota-exhausted; transient/backoff behavior; restart and local counters.
 - Cached extraction re-use, intentional cache re-extraction, and backward compatibility with existing state/history.
 - Mealie create succeeds, fails definitively, or has an ambiguous response; ensure no blind duplicate creation.
 - Tag exists, tag missing, tag API failure after recipe creation, tag backfill, and preservation of pre-existing tags.
-- Secret-redaction and user-facing `needs_review.csv` / run-report correctness.
+- Secret-redaction and user-facing `needs_review.csv` / run-report correctness; stable identity and audit trails linking each proposal, approval/edit, source, and recipe.
 
 Run `python -m pytest` if pytest is configured; otherwise use the repository's actual test command. Run `python -m compileall -q .` or a targeted syntax check and verify CLI `--help`. Report commands run, passing/failing counts, and untested live behavior. Never claim real Mealie/Gemini integration is verified solely from mocks.
 
 ## Implementation sequence
 
 1. Read current code, discover installed skills, establish a passing baseline, and write a concise risk-aware implementation plan.
-2. Add structured extraction diagnostics and review reporting first.
+2. Add structured extraction diagnostics, unverified suggestions for missing content, explicit approve/edit/reject review workflow, and review reporting first.
 3. Implement safe targeted retries and candidate reconciliation.
 4. Implement configurable model routing, throttling, and quota-aware fallback.
 5. Implement batch tagging and reconciliation with Mealie cookbooks.
 6. Add/update tests and usage documentation; provide a minimal dry-run/smoke-test procedure.
 
-**Definition of done:** On a repeat run against the existing first-batch state, previously imported recipes are not recreated; incomplete cases are explained; eligible retries use configured models responsibly; multi-recipe files stay correctly matched; and newly imported recipes receive the selected batch tag with recoverable partial failures.
+**Definition of done:** On a repeat run against the existing first-batch state, previously imported recipes are not recreated; incomplete cases are explained and may include clearly labeled proposals for human approval/editing; *pending proposals never modify Mealie*; eligible retries use configured models responsibly; multi-recipe files stay correctly matched; and newly imported recipes receive the selected batch tag with recoverable partial failures.
