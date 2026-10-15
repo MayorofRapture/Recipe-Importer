@@ -20,12 +20,13 @@ class StreamlitReviewTests(unittest.TestCase):
                 "RECIPE_IMPORTER_SOURCE_DIR": str(Path(tmp, "sources")),
             }, clear=False):
                 app = AppTest.from_file(str(APP_PATH)).run(timeout=10)
-                app.selectbox[1].set_value("All records").run(timeout=10)
+                app.segmented_control[0].set_value("All records").run(timeout=10)
 
         self.assertFalse(app.exception)
         self.assertEqual(app.title[0].value, "Review recipes")
-        self.assertIn("Fried Rice", app.selectbox[0].options)
-        self.assertIn("Imported Recipe", app.selectbox[0].options)
+        recipe_selector = next(item for item in app.selectbox if item.label == "Recipe")
+        self.assertIn("Fried Rice", recipe_selector.options)
+        self.assertIn("Imported Recipe", recipe_selector.options)
 
     def test_review_page_exposes_safe_draft_action(self):
         with tempfile.TemporaryDirectory() as tmp:

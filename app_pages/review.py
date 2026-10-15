@@ -22,26 +22,7 @@ def main() -> None:
         st.info("No extracted recipes are available yet. Uploading and extraction will be added in a later milestone.")
         return
 
-    with st.sidebar:
-        st.subheader("Review queue")
-        queue = st.selectbox("Show", ["Needs action", "All unresolved", "All records"], key="review_queue")
-        search = st.text_input("Find a recipe", placeholder="Search by recipe name")
-        batch = st.selectbox("Batch", ["All batches", *sorted({view.source_hash for view in views})], key="review_batch")
-        counts = {
-            "Needs attention": sum(view.status == "Needs attention" for view in views),
-            "Ready to review": sum(view.status == "Ready to review" for view in views),
-            "Ready to import": sum(view.status == "Ready to import" for view in views),
-            "Imported": sum(view.status == "Imported" for view in views),
-        }
-        st.caption(" · ".join(f"{label}: {value}" for label, value in counts.items()))
-
-    candidates = views if queue == "All records" else [view for view in views if not view.protected]
-    if queue == "Needs action":
-        candidates = [view for view in candidates if view.status in {"Needs attention", "Ready to review", "Import failed"}]
-    if batch != "All batches":
-        candidates = [view for view in candidates if view.source_hash == batch]
-    if search.strip():
-        candidates = [view for view in candidates if search.casefold() in view.candidate.name.casefold()]
+    candidates = _render_queue(views)
 
     if not candidates:
         st.success("This queue is clear.")
@@ -52,18 +33,21 @@ def main() -> None:
     selected_id = st.session_state.get("review_selection")
     if selected_id not in option_ids:
         selected_id = option_ids[0]
+        st.session_state.review_selection = selected_id
     selected_id = st.selectbox(
         "Recipe", option_ids, index=option_ids.index(selected_id),
         format_func=lambda value: next(view.candidate.name for view in candidates if view.candidate_id == value),
         key="review_selection",
     )
+    st.session_state.review_queue_ids = option_ids
+    position = option_ids.index(selected_id) + 1
     view = next(view for view in candidates if view.candidate_id == selected_id)
     buffer = buffer_for(view)
     sync_buffer(view, buffer)
 
     st.divider()
     st.subheader(view.candidate.name or "Untitled recipe")
-    st.caption(f"Status: {view.status} · Batch: {view.source_hash}")
+    st.caption(f"Recipe {position} of {len(option_ids)} · {view.status}")
     if view.protected:
         st.warning("This recipe is protected because its Mealie outcome needs reconciliation. Editing and approval are disabled here.")
 
@@ -76,6 +60,71 @@ def main() -> None:
     _render_findings(view)
     _render_suggestions(view)
     _render_actions(view, buffer)
+
+
+def _render_queue(views):
+    """Render the compact queue controls below the native top navigation."""
+    with st.container(border=True):
+        st.markdown("#### Review queue")
+        filter_cols = st.columns([1.6, 1.4, 1.4, 1.6], vertical_alignment="bottom")
+        with filter_cols[0]:
+            queue = st.segmented_control(
+                "Show", ["Needs action", "All unresolved", "All records"],
+                default="Needs action", key="review_queue", width="stretch",
+            ) or "Needs action"
+        with filter_cols[1]:
+            search = st.text_input("Find a recipe", placeholder="Search by recipe name", key="review_search")
+        with filter_cols[2]:
+            batch = st.selectbox("Batch", ["All batches", *sorted({view.source_hash for view in views})], key="review_batch")
+        with filter_cols[3]:
+            statuses = ["Any status", "Needs attention", "Ready to review", "Ready to import", "Imported", "Check Mealie", "Import failed"]
+            status = st.selectbox("Status", statuses, key="review_status")
+
+        candidates = views if queue == "All records" else [view for view in views if not view.protected]
+        if queue == "Needs action":
+            candidates = [view for view in candidates if view.status in {"Needs attention", "Ready to review", "Import failed"}]
+        if batch != "All batches":
+            candidates = [view for view in candidates if view.source_hash == batch]
+        if status != "Any status":
+            candidates = [view for view in candidates if view.status == status]
+        if search.strip():
+            candidates = [view for view in candidates if search.casefold() in view.candidate.name.casefold()]
+
+        nav_cols = st.columns([1, 5, 1], vertical_alignment="center")
+        with nav_cols[0]:
+            if st.button(":material/arrow_back: Previous recipe", key="queue_previous", width="stretch"):
+                _move_in_queue(candidates, -1)
+        with nav_cols[1]:
+            if candidates:
+                current_id = st.session_state.get("review_selection")
+                if current_id not in {view.candidate_id for view in candidates}:
+                    current_id = candidates[0].candidate_id
+                current = next(view for view in candidates if view.candidate_id == current_id)
+                st.markdown(f"**{current.candidate.name}** · {current.status}")
+                st.caption(f"Recipe {next(i for i, item in enumerate(candidates, 1) if item.candidate_id == current_id)} of {len(candidates)}")
+        with nav_cols[2]:
+            if st.button(":material/arrow_forward: Next recipe", key="queue_next", width="stretch"):
+                _move_in_queue(candidates, 1)
+
+        counts = {
+            "Needs attention": sum(view.status == "Needs attention" for view in views),
+            "Ready to review": sum(view.status == "Ready to review" for view in views),
+            "Ready to import": sum(view.status == "Ready to import" for view in views),
+            "Imported": sum(view.status == "Imported" for view in views),
+        }
+        st.caption(" · ".join(f"{label}: {value}" for label, value in counts.items()))
+    return candidates
+
+
+def _move_in_queue(candidates, direction: int) -> None:
+    if not candidates:
+        return
+    ids = [view.candidate_id for view in candidates]
+    current = st.session_state.get("review_selection")
+    index = ids.index(current) if current in ids else 0
+    target = max(0, min(len(ids) - 1, index + direction))
+    st.session_state.review_selection = ids[target]
+    st.rerun()
 
 
 def _render_source(view) -> None:
