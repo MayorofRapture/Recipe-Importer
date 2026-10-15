@@ -12,6 +12,7 @@ from quick_edit import parse_ingredients, parse_instructions, to_quick_edit
 from recipe_quality import RecipeCandidate
 from review_store import ReviewStore
 from ui_data import RecipeView, load_catalog
+from ui_review_state import quick_edit_to_structured, structured_to_quick_edit
 
 
 def paths() -> tuple[Path, Path | None]:
@@ -36,7 +37,7 @@ def buffer_for(view: RecipeView) -> dict[str, Any]:
             mode = view.draft.mode
         else:
             ingredients, instructions = to_quick_edit(candidate.ingredients, candidate.instructions)
-            mode = "quick"
+            mode = "structured"
         existing = {
             "raw_ingredients": ingredients,
             "raw_instructions": instructions,
@@ -56,6 +57,28 @@ def sync_buffer(view: RecipeView, buffer: dict[str, Any]) -> None:
     ):
         if key in st.session_state:
             buffer[name] = st.session_state[key]
+
+
+def switch_buffer_mode(buffer: dict[str, Any], mode: str) -> None:
+    """Convert the in-memory buffer before changing the visible editor."""
+    current = str(buffer.get("mode", "structured"))
+    if current == mode:
+        return
+    if mode == "structured":
+        structured = quick_edit_to_structured(
+            str(buffer.get("raw_ingredients", "")), str(buffer.get("raw_instructions", "")),
+        )
+        buffer["structured_ingredients"] = list(structured.ingredients)
+        buffer["structured_instructions"] = list(structured.instructions)
+    else:
+        from ui_review_state import StructuredBuffer
+
+        structured = StructuredBuffer(
+            ingredients=tuple(str(item) for item in buffer.get("structured_ingredients", [])),
+            instructions=tuple(str(item) for item in buffer.get("structured_instructions", [])),
+        )
+        buffer["raw_ingredients"], buffer["raw_instructions"] = structured_to_quick_edit(structured)
+    buffer["mode"] = mode
 
 
 def candidate_from_buffer(view: RecipeView, buffer: dict[str, Any]) -> tuple[RecipeCandidate, list[str]]:
