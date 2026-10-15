@@ -46,9 +46,10 @@ class StreamlitStructuredReviewTests(unittest.TestCase):
             self.assertTrue(any("Keep pending" in button.label for button in app.button))
             self.assertTrue(any("Approve & next" in button.label for button in app.button))
 
-            next(button for button in app.button if "Approve & next" in button.label).click().run(timeout=10)
-            errors = [item.value for item in app.error if hasattr(item, "value")]
-            self.assertTrue(any("critical" in value.casefold() or "proposal" in value.casefold() for value in errors))
+            approve = next(button for button in app.button if "Approve & next" in button.label)
+            self.assertTrue(approve.disabled)
+            captions = [item.value for item in app.caption if hasattr(item, "value")]
+            self.assertTrue(any("critical" in value.casefold() or "proposal" in value.casefold() for value in captions))
 
 
 if __name__ == "__main__":

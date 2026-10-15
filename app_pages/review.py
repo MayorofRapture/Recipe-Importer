@@ -12,7 +12,7 @@ from app_pages.common import (
     switch_buffer_mode,
     sync_buffer,
 )
-from ui_data import next_unresolved, previous_unresolved, render_source_page
+from ui_data import render_source_page
 from ui_review_state import structured_from_candidate
 
 
@@ -28,6 +28,11 @@ def main() -> None:
 
     if not candidates:
         st.success("This queue is clear.")
+        st.page_link("app_pages/import_history.py", label="Open Import & history")
+        return
+
+    if "review_selection" in st.session_state and st.session_state.review_selection is None:
+        st.success("You’ve reached the end of this queue.")
         st.page_link("app_pages/import_history.py", label="Open Import & history")
         return
 
@@ -53,14 +58,17 @@ def main() -> None:
     if view.protected:
         st.warning("This recipe is protected because its Mealie outcome needs reconciliation. Editing and approval are disabled here.")
 
+    _render_actions(view, buffer)
+
     left, right = st.columns([1, 1.2], gap="large")
     with left:
-        _render_source(view)
+        with st.container(height=650, border=True):
+            _render_source(view)
     with right:
-        _render_editor(view, buffer)
+        with st.container(height=650, border=True):
+            _render_editor(view, buffer)
 
     _render_findings(view)
-    _render_actions(view, buffer)
 
 
 def _render_queue(views):
@@ -96,7 +104,10 @@ def _render_queue(views):
             if st.button(":material/arrow_back: Previous recipe", key="queue_previous", width="stretch"):
                 _move_in_queue(candidates, -1)
         with nav_cols[1]:
-            if candidates:
+            if st.session_state.get("review_selection", "__missing__") is None:
+                st.markdown("**End of queue**")
+                st.caption("Use Previous recipe to return to the last item.")
+            elif candidates:
                 current_id = st.session_state.get("review_selection")
                 if current_id not in {view.candidate_id for view in candidates}:
                     current_id = candidates[0].candidate_id
@@ -122,9 +133,17 @@ def _move_in_queue(candidates, direction: int) -> None:
         return
     ids = [view.candidate_id for view in candidates]
     current = st.session_state.get("review_selection")
+    if current is None:
+        if direction < 0:
+            st.session_state.review_selection = ids[-1]
+            st.rerun()
+        return
     index = ids.index(current) if current in ids else 0
-    target = max(0, min(len(ids) - 1, index + direction))
-    st.session_state.review_selection = ids[target]
+    target = index + direction
+    if direction > 0 and target >= len(ids):
+        st.session_state.review_selection = None
+    else:
+        st.session_state.review_selection = ids[max(0, min(len(ids) - 1, target))]
     st.rerun()
 
 
@@ -136,7 +155,12 @@ def _render_source(view) -> None:
     page_number = st.number_input("Source page", min_value=1, max_value=100, value=1, step=1, key=f"page:{view.candidate_id}")
     preview = render_source_page(view.source_path, int(page_number))
     if preview.image is not None:
-        st.image(preview.image, caption=f"Page {preview.page_number} of {preview.page_count}", width="stretch")
+        st.image(
+            preview.image,
+            caption=f"Page {preview.page_number} of {preview.page_count}",
+            width="stretch",
+            alt=f"Recipe source page {preview.page_number} of {preview.page_count}",
+        )
     else:
         st.warning(preview.message or "Source preview unavailable.")
 
@@ -304,26 +328,58 @@ def _render_inline_suggestion(view, suggestion) -> None:
 
 
 def _render_actions(view, buffer) -> None:
-    if view.protected:
-        return
-    st.divider()
     st.markdown("#### Review actions")
+    approval_reason = _approval_block_reason(view, buffer)
     cols = st.columns(5)
-    if cols[0].button("Save draft", key=f"save:{view.candidate_id}"):
+    if cols[0].button("Save draft", key=f"save:{view.candidate_id}", disabled=view.protected, width="stretch"):
         _save(view, buffer, advance=False)
-    if cols[1].button(":material/save_as: Save & next", key=f"save_next:{view.candidate_id}"):
+    if cols[1].button(":material/save_as: Save & next", key=f"save_next:{view.candidate_id}", disabled=view.protected, width="stretch"):
         _save(view, buffer, advance=True)
-    if cols[2].button(":material/check_circle: Approve & next", key=f"approve:{view.candidate_id}"):
+    if cols[2].button(
+        ":material/check_circle: Approve & next",
+        key=f"approve:{view.candidate_id}",
+        disabled=bool(approval_reason),
+        width="stretch",
+    ):
         _approve(view, buffer)
-    if cols[3].button(":material/arrow_back: Previous", key=f"previous:{view.candidate_id}"):
-        previous = previous_unresolved(catalog(), view.candidate_id)
-        if previous:
-            st.session_state.review_selection = previous.candidate_id
-            st.rerun()
-    if cols[4].button(":material/skip_next: Skip", key=f"skip:{view.candidate_id}"):
-        following = next_unresolved(catalog(), view.candidate_id)
-        st.session_state.review_selection = following.candidate_id if following else None
+    if cols[3].button(":material/skip_next: Skip", key=f"skip:{view.candidate_id}", disabled=view.protected, width="stretch"):
+        _advance_queue(1)
+    if cols[4].button(":material/arrow_back: Previous", key=f"previous:{view.candidate_id}", disabled=view.protected, width="stretch"):
+        _advance_queue(-1)
+    if approval_reason:
+        st.caption(approval_reason)
+
+
+def _approval_block_reason(view, buffer) -> str | None:
+    if view.protected:
+        return "Approval is unavailable while this recipe needs Mealie reconciliation."
+    candidate, _ = candidate_from_buffer(view, buffer)
+    if any(item.severity == "critical" for item in candidate.missing_information):
+        return "Resolve the critical source warning before approving this recipe."
+    if any(item.review_status == "pending" for item in candidate.suggestions):
+        return "Resolve each unverified proposal before approving this recipe."
+    return None
+
+
+def _advance_queue(direction: int) -> None:
+    ids = st.session_state.get("review_queue_ids", [])
+    current = st.session_state.get("review_selection")
+    if not ids:
+        st.session_state.review_selection = None
         st.rerun()
+        return
+    if current is None:
+        if direction < 0:
+            st.session_state.review_selection = ids[-1]
+    elif current in ids:
+        target = ids.index(current) + direction
+        if direction > 0 and target >= len(ids):
+            st.session_state.review_selection = None
+        else:
+            st.session_state.review_selection = ids[max(0, min(len(ids) - 1, target))]
+    else:
+        st.session_state.review_selection = ids[0]
+    st.rerun()
 
 
 def _save(view, buffer, advance: bool) -> None:
@@ -334,9 +390,7 @@ def _save(view, buffer, advance: bool) -> None:
         return
     st.success(f"Draft saved (revision {record.revision}).")
     if advance:
-        following = next_unresolved(catalog(), view.candidate_id)
-        st.session_state.review_selection = following.candidate_id if following else None
-        st.rerun()
+        _advance_queue(1)
 
 
 def _approve(view, buffer) -> None:
@@ -356,9 +410,7 @@ def _approve(view, buffer) -> None:
     except Exception as exc:
         st.error(f"Approval was not saved. Your current text remains on screen: {exc}")
         return
-    following = next_unresolved(catalog(), view.candidate_id)
-    st.session_state.review_selection = following.candidate_id if following else None
-    st.rerun()
+    _advance_queue(1)
 
 
 main()
