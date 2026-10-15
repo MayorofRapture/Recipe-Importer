@@ -9,9 +9,11 @@ from app_pages.common import (
     catalog,
     review_store,
     save_draft,
+    switch_buffer_mode,
     sync_buffer,
 )
 from ui_data import next_unresolved, previous_unresolved, render_source_page
+from ui_review_state import structured_from_candidate
 
 
 def main() -> None:
@@ -58,7 +60,6 @@ def main() -> None:
         _render_editor(view, buffer)
 
     _render_findings(view)
-    _render_suggestions(view)
     _render_actions(view, buffer)
 
 
@@ -147,12 +148,13 @@ def _render_editor(view, buffer) -> None:
         st.text_area("Instructions", "\n\n".join(view.candidate.instructions), disabled=True, key=f"protected_s:{view.candidate_id}")
         return
 
-    mode = st.radio(
+    mode = st.segmented_control(
         "Edit mode", ["Quick Edit", "Structured Edit"],
-        index=0 if buffer.get("mode") != "structured" else 1,
-        horizontal=True, key=f"mode:{view.candidate_id}",
-    )
-    buffer["mode"] = "structured" if mode == "Structured Edit" else "quick"
+        default="Structured Edit" if buffer.get("mode") == "structured" else "Quick Edit",
+        key=f"mode:{view.candidate_id}",
+    ) or ("Structured Edit" if buffer.get("mode") == "structured" else "Quick Edit")
+    next_mode = "structured" if mode == "Structured Edit" else "quick"
+    switch_buffer_mode(buffer, next_mode)
     if buffer["mode"] == "quick":
         ingredients = st.text_area("Ingredients (one item per line)", value=buffer["raw_ingredients"], height=180,
                                    key=f"quick_ingredients:{view.candidate_id}")
@@ -163,43 +165,75 @@ def _render_editor(view, buffer) -> None:
         candidate, warnings = candidate_from_buffer(view, buffer)
         st.caption(f"Preview: {len(candidate.ingredients)} ingredients · {len(candidate.instructions)} steps")
         _render_parse_warnings(warnings)
+        _render_suggestions(view)
     else:
         _render_structured_editor(view, buffer)
 
 
 def _render_structured_editor(view, buffer) -> None:
-    buffer.setdefault("structured_ingredients", list(view.candidate.ingredients))
-    buffer.setdefault("structured_instructions", list(view.candidate.instructions))
+    structured = structured_from_candidate(view, buffer)
+    buffer.setdefault("structured_ingredients", list(structured.ingredients))
+    buffer.setdefault("structured_instructions", list(structured.instructions))
+    suggestions = {
+        ("ingredients" if item.field_path.startswith("ingredients") else "instructions", item.index): item
+        for item in structured.suggestions
+        if item.index is not None
+    }
     st.markdown("**Ingredients**")
     for index, value in enumerate(list(buffer["structured_ingredients"])):
-        cols = st.columns([1, 8, 1])
+        cols = st.columns([1, 7, 1, 1, 1], vertical_alignment="bottom")
         with cols[0]:
             st.caption(str(index + 1))
         with cols[1]:
             buffer["structured_ingredients"][index] = st.text_input(
-                "Ingredient", value=value, label_visibility="collapsed", key=f"structured_i:{view.candidate_id}:{index}")
+                f"Ingredient {index + 1}", value=value, key=f"structured_i:{view.candidate_id}:{index}")
         with cols[2]:
-            if st.button("×", key=f"remove_i:{view.candidate_id}:{index}", help="Remove this ingredient"):
+            if st.button(":material/keyboard_arrow_up: Move ingredient up", key=f"up_i:{view.candidate_id}:{index}"):
+                _move_buffer_item(buffer, "structured_ingredients", index, -1)
+            
+        with cols[3]:
+            if st.button(":material/keyboard_arrow_down: Move ingredient down", key=f"down_i:{view.candidate_id}:{index}"):
+                _move_buffer_item(buffer, "structured_ingredients", index, 1)
+        with cols[4]:
+            if st.button(":material/delete: Remove ingredient", key=f"remove_i:{view.candidate_id}:{index}"):
                 buffer["structured_ingredients"].pop(index)
                 st.rerun()
+        if ("ingredients", index) in suggestions:
+            _render_inline_suggestion(view, suggestions[("ingredients", index)])
     if st.button("Add ingredient", key=f"add_i:{view.candidate_id}"):
         buffer["structured_ingredients"].append("")
         st.rerun()
     st.markdown("**Instructions**")
     for index, value in enumerate(list(buffer["structured_instructions"])):
-        cols = st.columns([1, 8, 1])
+        cols = st.columns([1, 7, 1, 1, 1], vertical_alignment="bottom")
         with cols[0]:
             st.caption(str(index + 1))
         with cols[1]:
             buffer["structured_instructions"][index] = st.text_area(
-                "Step", value=value, label_visibility="collapsed", key=f"structured_s:{view.candidate_id}:{index}", height=80)
+                f"Step {index + 1}", value=value, key=f"structured_s:{view.candidate_id}:{index}", height=80)
         with cols[2]:
-            if st.button("×", key=f"remove_s:{view.candidate_id}:{index}", help="Remove this step"):
+            if st.button(":material/keyboard_arrow_up: Move step up", key=f"up_s:{view.candidate_id}:{index}"):
+                _move_buffer_item(buffer, "structured_instructions", index, -1)
+        with cols[3]:
+            if st.button(":material/keyboard_arrow_down: Move step down", key=f"down_s:{view.candidate_id}:{index}"):
+                _move_buffer_item(buffer, "structured_instructions", index, 1)
+        with cols[4]:
+            if st.button(":material/delete: Remove step", key=f"remove_s:{view.candidate_id}:{index}"):
                 buffer["structured_instructions"].pop(index)
                 st.rerun()
+        if ("instructions", index) in suggestions:
+            _render_inline_suggestion(view, suggestions[("instructions", index)])
     if st.button("Add step", key=f"add_s:{view.candidate_id}"):
         buffer["structured_instructions"].append("")
         st.rerun()
+
+
+def _move_buffer_item(buffer, field: str, index: int, direction: int) -> None:
+    target = index + direction
+    values = buffer[field]
+    if 0 <= target < len(values):
+        values[index], values[target] = values[target], values[index]
+    st.rerun()
 
 
 def _render_findings(view) -> None:
@@ -244,6 +278,31 @@ def _render_suggestions(view) -> None:
                 st.info("Left pending.")
 
 
+def _render_inline_suggestion(view, suggestion) -> None:
+    if suggestion.suggestion_id not in {item.suggestion_id for item in view.pending_suggestions}:
+        return
+    with st.container(border=True):
+        st.markdown(f"**Unverified suggestion** · {suggestion.field_path}")
+        st.caption(f"Suggested: {suggestion.proposed_value} · Why: {suggestion.rationale}")
+        st.caption(f"Uncertainty: {suggestion.uncertainty or 'Not stated'}")
+        edited = st.text_input(
+            "Suggested replacement", value=suggestion.proposed_value,
+            key=f"inline_suggestion:{view.candidate_id}:{suggestion.suggestion_id}",
+        )
+        cols = st.columns(4)
+        if cols[0].button(":material/check: Accept suggestion", key=f"inline_accept:{view.candidate_id}:{suggestion.suggestion_id}"):
+            review_store().record(view.source_path, view.candidate_id, view.candidate, suggestion.suggestion_id, "approved")
+            st.rerun()
+        if cols[1].button(":material/edit: Edit suggestion", key=f"inline_edit:{view.candidate_id}:{suggestion.suggestion_id}"):
+            review_store().record(view.source_path, view.candidate_id, view.candidate, suggestion.suggestion_id, "edited", edited)
+            st.rerun()
+        if cols[2].button(":material/block: Reject suggestion", key=f"inline_reject:{view.candidate_id}:{suggestion.suggestion_id}"):
+            review_store().record(view.source_path, view.candidate_id, view.candidate, suggestion.suggestion_id, "rejected")
+            st.rerun()
+        if cols[3].button(":material/pause: Keep pending", key=f"inline_pending:{view.candidate_id}:{suggestion.suggestion_id}"):
+            st.info("This proposal remains pending and will not enter the recipe.")
+
+
 def _render_actions(view, buffer) -> None:
     if view.protected:
         return
@@ -252,16 +311,16 @@ def _render_actions(view, buffer) -> None:
     cols = st.columns(5)
     if cols[0].button("Save draft", key=f"save:{view.candidate_id}"):
         _save(view, buffer, advance=False)
-    if cols[1].button("Save & Next", key=f"save_next:{view.candidate_id}"):
+    if cols[1].button(":material/save_as: Save & next", key=f"save_next:{view.candidate_id}"):
         _save(view, buffer, advance=True)
-    if cols[2].button("Approve & Next", key=f"approve:{view.candidate_id}"):
+    if cols[2].button(":material/check_circle: Approve & next", key=f"approve:{view.candidate_id}"):
         _approve(view, buffer)
-    if cols[3].button("Previous", key=f"previous:{view.candidate_id}"):
+    if cols[3].button(":material/arrow_back: Previous", key=f"previous:{view.candidate_id}"):
         previous = previous_unresolved(catalog(), view.candidate_id)
         if previous:
             st.session_state.review_selection = previous.candidate_id
             st.rerun()
-    if cols[4].button("Skip for now", key=f"skip:{view.candidate_id}"):
+    if cols[4].button(":material/skip_next: Skip", key=f"skip:{view.candidate_id}"):
         following = next_unresolved(catalog(), view.candidate_id)
         st.session_state.review_selection = following.candidate_id if following else None
         st.rerun()
