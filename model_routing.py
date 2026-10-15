@@ -145,9 +145,11 @@ class ModelRouter:
         remaining = list(self.models)
         route_reason = "primary"
         total_attempts = 0
+        attempted_models: list[str] = []
         last_error: Exception | None = None
         while remaining:
             model = remaining.pop(0)
+            attempted_models.append(model.id)
             try:
                 value = self._run_model(model, attempt)
                 total_attempts += 1
@@ -162,10 +164,14 @@ class ModelRouter:
             except QuotaExhausted as exc:
                 last_error = exc
                 total_attempts += 1
+                _attach_route_context(exc, attempted_models, model.id, route_reason)
                 route_reason = "quota_fallback"
             except Exception as exc:
                 last_error = exc
                 total_attempts += 1
+                _attach_route_context(exc, attempted_models, model.id, route_reason)
+                if getattr(exc, "stop_routing", False):
+                    break
                 if not remaining:
                     break
                 route_reason = "quality_escalation" if remaining[0].role == "quality_escalation" else "fallback"
@@ -188,6 +194,17 @@ class ModelRouter:
                     raise
                 tries += 1
                 self.sleep(min(60.0, 2 ** tries))
+
+
+def _attach_route_context(exc: Exception, attempted_models: list[str],
+                          model_id: str, route_reason: str) -> None:
+    """Preserve routing context on errors without coupling the router to extraction code."""
+    try:
+        setattr(exc, "attempted_models", list(attempted_models))
+        setattr(exc, "model", model_id)
+        setattr(exc, "route_reason", route_reason)
+    except Exception:
+        pass
 
 
 def _safe_error(exc: Exception) -> str:

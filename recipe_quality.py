@@ -40,6 +40,11 @@ class RecipeCandidate(BaseModel):
     warnings: list[str] = Field(default_factory=list)
     missing_information: list[Diagnostic] = Field(default_factory=list)
     suggestions: list[Suggestion] = Field(default_factory=list)
+    source_method: str = ""
+    source_line_ranges: list[dict] = Field(default_factory=list)
+    confidence: str = ""
+    uncertainties: list[str] = Field(default_factory=list)
+    requires_review: bool = False
 
 
 class ExtractionBatch(BaseModel):
@@ -56,7 +61,7 @@ def is_complete(recipe: RecipeCandidate) -> bool:
 
 def needs_review(recipe: RecipeCandidate) -> bool:
     """Critical findings or unresolved proposals require human review."""
-    return any(item.severity == "critical" for item in recipe.missing_information) or any(
+    return recipe.requires_review or any(item.severity == "critical" for item in recipe.missing_information) or any(
         item.review_status == "pending" for item in recipe.suggestions
     )
 

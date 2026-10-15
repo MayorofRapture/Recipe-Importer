@@ -12,7 +12,7 @@ from recipe_quality import (
     needs_review,
     schema_recipe,
 )
-from review_store import ReviewStore, apply_review_decision
+from review_store import ReviewDecision, ReviewStore, apply_review_decision
 
 
 class QualityReviewTests(unittest.TestCase):
@@ -106,6 +106,68 @@ class QualityReviewTests(unittest.TestCase):
         self.assertEqual(rows[0]["source"], "scan.jpg")
         self.assertEqual(rows[0]["diagnosis"], "ambiguous")
         self.assertEqual(rows[0]["review_status"], "pending")
+
+    def test_review_csv_includes_suggestion_id_for_jalapeno_suggestion(self):
+        candidate = RecipeCandidate(
+            name="Jalapeño Peppers",
+            ingredients=["1 lb jalapeño peppers"],
+            instructions=[],
+            missing_information=[Diagnostic(
+                field_path="instructions",
+                kind="missing_from_source",
+                severity="critical",
+                detail="The source contains no instructions.",
+            )],
+            suggestions=[Suggestion(
+                suggestion_id="sug_instructions_1",
+                field_path="instructions",
+                proposed_value="1. Preheat oven.\n2. Bake peppers.",
+                rationale="Unverified completion.",
+            )],
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ReviewStore(Path(tmp) / "review.jsonl")
+            store.add_candidate("jalapeno.jpg", "hash:jalapeno", candidate)
+            output = Path(tmp) / "needs_review.csv"
+            store.write_csv(output)
+            with output.open(newline="", encoding="utf-8-sig") as fh:
+                rows = list(csv.DictReader(fh))
+
+        self.assertEqual(rows[0]["suggestion_id"], "sug_instructions_1")
+
+    def test_approved_full_recipe_lists_preserve_individual_entries(self):
+        candidate = RecipeCandidate(
+            name="Jalapeño Peppers",
+            ingredients=["old ingredient"],
+            instructions=[],
+            suggestions=[
+                Suggestion(
+                    suggestion_id="sug-ingredients",
+                    field_path="ingredients",
+                    proposed_value="1 lb jalapeño peppers\n4 oz sharp cheese, grated",
+                    rationale="Unverified ingredient list.",
+                ),
+                Suggestion(
+                    suggestion_id="sug-instructions",
+                    field_path="instructions",
+                    proposed_value="1. Preheat oven.\n2. Bake peppers.",
+                    rationale="Unverified instructions.",
+                ),
+            ],
+        )
+
+        reviewed = apply_review_decision(candidate, [
+            ReviewDecision("sug-ingredients", "approved", None),
+            ReviewDecision("sug-instructions", "edited", "1. Preheat oven.\n2. Bake peppers."),
+        ])
+
+        self.assertEqual(reviewed.ingredients, [
+            "1 lb jalapeño peppers", "4 oz sharp cheese, grated",
+        ])
+        self.assertEqual(reviewed.instructions, ["Preheat oven.", "Bake peppers."])
+        self.assertEqual(reviewed.suggestions[1].proposed_value,
+                         "1. Preheat oven.\n2. Bake peppers.")
 
 
 if __name__ == "__main__":

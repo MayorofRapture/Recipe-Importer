@@ -25,6 +25,37 @@ Maintain and improve a **small, reliable, resumable** Python pipeline that impor
 6. Work on the user's existing development branch. Do not merge, force-push, rewrite history, delete source files, or commit/push unless requested.
 7. Keep all examples and commands compatible with PowerShell on Windows. Use `python` once `.venv` is active, or `\.venv\Scripts\python.exe` without activation.
 
+## Streamlit and UI/UX agent skills
+
+The future application is a Streamlit interface for upload, extraction monitoring, recipe review, approval, recovery, and Mealie import. The current task may install/configure these skills, but does not authorize building the UI.
+
+Project-scoped skills live under `.agents/skills/` and must be preserved. Installed sources are:
+
+| Skill | Source/version | Use when |
+| --- | --- | --- |
+| `developing-with-streamlit` | Streamlit 1.66.0 bundled skill; `streamlit skills` project install was attempted, then the bundled skill was copied because Windows symlinks are unavailable | Any Streamlit app, widget, layout, state, theme, performance, or component work |
+| `product-design-and-ux` | `magnus919/agent-skills` `main` at `b3b45651ffa2ca882911c2ebfeeab8e3dc7b53ce` | Task flows, information architecture, interaction contracts, states, recovery, and usability planning |
+| `ui-ux-pro-max` | `nextlevelbuilder/ui-ux-pro-max-skill` Codex installer `ui-ux-pro-max-cli` 2.15.0; upstream `main` at `616663179c5f9b5e2b3e07cab23ac9cad76378f3` | Visual hierarchy, typography, spacing, component consistency, and design-system guidance |
+| `playwright` | `openai/skills` `skills/.curated/playwright`, `main` at `49f948faa9258a0c61caceaf225e179651397431` | Real browser workflows, screenshots, and rendered interaction evidence |
+| `accessibility-audit` | `humbleteam/accessibility-audit` `main` at `6bf69c6c1b866495db0cc352dc37113e39aa3c9a` | WCAG 2.2 review of a screenshot, URL, or markup; state what the input cannot prove |
+| `recipe-review-ux` | Project-local `.agents/skills/recipe-review-ux/` | Recipe-Importer-specific workflow, trust, recovery, review, and usability requirements |
+
+The UI/UX Pro Max installer also generated its companion design skills under `.agents/skills/` (`design`, `design-system`, `ui-styling`, `brand`, `slides`, and `banner-design`); keep them unless a future authorized cleanup removes the installer-managed set.
+
+For Streamlit UI work, follow this order:
+
+**Understand the user task -> Design the interaction -> Implement -> Test -> Review the actual UI -> Improve.**
+
+- Invoke `recipe-review-ux` for any Recipe-Importer UI workflow or review. Read its UX checklist before declaring a milestone ready.
+- Invoke `product-design-and-ux` before implementation when the task changes task flow, information architecture, statuses, recovery, or approval behavior.
+- Invoke `ui-ux-pro-max` for visual design decisions; keep its generic recommendations subordinate to Streamlit constraints and the domain rules above.
+- Invoke `developing-with-streamlit` for all Streamlit implementation, debugging, theming, state, caching, and performance work.
+- Use Playwright for a real browser check whenever a UI workflow or rendered state changes. Capture screenshots for important states and test at least one happy path and one recovery path.
+- Perform an `accessibility-audit` before a UI milestone is released, or whenever labels, focus order, contrast, interaction targets, or error presentation changes. Do not claim keyboard/DOM conformance from a screenshot alone.
+- Explain each important design decision in terms of reduced clicks, less context switching, faster repetitive review, clearer recovery, or lower risk of importing an incorrect recipe.
+
+Do not expose raw internal statuses in the primary UI. Keep saving, approving, and importing distinct; preserve source evidence, authoritative extraction, unverified proposals, approved edits, and import history as separate concepts.
+
 ## Non-negotiable invariants
 
 - **Never represent inferred content as source transcription.** Extract only what is supported by the image/PDF into authoritative recipe fields. Preserve original quantities, units, oven temperatures, durations, ordering, ingredient wording, and instructions. Gemini **may separately propose clearly labeled, unverified completions** for information absent from the source, but those suggestions must never be auto-imported or applied without explicit human approval/editing.
