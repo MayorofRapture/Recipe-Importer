@@ -1,0 +1,4 @@
+# Optional local recovery dependencies. The Tesseract executable is installed separately.
+PyMuPDF>=1.24.0
+Pillow>=10.0.0
+pytesseract>=0.3.13
