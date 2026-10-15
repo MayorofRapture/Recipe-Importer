@@ -190,7 +190,7 @@ def _render_structured_editor(view, buffer) -> None:
         with cols[2]:
             if st.button(":material/keyboard_arrow_up: Move ingredient up", key=f"up_i:{view.candidate_id}:{index}"):
                 _move_buffer_item(buffer, "structured_ingredients", index, -1)
-            
+
         with cols[3]:
             if st.button(":material/keyboard_arrow_down: Move ingredient down", key=f"down_i:{view.candidate_id}:{index}"):
                 _move_buffer_item(buffer, "structured_ingredients", index, 1)
