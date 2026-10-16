@@ -28,22 +28,21 @@ class StreamlitStructuredReviewTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             app = self._app(tmp)
 
-        mode = next(item for item in app.segmented_control if item.label == "Edit mode")
-        self.assertEqual(mode.value, "Structured Edit")
+        mode = next(item for item in app.selectbox if item.label == "Editing")
+        self.assertEqual(mode.value, "Precise edit")
         labels = [button.label for button in app.button]
         self.assertIn("Add ingredient", labels)
         self.assertIn("Add step", labels)
-        self.assertTrue(any("Remove ingredient" in button.label for button in app.button))
+        self.assertTrue(any(item.label == "Actions" for item in app.menu_button))
 
     def test_suggestion_is_inline_and_approval_gate_remains_separate(self):
         with tempfile.TemporaryDirectory() as tmp:
             app = self._app(tmp)
-            recipe_selector = next(item for item in app.selectbox if item.label == "Recipe")
-            recipe_selector.set_value("Cranberry Date Bars").run(timeout=10)
+            recipe_selector = next(item for item in app.selectbox if item.label == "Jump to recipe")
+            recipe_selector.set_value("Cranberry & Caramel Date Bars").run(timeout=10)
             visible = "\n".join(item.value for item in [*app.markdown, *app.caption, *app.text] if hasattr(item, "value"))
-            self.assertIn("Unverified suggestion", visible)
-            self.assertTrue(any("Accept suggestion" in button.label for button in app.button))
-            self.assertTrue(any("Keep pending" in button.label for button in app.button))
+            self.assertIn("Unverified proposal", visible)
+            self.assertTrue(any("Use suggestion" in button.label for button in app.button))
             self.assertTrue(any("Approve & next" in button.label for button in app.button))
 
             approve = next(button for button in app.button if "Approve & next" in button.label)

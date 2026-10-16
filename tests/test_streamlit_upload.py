@@ -1,0 +1,106 @@
+from __future__ import annotations
+
+import io
+import os
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+from PIL import Image
+from streamlit.testing.v1 import AppTest
+
+import ui_job_service
+from batch_store import BatchStore
+from ui_data import load_catalog
+from ui_job_service import JobService
+
+
+PAGE = Path(__file__).resolve().parents[1] / "app_pages" / "upload.py"
+
+
+def _png() -> bytes:
+    image = Image.new("RGB", (24, 24), (40, 90, 120))
+    output = io.BytesIO()
+    image.save(output, format="PNG")
+    return output.getvalue()
+
+
+class StreamlitUploadTests(unittest.TestCase):
+    def test_reupload_restores_missing_source_and_opens_existing_batch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "output"
+            output.mkdir()
+            (output / ".fixture-library").write_text("synthetic test library", encoding="utf-8")
+            content = _png()
+            with patch.dict(os.environ, {
+                "RECIPE_IMPORTER_OUTPUT_DIR": str(output),
+                "RECIPE_IMPORTER_SOURCE_DIR": "",
+                "RECIPE_IMPORTER_FIXTURE_MODE": "1",
+            }):
+                app = AppTest.from_file(str(PAGE)).run(timeout=15)
+                next(item for item in app.text_input if item.label == "Batch name").set_value("Original")
+                next(item for item in app.form_submit_button if item.label == "Create batch").click().run(timeout=15)
+                next(item for item in app.file_uploader if item.label == "Add PDF, JPG, PNG, or WEBP scans").set_value(
+                    [("family-scan.png", content, "image/png")]).run(timeout=15)
+                store = BatchStore(output)
+                original = store.list_batches()[0]
+                staged_path = Path(original["sources"][0]["staged_path"])
+                staged_path.unlink()
+
+                next(item for item in app.file_uploader if item.label == "Add PDF, JPG, PNG, or WEBP scans").set_value(
+                    [("recovered-scan.png", content, "image/png")]).run(timeout=15)
+                relinked_notice = any("Restored recovered-scan.png" in item.value for item in app.success)
+                next(item for item in app.button if item.label == "Open existing work").click().run(timeout=15)
+
+            self.assertFalse(app.exception)
+            self.assertEqual(Path(original["sources"][0]["staged_path"]).read_bytes(), content)
+            selector = next(item for item in app.selectbox if item.label == "Select an existing batch")
+            self.assertEqual(selector.value, original["batch_id"])
+            self.assertTrue(relinked_notice)
+
+    def test_partial_intake_recovers_and_fixture_job_publishes_review_candidate(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "output"
+            output.mkdir()
+            (output / ".fixture-library").write_text("synthetic test library", encoding="utf-8")
+            with patch.dict(os.environ, {
+                "RECIPE_IMPORTER_OUTPUT_DIR": str(output),
+                "RECIPE_IMPORTER_SOURCE_DIR": "",
+                "RECIPE_IMPORTER_FIXTURE_MODE": "1",
+            }):
+                app = AppTest.from_file(str(PAGE)).run(timeout=15)
+                self.assertFalse(app.exception)
+                next(item for item in app.text_input if item.label == "Batch name").set_value("Synthetic upload")
+                next(item for item in app.form_submit_button if item.label == "Create batch").click().run(timeout=15)
+
+                uploader = next(item for item in app.file_uploader if item.label == "Add PDF, JPG, PNG, or WEBP scans")
+                uploader.set_value([
+                    ("synthetic.png", _png(), "image/png"),
+                    ("broken.pdf", b"not a pdf", "application/pdf"),
+                ]).run(timeout=15)
+
+                self.assertFalse(app.exception)
+                self.assertTrue(any("Saved synthetic.png" in item.value for item in app.success))
+                self.assertTrue(any("Could not add broken.pdf" in item.value for item in app.error))
+                batch = BatchStore(output).list_batches()[0]
+                self.assertEqual([source["original_filename"] for source in batch["sources"]], ["synthetic.png"])
+
+                next(button for button in app.button if button.label == "Start extraction").click().run(timeout=15)
+                self.assertFalse(app.exception)
+                service = JobService(output, extractor=lambda source, mode, config: [])
+                job = service.list_jobs()[0]
+                worker = ui_job_service._BACKGROUND_THREADS.get(job["job_id"])
+                if worker is not None:
+                    worker.join(timeout=4)
+                app.run(timeout=15)
+
+                completed = service.snapshot(job["job_id"])
+                self.assertEqual(completed["status"], "completed")
+                views = load_catalog(output)
+                self.assertTrue(any(view.candidate.name == "Synthetic demo from synthetic" for view in views))
+                self.assertTrue(any("No scans are sent to Gemini" in item.value for item in app.info))
+
+
+if __name__ == "__main__":
+    unittest.main()

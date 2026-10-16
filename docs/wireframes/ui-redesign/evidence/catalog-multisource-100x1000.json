@@ -1,0 +1,35 @@
+{
+  "python": "3.14.7",
+  "platform": "Windows-11-10.0.26200-SP0",
+  "fixture": "100 synthetic source files, 10 candidates each, 1000 prepopulated registrations; temporary directory only",
+  "method": "warm load_catalog() calls after one warm-up; three samples; external exact-revision approval appended and reloaded after each run",
+  "before_optimization": {
+    "warm_samples_seconds": [6.370, 5.990, 5.194],
+    "warm_p50_seconds": 5.990,
+    "warm_p95_seconds": 6.370,
+    "external_approval_reload_seconds": 4.333,
+    "external_approval_visible": true
+  },
+  "after_initial_read_projection_optimization": {
+    "warm_samples_seconds": [1.0380322, 0.9637281, 0.9981450],
+    "warm_p50_seconds": 0.9981450,
+    "warm_p95_seconds": 1.0380322,
+    "external_approval_reload_seconds": 0.9713392,
+    "external_approval_visible": true
+  },
+  "final_after_per_load_source_digest_reuse": {
+    "warm_samples_seconds": [0.7962093, 0.3620507, 0.4097338],
+    "warm_p50_seconds": 0.4097338,
+    "warm_p95_seconds": 0.7962093,
+    "external_approval_reload_seconds": 0.3348360,
+    "external_approval_visible": true
+  },
+  "changes": [
+    "Reuse only exact, uniquely registered candidate identities from the loaded review snapshot; uncertain or missing registrations still take the locked reload path.",
+    "Build legacy decision projections once per catalog load, pass registration source as a hint instead of copying the complete source map per candidate, and share the per-load source digest memo between source resolution and availability checks."
+  ],
+  "limits": [
+    "Synthetic prepopulated ledger measures warm catalog projection, not cold registration, rendered Streamlit latency, or user-library hardware variation.",
+    "Approval and import mutation boundaries continue to reload under the cross-process lock and recheck source bytes; the source-hash memo is local to one catalog load only."
+  ]
+}

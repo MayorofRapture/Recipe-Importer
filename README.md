@@ -41,6 +41,56 @@ This writes raw text to `output/ocr_text/`, records `OCR_NEEDS_REVIEW` or
 Repeated runs reuse the digest-named OCR text and do not append duplicate review
 records.
 
+## Local review app
+
+After installing the project dependencies, double-click `run_app.bat` or start
+the app from PowerShell:
+
+```powershell
+.\.venv\Scripts\python.exe -m streamlit run streamlit_app.py
+```
+
+The app opens Upload, then keeps extraction results in the local output library.
+Create a named batch, optionally choose its cookbook tag, add scans, and select an
+extraction method. Local OCR stays on this computer. Gemini extraction sends scans
+to Google; OCR-assisted review also sends the selected scan and OCR text. Both
+cloud modes require explicit consent. Pause/resume keeps completed files and retries
+only unfinished files.
+
+Use Review to compare each candidate with its source scan. Committed editor fields
+save locally as a draft; bulk edits take effect only after Apply. Inspect every
+unverified proposal and source issue, then approve a specific saved revision. Save,
+approval, and import are separate actions. Pending proposals and unapproved retry
+results cannot be imported.
+
+If a source preview is unavailable, re-upload the exact original file in Upload.
+The app verifies its content hash before reconnecting it to existing work; a
+same-named file with different bytes cannot restore or approve that recipe.
+
+Use Import & history to select approved recipes and review the exact preflight
+before starting a Mealie import. The selected batch tag applies only to recipes
+created from that batch; it does not retag older recipes. If a request has an
+uncertain server outcome or a partial tag failure, check the recorded result and
+reconcile it before retrying. The importer avoids blindly repeating uncertain
+creates.
+
+When a re-extraction produces an unmatched candidate from a source that already
+has an imported or uncertain sibling, the candidate stays held for explicit
+mapping or deferral. The current source model has no independent recipe-boundary
+anchor, so it cannot safely support declaring that unmatched candidate new in
+that protected-source case.
+
+Synthetic browser/testing mode requires `RECIPE_IMPORTER_FIXTURE_MODE=1` and an
+explicit isolated `RECIPE_IMPORTER_OUTPUT_DIR` containing a `.fixture-library`
+marker. It stops when that boundary is missing or invalid, uses synthetic results,
+and disables live service clients. The normal launcher does not enable fixture
+mode.
+
+The default local library is `output/`. To keep it elsewhere, set
+`RECIPE_IMPORTER_OUTPUT_DIR` before launching. Set `RECIPE_IMPORTER_SOURCE_DIR`
+only when scans are stored separately from the output library. Keep those paths
+local and do not commit recipe scans, `.env`, or output records.
+
 Run the complete offline regression suite from PowerShell:
 
 ```powershell
@@ -177,7 +227,7 @@ Repair tags only for an explicitly listed set of existing Mealie slugs; add `--d
 - `output/last_run_report.csv`: status for each processed recipe, including `IMPORTED`, `ALREADY_DONE`, `IMPORT_FAILED`, `EXTRACTION_FAILED`, `INCOMPLETE`, and `NEEDS_MANUAL_CHECK`. Open the report in Excel.
 - `output/review_events.jsonl`: append-only diagnostics, proposals, and human review decisions.
 - `output/needs_review.csv`: actionable review projection with source, field, diagnosis, suggestion, uncertainty, and disposition.
-- `output/gemini_usage.json`: best-effort local request accounting by UTC day and model; other applications using the same provider project are not visible to this file.
+- `output/gemini_usage.json`: atomic best-effort daily request reservations and shared request-start windows for CLI/UI workers that use the same output directory. Other applications using the provider project are not visible to this file.
 - `output/gemini_diagnostics.jsonl`: append-only Gemini response metadata, including finish reason, attempted route, and any OCR fallback result.
 - `output/ocr_text/`: raw local OCR text saved after a RECITATION failure. Review this text before approving or editing a recipe.
 - `output/extracted/<sha256>--ocr-structure--*.json`: versioned, reviewable OCR structure assembled from original OCR lines; prior versions are retained.
@@ -192,6 +242,7 @@ If a file shows **NEEDS_MANUAL_CHECK**, inspect Mealie for that recipe before at
 - AI transcription can make mistakes; a quick 5-recipe test is essential, and recipes with extraction warnings need review.
 - Exact duplicate input files are de-duplicated by SHA-256. Different files containing the *same recipe* can still create duplicate Mealie entries.
 - API throughput depends on your Gemini project quotas (requests/minute, tokens/minute, requests/day), Mealie server load, source file sizes, and network access; the one-hour goal is **not guaranteed**.
+- Local Gemini scheduling coordinates configured global/per-model requests per minute and request/day across importer workers sharing this ledger. Its day boundary is UTC, it cannot see external project traffic, and it does not enforce tokens/minute because the router has no reliable request-token estimate; provider limits remain authoritative.
 - Gemini receives the PDF/image contents. Only upload materials you are authorized to process and comfortable sending to Google.
 - Do not edit extraction cache files while the importer is running. To correct a failed cached extraction, edit its JSON after stopping, or remove just its cached JSON to force re-extraction.
 - Recipe import is best-effort against Mealie v3.22.x. If your Mealie configuration alters scraping behavior, test and troubleshoot before running all 300.

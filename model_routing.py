@@ -5,6 +5,7 @@ import json
 import os
 import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -63,7 +64,11 @@ def parse_model_config(raw: Optional[str] = None, fallback_model: str = "") -> l
 
 
 class UsageLedger:
-    """Persist request starts; UTC date is a best-effort provider-day proxy."""
+    """Persist daily reservations and shared request-start windows.
+
+    The short file lock protects only the local read/modify/write transaction. It
+    is released before waiting and before the provider request is made.
+    """
     def __init__(self, path: Path, now: Callable[[], datetime] | None = None):
         self.path = path
         self.now = now or (lambda: datetime.now(timezone.utc))
@@ -86,24 +91,92 @@ class UsageLedger:
         return data
 
     def reserve(self, model: str, rpd: int = 0) -> None:
-        with self.lock:
-            if self.data.get("day") != self._day():
-                self.data = {"day": self._day(), "models": {}}
-            entry = self.data["models"].setdefault(model, {"requests": 0})
-            if rpd and int(entry.get("requests", 0)) >= rpd:
-                raise QuotaExhausted(f"Local daily request limit reached for {model}")
-            entry["requests"] = int(entry.get("requests", 0)) + 1
-            self._save()
+        self._reserve(model, rpd, model_rpm=0, global_rpm=0, sleep=time.sleep)
+
+    def reserve_scheduled(self, model: str, rpd: int = 0, *, model_rpm: float = 0,
+                          global_rpm: float = 0,
+                          sleep: Callable[[float], None] = time.sleep) -> None:
+        """Reserve one daily request and a shared global/per-model start slot."""
+        self._reserve(model, rpd, model_rpm=model_rpm, global_rpm=global_rpm, sleep=sleep)
+
+    def _reserve(self, model: str, rpd: int, *, model_rpm: float, global_rpm: float,
+                 sleep: Callable[[float], None]) -> None:
+        global_interval = 60.0 / global_rpm if global_rpm > 0 else 0.0
+        model_interval = 60.0 / model_rpm if model_rpm > 0 else 0.0
+        while True:
+            wait = 0.0
+            with self.lock, _process_file_lock(self.path.with_suffix(self.path.suffix + ".lock")):
+                self.data = self._read_current()
+                entry = self.data["models"].setdefault(model, {"requests": 0})
+                if rpd and int(entry.get("requests", 0)) >= rpd:
+                    raise QuotaExhausted(f"Local daily request limit reached for {model}")
+
+                now = self.now().astimezone(timezone.utc).timestamp()
+                model_windows = self.data.setdefault("model_windows", {})
+                model_intervals = self.data.setdefault("model_intervals", {})
+                shared_global_interval = max(global_interval,
+                                             float(self.data.get("global_interval", 0)))
+                shared_model_interval = max(model_interval,
+                                            float(model_intervals.get(model, 0)))
+                start = max(now, float(self.data.get("global_next_start", 0)),
+                            float(model_windows.get(model, 0)))
+                wait = max(0.0, start - now)
+                if not wait:
+                    entry["requests"] = int(entry.get("requests", 0)) + 1
+                    if shared_global_interval:
+                        self.data["global_interval"] = shared_global_interval
+                        self.data["global_next_start"] = start + shared_global_interval
+                    if shared_model_interval:
+                        model_intervals[model] = shared_model_interval
+                        model_windows[model] = start + shared_model_interval
+                    self._save()
+                    self.data = self._read_current()
+                    return
+            # Never hold either lock while waiting; every wake-up rechecks state.
+            sleep(wait)
 
     def count(self, model: str) -> int:
-        with self.lock:
+        with self.lock, _process_file_lock(self.path.with_suffix(self.path.suffix + ".lock")):
+            self.data = self._read_current()
             return int(self.data.get("models", {}).get(model, {}).get("requests", 0))
+
+    def _read_current(self) -> dict:
+        data = self._load()
+        data.setdefault("models", {})
+        data.setdefault("model_windows", {})
+        return data
 
     def _save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         temp = self.path.with_suffix(self.path.suffix + ".tmp")
         temp.write_text(json.dumps(self.data, indent=2), encoding="utf-8")
         os.replace(temp, self.path)
+
+
+@contextmanager
+def _process_file_lock(path: Path):
+    """Lock one byte in a sibling file across processes on Windows and POSIX."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a+b") as handle:
+        handle.seek(0, os.SEEK_END)
+        if handle.tell() == 0:
+            handle.write(b"0")
+            handle.flush()
+        handle.seek(0)
+        if os.name == "nt":
+            import msvcrt
+            msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            handle.seek(0)
+            if os.name == "nt":
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 class ModelRouter:
@@ -114,31 +187,9 @@ class ModelRouter:
         if not self.models:
             raise ValueError("At least one enabled Gemini model is required")
         self.ledger = ledger
-        self.global_delay = 60.0 / global_rpm if global_rpm > 0 else 0.0
-        self.next_global_start = 0.0
-        self.lock = threading.Lock()
-        self.next_model_start: dict[str, float] = {}
-        self.model_lock = threading.Lock()
+        self.global_rpm = global_rpm
         self.sleep = sleep
         self.max_transient_retries = max_transient_retries
-
-    def _wait_global(self) -> None:
-        with self.lock:
-            now = time.monotonic()
-            start = max(now, self.next_global_start)
-            self.next_global_start = start + self.global_delay
-        if start > now:
-            self.sleep(start - now)
-
-    def _wait_model(self, model: ModelConfig) -> None:
-        if model.rpm <= 0:
-            return
-        with self.model_lock:
-            now = time.monotonic()
-            start = max(now, self.next_model_start.get(model.id, 0.0))
-            self.next_model_start[model.id] = start + 60.0 / model.rpm
-        if start > now:
-            self.sleep(start - now)
 
     def run(self, attempt: Callable[[ModelConfig], Any],
             quality_check: Callable[[Any], bool] | None = None) -> RouteResult:
@@ -182,9 +233,8 @@ class ModelRouter:
     def _run_model(self, model: ModelConfig, attempt: Callable[[ModelConfig], Any]) -> Any:
         tries = 0
         while True:
-            self._wait_global()
-            self._wait_model(model)
-            self.ledger.reserve(model.id, model.rpd)
+            self.ledger.reserve_scheduled(model.id, model.rpd, model_rpm=model.rpm,
+                                          global_rpm=self.global_rpm, sleep=self.sleep)
             try:
                 return attempt(model)
             except Exception as exc:

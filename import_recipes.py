@@ -19,6 +19,7 @@ from typing import Optional
 
 import requests
 from dotenv import load_dotenv
+from draft_store import DraftStore
 from google import genai
 from google.genai import types
 
@@ -27,7 +28,8 @@ from recipe_quality import ExtractionBatch, RecipeCandidate, is_complete, needs_
 from mealie_client import MealieClient
 import local_ocr
 from ocr_structuring import OcrLineReferences, assemble_line_references, numbered_lines
-from review_store import ReviewStore, apply_candidate_decision, apply_review_decision
+from review_store import (ReviewConflict, ReviewDecision, ReviewStore, apply_candidate_decision, apply_review_decision,
+                          extraction_identity, _state_lock)
 
 SUPPORTED = {".pdf", ".jpg", ".jpeg", ".png", ".webp"}
 INLINE_MAX_BYTES = 8 * 1024 * 1024
@@ -101,7 +103,11 @@ def _norm(value: str) -> str:
 
 
 def candidate_identity(source_hash: str, candidate: RecipeCandidate) -> str:
-    return _identity_for_title(source_hash, candidate.name)
+    fingerprint = hashlib.sha256(json.dumps(
+        candidate.model_dump(mode="json"), ensure_ascii=False,
+        sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")).hexdigest()
+    return f"{source_hash}:{fingerprint[:24]}"
 
 
 def _identity_for_title(source_hash: str, title: str) -> str:
@@ -128,31 +134,61 @@ class StateStore:
         with self.lock:
             return self.records.get(key)
 
+    def refresh(self) -> None:
+        """Read other UI/CLI writers' completed records under the shared lock."""
+        with self.lock:
+            with _state_lock(self.path):
+                self.records = StateStore(self.path).records
+
     def add(self, key: str, status: str, slug: str, filename: str, title: str,
-            identity: str = "", **fields) -> None:
+            identity: str = "", *, locked: bool = False, **fields) -> None:
+        from contextlib import nullcontext
         record = {"key": key, "status": status, "slug": slug, "file": filename,
                   "title": title, "timestamp": datetime.now(timezone.utc).isoformat()}
         if identity:
             record["identity"] = identity
         record.update(fields)
         with self.lock:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            with self.path.open("a", encoding="utf-8") as fh:
-                fh.write(json.dumps(record, ensure_ascii=False) + "\n")
-                fh.flush()
-                os.fsync(fh.fileno())
+            with (nullcontext() if locked else _state_lock(self.path)):
+                self.path.parent.mkdir(parents=True, exist_ok=True)
+                with self.path.open("a", encoding="utf-8") as fh:
+                    fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+                    fh.flush()
+                    os.fsync(fh.fileno())
             self.records[key] = record
 
     def find_candidate(self, source_hash: str, index: int,
-                       candidate: RecipeCandidate) -> Optional[dict]:
+                       candidate: RecipeCandidate, identity_aliases: tuple[str, ...] = (),
+                       allow_legacy_title_match: bool = True) -> Optional[dict]:
         identity = candidate_identity(source_hash, candidate)
         legacy = self.records.get(f"{source_hash}:{index}")
+        identities = {identity, *identity_aliases}
         identity_matches = [record for record in self.records.values()
-                            if record.get("identity") == identity]
+                            if record.get("identity") in identities]
         if len(identity_matches) > 1:
             raise AmbiguousCandidate(f"Multiple prior records match {candidate.name!r}; manual reconciliation required")
-        if legacy and _norm(str(legacy.get("title", ""))) == _norm(candidate.name):
+        if identity_matches:
+            return identity_matches[0]
+        legacy_identity = _identity_for_title(source_hash, candidate.name)
+        if allow_legacy_title_match and legacy and _norm(str(legacy.get("title", ""))) == _norm(candidate.name) \
+                and legacy.get("identity") in {None, legacy_identity}:
             return legacy
+        title_records = [record for record in self.records.values()
+                         if _norm(str(record.get("title", ""))) == _norm(candidate.name)
+                         and str(record.get("key", "")).startswith(source_hash + ":")]
+        title_matches = [record for record in title_records
+                         if record.get("identity") == legacy_identity]
+        if not allow_legacy_title_match and title_matches:
+            raise AmbiguousCandidate(f"Legacy identity for duplicate title {candidate.name!r} cannot be assigned to a sibling")
+        all_title_records = [record for record in self.records.values()
+                             if _norm(str(record.get("title", ""))) == _norm(candidate.name)
+                             and str(record.get("key", "")).startswith(source_hash + ":")]
+        if len(all_title_records) > 1 and len({record.get("identity") for record in all_title_records}) == 1:
+            raise AmbiguousCandidate(f"Multiple legacy records share {candidate.name!r}; manual reconciliation required")
+        if len(title_matches) == 1:
+            return title_matches[0]
+        if len(title_matches) > 1:
+            raise AmbiguousCandidate(f"Multiple legacy records share {candidate.name!r}; manual reconciliation required")
         matches = identity_matches
         if not matches:
             return None
@@ -166,6 +202,8 @@ _diagnostic_log_lock = threading.Lock()
 
 
 def google_client(api_key: str):
+    from runtime_safety import require_live_services
+    require_live_services()
     if not hasattr(_thread_local, "client"):
         _thread_local.client = genai.Client(api_key=api_key)
     return _thread_local.client
@@ -327,6 +365,8 @@ def structure_ocr_text(text: str, api_key: str, model: str,
 
 
 def import_mealie(recipe: RecipeCandidate, mealie_url: str, token: str) -> str:
+    from runtime_safety import require_live_services
+    require_live_services()
     url = mealie_url.rstrip("/") + "/api/recipes/create/html-or-json"
     response = requests.post(url, json={"data": json.dumps(schema_recipe(recipe), ensure_ascii=False), "includeTags": False, "includeCategories": False}, headers={"Authorization": f"Bearer {token}", "Accept": "application/json"}, timeout=(10, 100))
     if response.status_code != 201:
@@ -724,27 +764,48 @@ def process_file(path: Path, digest: str, config: dict, gate: RateGate | None, s
     if not batch.recipes:
         return [record("NO_RECIPE", note="; ".join(batch.general_warnings), model=selected_model, route_reason=route_reason)]
     reviews = review_store or ReviewStore(cache_dir.parent / "review_events.jsonl")
+    legacy_drafts = DraftStore(cache_dir.parent / "ui_drafts.jsonl").all_latest()
+    extraction_id = extraction_identity(digest, batch.model_dump(mode="json"))
+    registrations = reviews.register_candidates(str(path), digest, extraction_id, batch.recipes)
+    title_counts = {}
+    for item in batch.recipes:
+        title_counts[_norm(item.name)] = title_counts.get(_norm(item.name), 0) + 1
     results: list[dict] = []
-    for index, candidate in enumerate(batch.recipes):
-        identity = candidate_identity(digest, candidate)
+    for index, (candidate, registration) in enumerate(zip(batch.recipes, registrations)):
+        identity = registration["candidate_id"]
+        state.refresh()
+        if registration.get("identity_status") != "registered":
+            results.append(record("NEEDS_REVIEW", candidate.name,
+                                  note="Indistinguishable recipe candidates require explicit reconciliation.",
+                                  model=selected_model, route_reason=route_reason, candidate_id=identity))
+            continue
         try:
-            previous = state.find_candidate(digest, index, candidate)
+            previous = state.find_candidate(
+                digest, index, candidate,
+                (identity, *tuple(registration.get("legacy_aliases", ()))),
+                allow_legacy_title_match=title_counts[_norm(candidate.name)] == 1,
+            )
         except AmbiguousCandidate as exc:
             reviews.add_candidate(str(path), identity, candidate)
             results.append(record("NEEDS_REVIEW", candidate.name, note=str(exc), model=selected_model, route_reason=route_reason, candidate_id=identity))
             continue
-        decisions = reviews.decisions_for(identity)
-        if decisions:
-            candidate = apply_review_decision(candidate, decisions)
-            approved_fields = {item.field_path for item in candidate.suggestions
-                               if item.review_status in {"approved", "edited"}}
-            candidate.missing_information = [item for item in candidate.missing_information
-                                             if item.field_path not in approved_fields]
-        candidate = apply_candidate_decision(candidate, reviews.candidate_decision(identity))
+        legacy_draft = next((legacy_drafts[key] for key in
+                             (identity, *tuple(registration.get("legacy_aliases", ())))
+                             if key in legacy_drafts
+                             and legacy_drafts[key].source_hash in {"", digest}), None)
+        from review_service import project_legacy_review
+        legacy_review = project_legacy_review(
+            candidate, reviews.decisions_for(identity), reviews.candidate_decision(identity), legacy_draft,
+        )
+        candidate = legacy_review.recipe
+        effective = reviews.project(identity, digest, extraction_id, candidate, legacy_draft)
+        modern_revision = effective.revision > 0
+        if modern_revision:
+            candidate = RecipeCandidate.model_validate(effective.recipe)
         warnings = "; ".join(batch.general_warnings + candidate.warnings)
         if previous and previous.get("status") == "IMPORTED" and batch_tag \
                 and previous.get("tag_status") == "failed" \
-                and previous.get("tag_name") == batch_tag:
+                and (previous.get("tag_name") or previous.get("batch_tag")) == batch_tag:
             try:
                 tag = mealie_client.ensure_tag(batch_tag)
                 tag_status = mealie_client.add_tag(previous.get("slug", ""), tag)
@@ -763,6 +824,11 @@ def process_file(path: Path, digest: str, config: dict, gate: RateGate | None, s
         if previous and previous.get("status") in {"IMPORTED", "UNCERTAIN"}:
             results.append(record("ALREADY_DONE" if previous["status"] == "IMPORTED" else "NEEDS_MANUAL_CHECK", candidate.name, previous.get("slug", ""), warnings, model=selected_model, route_reason=route_reason, candidate_id=identity))
             continue
+        if modern_revision and not effective.import_ready:
+            results.append(record("NEEDS_REVIEW", candidate.name,
+                                  note="The current review revision does not have an exact matching approval.",
+                                  model=selected_model, route_reason=route_reason, candidate_id=identity))
+            continue
         if candidate.missing_information or candidate.suggestions:
             reviews.add_candidate(str(path), identity, candidate)
         if not is_complete(candidate):
@@ -775,32 +841,25 @@ def process_file(path: Path, digest: str, config: dict, gate: RateGate | None, s
             results.append(record("EXTRACTED_ONLY", candidate.name, note=warnings, model=selected_model, route_reason=route_reason, candidate_id=identity))
             continue
         try:
-            slug = import_mealie(candidate, config["mealie_url"], config["mealie_token"])
-            tag_status = ""
-            if batch_tag:
-                try:
-                    if mealie_client is None:
-                        raise RuntimeError("Batch tag requested but no Mealie tag client is configured")
-                    tag_status = mealie_client.add_tag(slug, mealie_client.ensure_tag(batch_tag))
-                except Exception as tag_exc:
-                    state.add(identity, "IMPORTED", slug, str(path), candidate.name, identity=identity,
-                              model=selected_model, route_reason=route_reason, tag_status="failed", tag_name=batch_tag,
-                              tag_note=str(tag_exc))
-                    results.append(record("TAG_FAILED", candidate.name, slug, str(tag_exc),
-                                          model=selected_model, route_reason=route_reason, candidate_id=identity))
-                    continue
-            state.add(identity, "IMPORTED", slug, str(path), candidate.name, identity=identity,
-                      model=selected_model, route_reason=route_reason, tag_status=tag_status)
-            results.append(record("IMPORTED", candidate.name, slug, warnings,
-                                  model=selected_model, route_reason=route_reason, candidate_id=identity))
+            from ui_import_service import ImportService
+            importer = ImportService(cache_dir.parent, review_path=reviews.path, state_path=state.path)
+            outcome = importer.dispatch_cli_candidate(
+                identity, candidate, path, digest, extraction_id,
+                lambda approved: import_mealie(approved, config["mealie_url"], config["mealie_token"]),
+                batch_tag=batch_tag, tag_client=mealie_client,
+            )
+            state.refresh()
+            creation = outcome.get("status", "uncertain")
+            status = ("TAG_FAILED" if creation == "created" and outcome.get("tag_status") in {"failed", "unknown"}
+                      else {"created": "IMPORTED", "already_done": "ALREADY_DONE", "imported": "ALREADY_DONE",
+                            "rejected": "IMPORT_FAILED", "not_sent": "NEEDS_REVIEW"}.get(creation, "NEEDS_MANUAL_CHECK"))
+            results.append(record(status, candidate.name, outcome.get("slug", ""),
+                                  outcome.get("reason") or warnings, model=selected_model,
+                                  route_reason=route_reason, candidate_id=identity))
         except Exception as exc:
-            error = str(exc)
-            definite_reject = any(f"HTTP {code}:" in error for code in (400, 401, 403, 404, 409, 413, 415, 422, 429))
-            if definite_reject:
-                results.append(record("IMPORT_FAILED", candidate.name, note=error, model=selected_model, route_reason=route_reason, candidate_id=identity))
-            else:
-                state.add(identity, "UNCERTAIN", "", str(path), candidate.name, identity=identity, model=selected_model, route_reason=route_reason)
-                results.append(record("NEEDS_MANUAL_CHECK", candidate.name, note=f"Import outcome unclear; inspect Mealie before retrying: {error}", model=selected_model, route_reason=route_reason, candidate_id=identity))
+            results.append(record("NEEDS_MANUAL_CHECK", candidate.name,
+                                  note="Import was stopped safely; inspect local intent history before retrying: " + _redact_error(exc, config),
+                                  model=selected_model, route_reason=route_reason, candidate_id=identity))
     return results
 
 
@@ -1248,11 +1307,97 @@ def main() -> int:
         if not args.review_status:
             parser.error("--review-id requires --review-status")
         reviews = ReviewStore(work / "review_events.jsonl")
-        event = reviews.candidates.get(args.review_id)
-        if not event:
+        candidate_id = reviews.canonical_candidate_id(args.review_id)
+        registrations = reviews.registrations.get(candidate_id, [])
+        registration = registrations[-1] if registrations else None
+        event = reviews.candidates.get(args.review_id) or reviews.candidates.get(candidate_id)
+        if not registration and not event:
             parser.error(f"Review candidate not found: {args.review_id}")
         try:
-            if args.review_suggestion:
+            if registration:
+                extraction_id = registration["extraction_id"]
+                source_hash = registration["source_hash"]
+                if args.review_status in {"approved", "edited"}:
+                    source_path = Path(str(registration.get("source", "")))
+                    if (not source_path.is_file()
+                            or file_digest(source_path) != source_hash):
+                        parser.error("New approval requires the original source scan to be available and hash-matching.")
+                revisions = [item for item in reviews.revisions.get(candidate_id, [])
+                             if item.get("extraction_id") == extraction_id]
+                current_revision = max((int(item["revision"]) for item in revisions), default=0)
+                candidate = RecipeCandidate.model_validate(
+                    max(revisions, key=lambda item: int(item["revision"]))["recipe"]
+                    if revisions else registration["candidate"]
+                )
+                row_bindings = (max(revisions, key=lambda item: int(item["revision"]))["target_bindings"]
+                                if revisions else [
+                                    {"target_id": item["target_id"], "field": item["field"],
+                                     "position": item["original_position"]}
+                                    for item in registration["target_bindings"]
+                                    if item.get("target_kind") == "row"
+                                ])
+                if args.review_suggestion:
+                    issue = next((item for item in registration["target_bindings"]
+                                  if item.get("issue_id") == args.review_suggestion), None)
+                    if not issue:
+                        parser.error(f"Review issue not found: {args.review_suggestion}")
+                    if current_revision == 0:
+                        snapshot = candidate.model_dump(mode="json")
+                        operation_id = "cli-save:" + hashlib.sha256(json.dumps(
+                            [candidate_id, extraction_id, snapshot], ensure_ascii=False,
+                            sort_keys=True, separators=(",", ":")
+                        ).encode("utf-8")).hexdigest()
+                        saved = reviews.save_revision(
+                            candidate_id=candidate_id, source_hash=source_hash,
+                            extraction_id=extraction_id, expected_parent=0,
+                            operation_id=operation_id, recipe=snapshot,
+                            target_bindings=row_bindings,
+                        )
+                        current_revision = int(saved["revision"])
+                    disposition = {"approved": "accepted", "edited": "edited",
+                                   "rejected": "rejected", "pending": "deferred"}[args.review_status]
+                    digest = hashlib.sha256(
+                        (disposition + str(args.review_value or "")).encode("utf-8")
+                    ).hexdigest()[:20]
+                    reviews.resolve_issue(
+                        candidate_id=candidate_id, source_hash=source_hash,
+                        extraction_id=extraction_id, revision=current_revision,
+                        issue_id=issue["issue_id"], target_id=issue["target_id"],
+                        disposition=disposition,
+                        final_value=args.review_value if disposition in {"edited", "accepted"} else None,
+                        operation_id=f"cli-issue:{candidate_id}:{extraction_id}:{current_revision}:{issue['issue_id']}:{digest}",
+                    )
+                    message = f"Recorded {args.review_status} decision for {args.review_suggestion}."
+                elif args.review_status in {"approved", "edited"}:
+                    if args.review_status == "edited":
+                        candidate = apply_candidate_decision(
+                            candidate, ReviewDecision("", "edited", args.review_value))
+                    if args.review_status == "edited" or current_revision == 0:
+                        snapshot = candidate.model_dump(mode="json")
+                        operation_material = json.dumps(snapshot, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+                        operation_id = "cli-save:" + hashlib.sha256(
+                            f"{candidate_id}:{extraction_id}:{current_revision}:{operation_material}".encode("utf-8")
+                        ).hexdigest()
+                        saved = reviews.save_revision(
+                            candidate_id=candidate_id, source_hash=source_hash,
+                            extraction_id=extraction_id, expected_parent=current_revision,
+                            operation_id=operation_id, recipe=snapshot,
+                            target_bindings=row_bindings,
+                        )
+                        current_revision = int(saved["revision"])
+                    reviews.approve_revision(
+                        candidate_id=candidate_id, source_hash=source_hash,
+                        extraction_id=extraction_id, revision=current_revision,
+                        operation_id=f"cli-approve:{candidate_id}:{extraction_id}:{current_revision}",
+                        source_path=str(registration.get("source", "")),
+                    )
+                    message = f"Approved exact revision {current_revision} for candidate {candidate_id}."
+                else:
+                    reviews.record_candidate_decision(
+                        str(registration.get("source", "")), candidate_id,
+                        args.review_status, args.review_value)
+                    message = f"Recorded {args.review_status} decision for candidate {candidate_id}."
+            elif args.review_suggestion:
                 candidate = RecipeCandidate.model_validate(event["candidate"])
                 reviews.record(event["source"], args.review_id, candidate,
                                args.review_suggestion, args.review_status,
@@ -1263,7 +1408,7 @@ def main() -> int:
                     event["source"], args.review_id, args.review_status,
                     args.review_value)
                 message = f"Recorded {args.review_status} decision for candidate {args.review_id}."
-        except ValueError as exc:
+        except (ValueError, ReviewConflict) as exc:
             parser.error(str(exc))
         reviews.write_csv(work / "needs_review.csv")
         print(message)
