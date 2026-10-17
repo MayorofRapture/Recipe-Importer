@@ -183,6 +183,12 @@ def render_suggestion_summary(st: Any, suggestions: Iterable[Any]) -> None:
 def render_approval_blockers(st: Any, blockers: list[ApprovalBlocker], on_jump: Callable[[str], None] | None = None) -> None:
     """Show actual blockers with an optional direct jump control for each one."""
     for index, blocker in enumerate(blockers):
+        if blocker.anchor == "recipe-identity":
+            st.warning(blocker.label, icon=":material/error:")
+            if on_jump and st.button("Resolve identity", key=f"approval_blocker:{blocker.code}:{index}",
+                                     help="Open the source-backed identity comparison"):
+                on_jump(blocker.anchor)
+            continue
         columns = st.columns([5, 1], vertical_alignment="center")
         columns[0].warning(blocker.label, icon=":material/error:")
         if on_jump and columns[1].button("Review", key=f"approval_blocker:{blocker.code}:{index}",

@@ -257,6 +257,8 @@ def _invalidate_suggestion_request_snapshot(candidate_id: str) -> None:
 def _jump_to_blocker(anchor: str, candidate_id: str) -> None:
     st.session_state.review_jump_to = anchor
     st.session_state.review_show_issues = True
+    if anchor == "recipe-identity":
+        st.session_state.review_identity_target = candidate_id
     if anchor in {"suggestions", "suggestion-request"}:
         # Tabs register their session-state key when the editor fragment is
         # rendered. Defer changing it until the next app run, before that
@@ -631,7 +633,126 @@ def main() -> None:
             _render_editor_fragment(view, buffer)
     _render_ingredient_repair(view, buffer)
     _render_findings(view, buffer)
+    _render_identity_resolution(view, views)
     _render_retry_panel(view, views)
+
+
+def _render_identity_resolution(view, views) -> None:
+    """Show a direct, append-only identity comparison for the selected candidate."""
+    if st.session_state.get("review_identity_target") != view.candidate_id:
+        return
+    store = review_store()
+    proposals = store.identity_reconciliation_candidates()
+    proposal = next((item for item in proposals if item["candidate_id"] == view.candidate_id), None)
+    st.subheader("Recipe identity needs review")
+    if proposal is None:
+        st.info("This identity is already resolved or its saved registration is unavailable.")
+        if st.button("Return to Review", key=f"identity_return:{view.candidate_id}"):
+            st.session_state.pop("review_identity_target", None)
+            st.rerun()
+        return
+
+    from draft_store import DraftStore
+    from app_pages.common import paths
+    output, _ = paths()
+    drafts = DraftStore(output / "ui_drafts.jsonl").all_latest()
+    previous_id = proposal.get("previous_candidate_id")
+    previous_draft = drafts.get(previous_id) if previous_id else None
+    held_draft = drafts.get(view.candidate_id)
+    with st.container(border=True):
+        st.markdown(f"**{view.candidate.name or 'Untitled recipe'}**")
+        st.caption(f"Source: {view.source_display_name or 'Unknown file'} · hash `{view.source_hash[:12]}`")
+        st.caption(f"Current extraction: `{view.extraction_id[:12]}` · status: needs review")
+        st.caption(f"Prior import protection: {'protected' if proposal['protected'] else 'none found'}")
+        st.caption(f"Saved drafts: current {'yes' if held_draft else 'no'} · previous {'yes' if previous_draft else 'no'}")
+        if proposal.get("previous_candidate_id"):
+            st.caption(f"Previous extraction: `{str(proposal.get('previous_extraction_id') or '')[:12]}` · status: registered")
+        if not proposal["authoritative_differences"] and proposal.get("previous_candidate_id"):
+            st.info("The recipe content matches an earlier extraction. The newer extraction contains different AI suggestions. These versions can be linked without automatically approving the newer suggestions.")
+        elif proposal.get("possible_matches"):
+            st.warning(proposal.get("reason") or "Select a possible match only after checking its source evidence.")
+        else:
+            st.warning("No same-source authoritative-content match is available. This identity remains held.")
+
+        with st.expander("Inspect differences", expanded=True):
+            if proposal.get("authoritative_differences"):
+                st.write("Authoritative recipe fields differ:", ", ".join(proposal["authoritative_differences"]))
+            elif proposal.get("previous_candidate_id"):
+                st.write("Authoritative recipe fields match exactly under the documented identity rule.")
+            st.write("Current registration and review activity:", proposal.get("held_history") or "No revision or decision history recorded.")
+            st.write("Previous registration and review activity:", proposal.get("previous_history") or "No revision or decision history recorded.")
+            for match in proposal.get("possible_matches", []):
+                st.markdown(f"**Possible match:** {match['candidate'].get('name') or 'Untitled'} · `{str(match['candidate_id'])[:12]}`")
+                st.caption(f"Extraction `{str(match.get('extraction_id') or '')[:12]}` · authoritative differences: {', '.join(match['differences']) or 'none'} · import protection: {'yes' if match['protected'] else 'no'}")
+            current_suggestions = proposal["candidate"].get("suggestions", [])
+            previous_candidate = proposal.get("previous_candidate") or {}
+            previous_suggestions = previous_candidate.get("suggestions", [])
+            st.write("Suggestion differences")
+            if current_suggestions == previous_suggestions:
+                st.caption("No suggestion differences.")
+            else:
+                st.json({"previous": previous_suggestions, "current": current_suggestions})
+            st.caption("Diagnostic metadata differences are excluded from logical identity.")
+
+        eligible = bool(proposal["eligible"])
+        if eligible:
+            st.caption("This match is uniquely eligible. Confirming it preserves both candidate histories and does not carry forward an approval.")
+            if st.button("Confirm identity match", key=f"identity_confirm:{view.candidate_id}", type="primary"):
+                try:
+                    store.confirm_identity_match(view.candidate_id, str(previous_id))
+                except Exception as exc:
+                    st.error(f"This identity remains unresolved. {exc}")
+                else:
+                    st.session_state.pop("review_identity_target", None)
+                    st.rerun()
+        else:
+            exact_matches = [item for item in proposal.get("possible_matches", [])
+                             if not item["differences"] and item["identity_status"] == "registered"]
+            if exact_matches and not proposal["protected"]:
+                labels = {str(item["candidate_id"]):
+                          f"{item['candidate'].get('name') or 'Untitled'} · {str(item.get('extraction_id') or '')[:12]}"
+                          for item in exact_matches}
+                selected = st.selectbox("Choose the exact matching extraction", list(labels),
+                                        format_func=lambda key: labels[key],
+                                        key=f"identity_match_choice:{view.candidate_id}")
+                evidence = st.text_input("Why these source-backed records are the same recipe", key=f"identity_evidence:{view.candidate_id}")
+                if st.button("Confirm selected match", key=f"identity_confirm_selected:{view.candidate_id}",
+                             disabled=not evidence.strip()):
+                    try:
+                        store.confirm_identity_match(view.candidate_id, selected, evidence)
+                    except Exception as exc:
+                        st.error(f"This identity remains unresolved. {exc}")
+                    else:
+                        st.session_state.pop("review_identity_target", None)
+                        st.rerun()
+            else:
+                st.caption(proposal.get("reason") or "No safe match can be confirmed from the available records.")
+        batch_eligible = [item for item in proposals if item["eligible"]]
+        if batch_eligible:
+            st.caption(f"{len(batch_eligible)} safe identity match{'es' if len(batch_eligible) != 1 else ''} available across the review queue.")
+            if st.button(f"Confirm all {len(batch_eligible)} safe matches", key="identity_confirm_batch"):
+                confirmed = 0
+                try:
+                    for item in batch_eligible:
+                        store.confirm_identity_match(item["candidate_id"], str(item["previous_candidate_id"]))
+                        confirmed += 1
+                except Exception as exc:
+                    st.warning(f"Batch review stopped after {confirmed} confirmations. Remaining identities stay unresolved. {exc}")
+                else:
+                    st.session_state.pop("review_identity_target", None)
+                    st.rerun()
+        controls = st.columns(2)
+        if controls[0].button("Defer", key=f"identity_defer:{view.candidate_id}"):
+            try:
+                store.defer_identity_match(view.candidate_id, view.extraction_id)
+            except Exception as exc:
+                st.error(f"This identity remains unresolved. {exc}")
+            else:
+                st.session_state.pop("review_identity_target", None)
+                st.rerun()
+        if controls[1].button("Return to Review", key=f"identity_return:{view.candidate_id}"):
+            st.session_state.pop("review_identity_target", None)
+            st.rerun()
 
 
 def _render_retry_panel(view, views) -> None:

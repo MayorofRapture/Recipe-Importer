@@ -43,6 +43,8 @@ records.
 
 ## Local review app
 
+See [identity stability and reconciliation](docs/identity-stability-and-reconciliation.md) for the versioned matching rules and safe recovery workflow.
+
 After installing the project dependencies, double-click `run_app.bat` or start
 the app from PowerShell:
 

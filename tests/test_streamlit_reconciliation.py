@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import os
+import hashlib
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -8,9 +10,9 @@ from unittest.mock import patch
 
 from streamlit.testing.v1 import AppTest
 
-from recipe_quality import ExtractionBatch, RecipeCandidate
+from recipe_quality import ExtractionBatch, RecipeCandidate, Suggestion
 from reconciliation_service import ReconciliationError, RetryService
-from review_store import ReviewStore
+from review_store import ReviewStore, _candidate_payload, _canonical, extraction_identity
 from tests.ui_fixture_factory import write_ui_fixture
 from ui_data import load_catalog
 
@@ -41,6 +43,139 @@ class StreamlitReconciliationTests(unittest.TestCase):
         app.session_state["review_comparison_attempt_id"] = attempt_id
         app.run(timeout=15)
         return app
+
+    def test_identity_review_button_opens_comparison_and_confirmation_unblocks_only_identity(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = write_ui_fixture(Path(tmp))
+            output = Path(fixture["output"])
+            (output / "import_state.jsonl").unlink()
+            existing = next(view for view in load_catalog(output)
+                            if view.candidate.name == "Fried Rice")
+            updated = existing.candidate.model_copy(update={"suggestions": [Suggestion(
+                suggestion_id="new-review-proposal", field_path="instructions[0]",
+                proposed_value="Fold in the egg gently.", rationale="Possible omitted detail.",
+            )]})
+            extraction_id = extraction_identity(existing.source_hash, {
+                "recipes": [updated.model_dump(mode="json")], "general_warnings": [],
+            })
+            (output / "extracted" / f"{existing.source_hash}--identity-v2.json").write_text(
+                json.dumps({"source_hash": existing.source_hash,
+                            "batch": {"recipes": [updated.model_dump(mode="json")]}}),
+                encoding="utf-8",
+            )
+            payload = _candidate_payload(updated)
+            event = ReviewStore(output / "review_events.jsonl")._base_event(
+                "candidate_registration", "held-identity-v2", existing.source_hash,
+                extraction_id, "synthetic-legacy-held-v2",
+            )
+            event.update({"source": str(fixture["source"]),
+                          "fingerprint": hashlib.sha256(_canonical(payload).encode()).hexdigest(),
+                          "identity_status": "needs_reconciliation", "legacy_id": "",
+                          "title_legacy_id": "", "legacy_aliases": [], "candidate": payload,
+                          "target_bindings": []})
+            with (output / "review_events.jsonl").open("a", encoding="utf-8") as ledger:
+                ledger.write(json.dumps(event) + "\n")
+            environment = patch.dict(os.environ, {
+                "RECIPE_IMPORTER_OUTPUT_DIR": str(output),
+                "RECIPE_IMPORTER_SOURCE_DIR": str(Path(fixture["source"]).parent),
+            }, clear=False)
+            environment.start()
+            self.addCleanup(environment.stop)
+            app = AppTest.from_file(str(APP_PATH)).run(timeout=15)
+            picker = next((item for item in app.selectbox if item.label == "Jump to recipe"), None)
+            self.assertIsNotNone(picker, [item.label for item in app.selectbox])
+            picker.select("held-identity-v2").run(timeout=15)
+            next(button for button in app.button if button.label == "Resolve identity").click().run(timeout=15)
+            self.assertTrue(any("recipe content matches an earlier extraction" in item.value.casefold()
+                                for item in app.info))
+            self.assertTrue(any(button.label == "Confirm identity match" for button in app.button))
+            next(button for button in app.button if button.label == "Confirm identity match").click().run(timeout=15)
+            view = next(item for item in load_catalog(output)
+                        if item.candidate_id == "held-identity-v2")
+            remaining_blockers = [item.value for item in app.warning]
+            events = [json.loads(line) for line in
+                      (output / "review_events.jsonl").read_text(encoding="utf-8").splitlines()]
+
+        self.assertFalse(app.exception)
+        self.assertEqual(view.identity_status, "registered")
+        self.assertFalse(view.import_ready)
+        self.assertEqual(view.candidate.suggestions[0].review_status, "pending")
+        self.assertTrue(any("suggestion" in item.casefold() for item in remaining_blockers))
+        self.assertEqual(sum(item.get("event") == "candidate_identity_link"
+                             and item.get("candidate_id") == "held-identity-v2" for item in events), 1)
+
+    def test_identity_panel_batch_count_and_confirmation_use_only_safe_matches(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = write_ui_fixture(Path(tmp))
+            output = Path(fixture["output"])
+            (output / "import_state.jsonl").unlink()
+            base = next(view for view in load_catalog(output) if view.candidate.name == "Fried Rice")
+            store = ReviewStore(output / "review_events.jsonl")
+            held_ids = []
+            for index in range(17):
+                source_hash = f"synthetic-source-{index}"
+                recipe = RecipeCandidate(
+                    name=f"Synthetic blend {index}", ingredients=[f"{index + 1} tsp salt"],
+                    instructions=["Stir."],
+                )
+                prior = store.register_candidates("synthetic.jpg", source_hash,
+                                                  f"old-{index}", [recipe])[0]
+                updated = recipe.model_copy(update={"suggestions": [Suggestion(
+                    suggestion_id=f"suggestion-{index}", field_path="instructions[0]",
+                    proposed_value="Stir thoroughly.", rationale="Synthetic proposal.",
+                )]})
+                payload = _candidate_payload(updated)
+                held_id = f"held-{index}"
+                extraction_id = f"new-{index}"
+                event = store._base_event("candidate_registration", held_id, source_hash,
+                                          extraction_id, f"held-registration-{index}")
+                event.update({"source": "synthetic.jpg", "fingerprint": hashlib.sha256(
+                    _canonical(payload).encode()).hexdigest(), "identity_status": "needs_reconciliation",
+                    "candidate": payload, "legacy_aliases": [], "target_bindings": []})
+                with (output / "review_events.jsonl").open("a", encoding="utf-8") as ledger:
+                    ledger.write(json.dumps(event) + "\n")
+                held_ids.append((held_id, prior["candidate_id"]))
+                store = ReviewStore(output / "review_events.jsonl")
+            # Add one displayable current candidate; the remaining 17 are queue-level synthetic records.
+            updated_visible = base.candidate.model_copy(update={"suggestions": [Suggestion(
+                suggestion_id="visible-proposal", field_path="instructions[0]",
+                proposed_value="Fold in gently.", rationale="Synthetic proposal.",
+            )]})
+            extraction_id = extraction_identity(base.source_hash, {
+                "recipes": [updated_visible.model_dump(mode="json")], "general_warnings": [],
+            })
+            payload = _candidate_payload(updated_visible)
+            visible_event = store._base_event("candidate_registration", "held-visible", base.source_hash,
+                                              extraction_id, "held-visible-registration")
+            visible_event.update({"source": str(fixture["source"]), "fingerprint": hashlib.sha256(
+                _canonical(payload).encode()).hexdigest(), "identity_status": "needs_reconciliation",
+                "candidate": payload, "legacy_aliases": [], "target_bindings": []})
+            with (output / "review_events.jsonl").open("a", encoding="utf-8") as ledger:
+                ledger.write(json.dumps(visible_event) + "\n")
+            (output / "extracted" / f"{base.source_hash}--batch-v2.json").write_text(
+                json.dumps({"source_hash": base.source_hash, "batch": {
+                    "recipes": [updated_visible.model_dump(mode="json")], "general_warnings": [],
+                }}), encoding="utf-8",
+            )
+            environment = patch.dict(os.environ, {
+                "RECIPE_IMPORTER_OUTPUT_DIR": str(output),
+                "RECIPE_IMPORTER_SOURCE_DIR": str(Path(fixture["source"]).parent),
+            }, clear=False)
+            environment.start()
+            self.addCleanup(environment.stop)
+            app = AppTest.from_file(str(APP_PATH)).run(timeout=15)
+            picker = next(item for item in app.selectbox if item.label == "Jump to recipe")
+            picker.select("held-visible").run(timeout=15)
+            next(button for button in app.button if button.label == "Resolve identity").click().run(timeout=15)
+            self.assertTrue(any(button.label == "Confirm all 18 safe matches" for button in app.button))
+            next(button for button in app.button if button.label == "Confirm all 18 safe matches").click().run(timeout=15)
+            linked = [event for event in ReviewStore(output / "review_events.jsonl").events
+                      if event.get("event") == "candidate_identity_link"
+                      and event.get("decision") == "confirmed_unique_content_match"]
+
+        self.assertFalse(app.exception)
+        self.assertEqual(len(linked), 18)
+        self.assertEqual(len(held_ids), 17)
 
     def test_cancel_comparison_returns_to_draft_without_mutation(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -279,7 +279,9 @@ def load_catalog(output_dir: Path, source_root: Path | None = None, *,
                 revision=effective.revision if effective else 0,
                 content_digest=effective.content_sha256 if effective else "",
                 target_bindings=tuple(registration.get("target_bindings", [])),
-                identity_status=str(registration.get("identity_status", "registered")),
+                identity_status=("registered" if reviews.identity_link_status(
+                    identity, source_hash, extraction_id) == "registered"
+                    else str(registration.get("identity_status", "registered"))),
                 source_available=source_available,
                 source_verified=verify_sources and source_available,
                 legacy_draft_conflict=bool(effective and effective.legacy_draft_conflict),
@@ -373,7 +375,9 @@ def load_catalog(output_dir: Path, source_root: Path | None = None, *,
             import_ready=status == "Ready to import" and not intent_protected,
             extraction_id=extraction_id, revision=effective.revision,
             target_bindings=tuple(registration.get("target_bindings", [])),
-            identity_status=str(registration.get("identity_status", "registered")),
+            identity_status=("registered" if reviews.identity_link_status(
+                candidate_id, source_hash, extraction_id) == "registered"
+                else str(registration.get("identity_status", "registered"))),
             source_available=source_available,
             source_verified=verify_sources and source_available,
             legacy_draft_conflict=effective.legacy_draft_conflict,

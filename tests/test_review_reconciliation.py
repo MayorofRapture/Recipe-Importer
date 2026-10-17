@@ -5,16 +5,261 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from recipe_quality import ExtractionBatch, RecipeCandidate
-from review_store import ReviewConflict, ReviewStore
+from recipe_quality import ExtractionBatch, RecipeCandidate, Suggestion
+from review_store import (
+    ReviewConflict, ReviewStore, _candidate_payload, _canonical, authoritative_recipe_differences,
+    logical_recipe_identity,
+)
+import hashlib
 from reconciliation_service import RetryService, ReconciliationError
 from import_recipes import StateStore
 from import_protection import protected_candidate_ids
+from draft_store import DraftStore
 from tests.ui_fixture_factory import write_ui_fixture
 from ui_data import load_catalog
 
 
 class ReviewReconciliationTests(unittest.TestCase):
+    def _legacy_held_suggestion_version(self, root: Path, suffix: str = ""):
+        path = root / "review_events.jsonl"
+        store = ReviewStore(path)
+        original = RecipeCandidate(
+            name=f"Blend{suffix}", ingredients=["1 tsp salt"], instructions=["Stir."],
+        )
+        held = original.model_copy(update={"suggestions": [Suggestion(
+            suggestion_id=f"proposal-v2{suffix}", field_path="instructions[0]",
+            proposed_value="Stir well.", rationale="Possible missing detail.",
+        )]})
+        source_hash = f"same-source{suffix}"
+        prior = store.register_candidates("blend.jpg", source_hash, f"extract-v1{suffix}", [original])[0]
+        payload = _candidate_payload(held)
+        fingerprint = hashlib.sha256(_canonical(payload).encode()).hexdigest()
+        event = store._base_event(
+            "candidate_registration", f"held-candidate{suffix}", source_hash,
+            f"extract-v2{suffix}", f"legacy-held-v2{suffix}",
+        )
+        event.update({"source": "blend.jpg", "fingerprint": fingerprint,
+                      "identity_status": "needs_reconciliation", "legacy_id": "",
+                      "title_legacy_id": "", "legacy_aliases": [], "candidate": payload,
+                      "target_bindings": []})
+        with path.open("a", encoding="utf-8") as output:
+            output.write(json.dumps(event) + "\n")
+        return path, prior, event
+
+    def test_eighteen_synthetic_metadata_only_pairs_project_as_safe_review_candidates(self):
+        with tempfile.TemporaryDirectory(dir=".devtest-tmp") as tmp:
+            root = Path(tmp)
+            for index in range(18):
+                self._legacy_held_suggestion_version(root, suffix=f"-{index}")
+            proposals = ReviewStore(root / "review_events.jsonl").identity_reconciliation_candidates()
+
+        self.assertEqual(len(proposals), 18)
+        self.assertEqual(sum(item["eligible"] for item in proposals), 18)
+        self.assertTrue(all(not item["authoritative_differences"] for item in proposals))
+
+    def test_metadata_only_historical_pair_requires_explicit_append_only_confirmation(self):
+        with tempfile.TemporaryDirectory(dir=".devtest-tmp") as tmp:
+            path, prior, held = self._legacy_held_suggestion_version(Path(tmp))
+            store = ReviewStore(path)
+            before = path.read_text(encoding="utf-8").splitlines()
+            proposal = next(item for item in store.identity_reconciliation_candidates()
+                            if item["candidate_id"] == "held-candidate")
+            self.assertTrue(proposal["eligible"])
+            self.assertEqual(proposal["authoritative_differences"], [])
+            self.assertTrue(proposal["suggestions_differ"])
+            self.assertNotEqual(held["extraction_id"], prior["extraction_id"])
+
+            event = store.confirm_identity_match("held-candidate", prior["candidate_id"])
+            repeated = ReviewStore(path).confirm_identity_match("held-candidate", prior["candidate_id"])
+            reopened = ReviewStore(path)
+            after = path.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(event["event"], "candidate_identity_link")
+        self.assertEqual(event["event_id"], repeated["event_id"])
+        self.assertEqual(len(after), len(before) + 1)
+        self.assertEqual(reopened.identity_link_status("held-candidate", "same-source", "extract-v2"),
+                         "registered")
+        self.assertEqual(set(reopened.registrations), {prior["candidate_id"], "held-candidate"})
+
+    def test_confirmed_identity_keeps_existing_draft_and_revision_streams_separate(self):
+        with tempfile.TemporaryDirectory(dir=".devtest-tmp") as tmp:
+            root = Path(tmp)
+            path, prior, held = self._legacy_held_suggestion_version(root)
+            drafts = DraftStore(root / "ui_drafts.jsonl")
+            drafts.save("held-candidate", "same-source", "blend.jpg", {"name": "Blend", "notes": ["keep me"]},
+                        "", "", "structured", [])
+            store = ReviewStore(path)
+            store.save_revision(candidate_id="held-candidate", source_hash="same-source",
+                                extraction_id="extract-v2", expected_parent=0,
+                                operation_id="held-revision", recipe=held["candidate"], target_bindings=[])
+            store.confirm_identity_match("held-candidate", prior["candidate_id"])
+            reopened = ReviewStore(path)
+            draft_after = drafts.all_latest()["held-candidate"]
+
+        self.assertEqual(draft_after.recipe["notes"], ["keep me"])
+        self.assertIn("held-candidate", reopened.revisions)
+        self.assertNotIn("held-candidate", reopened.approvals)
+        self.assertNotEqual(prior["candidate_id"], "held-candidate")
+
+    def test_import_protected_historical_match_stays_ineligible_and_defer_is_audited(self):
+        with tempfile.TemporaryDirectory(dir=".devtest-tmp") as tmp:
+            root = Path(tmp)
+            path, prior, _held = self._legacy_held_suggestion_version(root)
+            (root / "import_state.jsonl").write_text(json.dumps({
+                "key": "same-source:0", "source_hash": "same-source", "status": "IMPORTED",
+            }) + "\n", encoding="utf-8")
+            store = ReviewStore(path)
+            proposal = next(item for item in store.identity_reconciliation_candidates()
+                            if item["candidate_id"] == "held-candidate")
+            store.defer_identity_match("held-candidate", "extract-v2")
+            reopened = ReviewStore(path)
+
+        self.assertFalse(proposal["eligible"])
+        self.assertTrue(proposal["protected"])
+        self.assertEqual(reopened.identity_link_status("held-candidate", "same-source", "extract-v2"),
+                         "needs_reconciliation")
+        self.assertTrue(any(event.get("event") == "candidate_identity_review"
+                            and event.get("decision") == "deferred" for event in reopened.events))
+
+    def test_conflicting_historical_recipe_content_remains_held(self):
+        with tempfile.TemporaryDirectory(dir=".devtest-tmp") as tmp:
+            root = Path(tmp)
+            path, _prior, held = self._legacy_held_suggestion_version(root)
+            events = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+            events[-1]["candidate"]["ingredients"] = ["2 tsp salt"]
+            path.write_text("".join(json.dumps(item) + "\n" for item in events), encoding="utf-8")
+            proposal = next(item for item in ReviewStore(path).identity_reconciliation_candidates()
+                            if item["candidate_id"] == held["candidate_id"])
+
+        self.assertFalse(proposal["eligible"])
+        self.assertIn("ingredients", proposal["possible_matches"][0]["differences"])
+
+    def test_unlinked_prior_version_blocks_future_automatic_reuse_until_confirmed(self):
+        with tempfile.TemporaryDirectory(dir=".devtest-tmp") as tmp:
+            unlinked_root = Path(tmp) / "unlinked"
+            confirmed_root = Path(tmp) / "confirmed"
+            unlinked_root.mkdir()
+            confirmed_root.mkdir()
+            path, _prior, held = self._legacy_held_suggestion_version(unlinked_root)
+            store = ReviewStore(path)
+            third = RecipeCandidate.model_validate(held["candidate"]).model_copy(update={"suggestions": [Suggestion(
+                suggestion_id="proposal-v3", field_path="instructions[0]",
+                proposed_value="Stir very well.", rationale="Another possible detail.",
+            )]})
+            before_confirmation = store.register_candidates("blend.jpg", "same-source", "extract-v3", [third])[0]
+            confirmed_path, prior, _held = self._legacy_held_suggestion_version(confirmed_root)
+            store = ReviewStore(confirmed_path)
+            store.confirm_identity_match("held-candidate", prior["candidate_id"])
+            after_confirmation = store.register_candidates("blend.jpg", "same-source", "extract-v3", [third])[0]
+
+        self.assertEqual(before_confirmation["identity_status"], "needs_reconciliation")
+        self.assertEqual(after_confirmation["identity_status"], "registered")
+        self.assertNotEqual(after_confirmation["candidate_id"], prior["candidate_id"])
+
+    def test_ambiguous_exact_matches_require_evidence_and_selected_identity(self):
+        with tempfile.TemporaryDirectory(dir=".devtest-tmp") as tmp:
+            root = Path(tmp)
+            path, prior, held = self._legacy_held_suggestion_version(root)
+            store = ReviewStore(path)
+            duplicate = store._base_event("candidate_registration", "prior-duplicate", "same-source",
+                                          "extract-v0", "synthetic-prior-duplicate")
+            payload = _candidate_payload(RecipeCandidate(
+                name="Blend", ingredients=["1 tsp salt"], instructions=["Stir."],
+            ))
+            duplicate.update({"source": "blend.jpg", "fingerprint": hashlib.sha256(
+                _canonical(payload).encode()).hexdigest(), "identity_status": "registered",
+                "candidate": payload, "legacy_aliases": [], "target_bindings": []})
+            with path.open("a", encoding="utf-8") as output:
+                output.write(json.dumps(duplicate) + "\n")
+            store = ReviewStore(path)
+            proposal = next(item for item in store.identity_reconciliation_candidates()
+                            if item["candidate_id"] == held["candidate_id"])
+            self.assertFalse(proposal["eligible"])
+            self.assertEqual(len(proposal["possible_matches"]), 2)
+            with self.assertRaises(ReviewConflict):
+                store.confirm_identity_match(held["candidate_id"], prior["candidate_id"])
+            event = store.confirm_identity_match(
+                held["candidate_id"], "prior-duplicate", "The matching recipe heading and ingredient block agree."
+            )
+
+        self.assertEqual(event["decision"], "confirmed_user_selected_match")
+        self.assertEqual(event["evidence"], "The matching recipe heading and ingredient block agree.")
+
+    def test_authoritative_changes_are_not_auto_matched(self):
+        original = {"name": "Blend", "ingredients": ["1 tsp salt"], "instructions": ["Stir."]}
+        self.assertEqual(logical_recipe_identity(original), logical_recipe_identity({
+            **original, "notes": [], "suggestions": ["changed"], "warnings": ["changed"],
+            "confidence": "low", "source_method": "other",
+        }))
+        self.assertEqual(authoritative_recipe_differences(original, {**original, "notes": []}), {})
+        self.assertIn("ingredients", authoritative_recipe_differences(
+            original, {**original, "ingredients": ["2 tsp salt"]},
+        ))
+        self.assertIn("instructions", authoritative_recipe_differences(
+            original, {**original, "instructions": ["Stir thoroughly."]},
+        ))
+        self.assertIn("name", authoritative_recipe_differences(
+            original, {**original, "name": "New blend"},
+        ))
+
+    def test_identical_sibling_recipes_remain_held(self):
+        with tempfile.TemporaryDirectory(dir=".devtest-tmp") as tmp:
+            store = ReviewStore(Path(tmp) / "review_events.jsonl")
+            recipe = RecipeCandidate(name="Sibling", ingredients=["1 cup rice"], instructions=["Cook."])
+            rows = store.register_candidates("source.jpg", "same-source", "extract-1", [recipe, recipe])
+
+        self.assertEqual([row["identity_status"] for row in rows],
+                         ["needs_reconciliation", "needs_reconciliation"])
+        self.assertNotEqual(rows[0]["candidate_id"], rows[1]["candidate_id"])
+
+    def test_identical_text_from_a_different_source_hash_is_a_separate_identity(self):
+        with tempfile.TemporaryDirectory(dir=".devtest-tmp") as tmp:
+            store = ReviewStore(Path(tmp) / "review_events.jsonl")
+            recipe = RecipeCandidate(name="Cake", ingredients=["2 cups flour"], instructions=["Bake."])
+            first = store.register_candidates("one.jpg", "source-one", "extract-one", [recipe])[0]
+            second = store.register_candidates("two.jpg", "source-two", "extract-two", [recipe])[0]
+            links = [event for event in store.events if event.get("event") == "candidate_identity_link"]
+
+        self.assertNotEqual(first["candidate_id"], second["candidate_id"])
+        self.assertFalse(links)
+
+    def test_import_protected_source_does_not_auto_link_changed_suggestions(self):
+        with tempfile.TemporaryDirectory(dir=".devtest-tmp") as tmp:
+            root = Path(tmp)
+            state_path = root / "import_state.jsonl"
+            store = ReviewStore(root / "review_events.jsonl", state_path=state_path)
+            recipe = RecipeCandidate(name="Protected", ingredients=["1 cup rice"], instructions=["Cook."])
+            first = store.register_candidates("source.jpg", "same-source", "extract-1", [recipe])[0]
+            state_path.write_text(json.dumps({"status": "IMPORTED", "source_hash": "same-source"}) + "\n",
+                                  encoding="utf-8")
+            changed = recipe.model_copy(update={"suggestions": [Suggestion(
+                suggestion_id="pending", field_path="instructions[0]", proposed_value="Cook gently.",
+                rationale="Check the source.",
+            )]})
+            second = store.register_candidates("source.jpg", "same-source", "extract-2", [changed])[0]
+
+        self.assertNotEqual(first["candidate_id"], second["candidate_id"])
+        self.assertEqual(second["identity_status"], "needs_reconciliation")
+
+    def test_suggestion_only_extraction_gets_a_distinct_registered_candidate_stream(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ReviewStore(Path(tmp) / "review_events.jsonl")
+            original = RecipeCandidate(
+                name="Blend", ingredients=["1 tsp salt"], instructions=["Stir."],
+            )
+            changed_suggestions = original.model_copy(update={"suggestions": [Suggestion(
+                suggestion_id="proposal-v2", field_path="instructions[0]",
+                proposed_value="Stir well.", rationale="Possible missing detail.",
+            )]})
+            first = store.register_candidates("blend.jpg", "same-source", "extract-v1", [original])[0]
+            second = store.register_candidates(
+                "blend.jpg", "same-source", "extract-v2", [changed_suggestions],
+            )[0]
+
+        self.assertEqual(first["identity_status"], "registered")
+        self.assertEqual(second["identity_status"], "registered")
+        self.assertNotEqual(first["candidate_id"], second["candidate_id"])
+        self.assertNotEqual(first["extraction_id"], second["extraction_id"])
+
     def _retry(self, root: Path, candidates):
         fixture = write_ui_fixture(root)
 

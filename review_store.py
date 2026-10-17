@@ -143,6 +143,39 @@ def _recipe_digest(recipe: dict) -> str:
     return hashlib.sha256(b"recipe-content-v1\0" + _canonical(fields).encode("utf-8")).hexdigest()
 
 
+_IDENTITY_FIELDS = (
+    "name", "ingredients", "instructions", "yield_text", "description", "notes",
+    "prep_time", "perform_time", "total_time", "recipe_category", "tags",
+)
+
+
+def authoritative_recipe_payload(recipe: dict) -> dict:
+    """Return conservative, versioned source-content fields for logical identity."""
+    payload = {}
+    for field in _IDENTITY_FIELDS:
+        value = recipe.get(field)
+        if field in {"yield_text", "description"}:
+            value = value or None
+        elif field in {"ingredients", "instructions", "notes", "tags"}:
+            value = value or []
+        elif field == "name":
+            value = value or ""
+        payload[field] = value
+    return payload
+
+
+def logical_recipe_identity(recipe: dict) -> str:
+    """Hash authoritative recipe content; extraction metadata is intentionally excluded."""
+    return hashlib.sha256(
+        b"logical-recipe-v1\0" + _canonical(authoritative_recipe_payload(recipe)).encode("utf-8")
+    ).hexdigest()
+
+
+def authoritative_recipe_differences(left: dict, right: dict) -> dict[str, tuple[object, object]]:
+    a, b = authoritative_recipe_payload(left), authoritative_recipe_payload(right)
+    return {key: (a[key], b[key]) for key in _IDENTITY_FIELDS if a[key] != b[key]}
+
+
 def _resolution_digest(resolutions: list[dict]) -> str:
     values = [{key: value for key, value in item.items()
                if key not in {"event_id", "timestamp", "actor"}}
@@ -208,6 +241,12 @@ class ReviewStore:
         self.decisions: dict[str, list[ReviewDecision]] = {}
         self.candidate_decisions: dict[str, list[ReviewDecision]] = {}
         self._exact_registration_index: dict[tuple[str, str, str], list[dict]] = {}
+        self._source_registration_index: dict[str, list[dict]] = {}
+        self._source_event_index: dict[str, list[dict]] = {}
+        self._source_path_event_index: dict[str, list[dict]] = {}
+        self._candidate_history_index: dict[str, Counter] = {}
+        self._identity_link_group_index: dict[tuple[str, str, str], str] = {}
+        self._protected_source_cache: set[str] | None = None
         with _state_lock(path):
             self._reload()
 
@@ -221,6 +260,12 @@ class ReviewStore:
         self.resolutions = {}
         self.events = []
         self._exact_registration_index = {}
+        self._source_registration_index = {}
+        self._source_event_index = {}
+        self._source_path_event_index = {}
+        self._candidate_history_index = {}
+        self._identity_link_group_index = {}
+        self._protected_source_cache = None
         self._suggestion_requests_by_candidate: dict[str, list[dict]] = {}
         self._suggestion_requests_by_id: dict[str, dict] = {}
         self._suggestion_request_status_by_id: dict[str, dict] = {}
@@ -240,6 +285,7 @@ class ReviewStore:
                 if kind == "candidate_registration":
                     self.registrations.setdefault(identity, []).append(event)
                     self._index_registration(event)
+                    self._source_registration_index.setdefault(str(event.get("source_hash", "")), []).append(event)
                 elif kind == "review_revision":
                     self.revisions.setdefault(identity, []).append(event)
                 elif kind == "review_approval":
@@ -256,6 +302,37 @@ class ReviewStore:
                     self.candidate_decisions.setdefault(identity, []).append(ReviewDecision(
                         "", event["status"], event.get("final_value"), event.get("timestamp", "")
                     ))
+                if kind == "candidate_identity_link" and event.get("decision") in {
+                    "confirmed_unique_content_match", "confirmed_user_selected_match",
+                    "automatic_unique_content_match",
+                }:
+                    self._identity_link_group_index[(str(identity), str(event.get("source_hash", "")),
+                                                     str(event.get("extraction_id", "")))] = str(
+                        event.get("identity_group_id", ""))
+                history_kinds = {"review_revision": "revisions", "review_approval": "approvals",
+                                 "decision": "suggestion_decisions", "candidate_decision": "review_decisions",
+                                 "dynamic_suggestion": "generated_proposals",
+                                 "dynamic_suggestion_decision": "proposal_decisions"}
+                if kind in history_kinds:
+                    self._candidate_history_index.setdefault(identity, Counter())[history_kinds[kind]] += 1
+        path_sources: dict[str, set[str]] = {}
+        for source, items in self._source_registration_index.items():
+            for item in items:
+                path = str(item.get("source", "")).casefold()
+                if path:
+                    path_sources.setdefault(path, set()).add(source)
+        for event in self.events:
+            if event.get("event") != "candidate":
+                continue
+            identity = str(event.get("candidate_id", ""))
+            if event.get("source"):
+                self._source_path_event_index.setdefault(str(event["source"]).casefold(), []).append(event)
+            prefix, separator, _ = identity.partition(":")
+            if separator and len(prefix) == 64:
+                self._source_event_index.setdefault(prefix, []).append(event)
+            elif event.get("source"):
+                for source in path_sources.get(str(event["source"]).casefold(), set()):
+                    self._source_event_index.setdefault(source, []).append(event)
 
     def _append(self, event: dict, *, locked: bool = False) -> None:
         self._append_many([event], locked=locked)
@@ -364,6 +441,18 @@ class ReviewStore:
             "timestamp": datetime.now(timezone.utc).isoformat(), "actor": "local-user",
         }
 
+    def _identity_link_event(self, candidate_id: str, previous: dict, source_hash: str,
+                             extraction_id: str, identity_digest: str,
+                             identity_group_id: str, decision: str) -> dict:
+        operation_id = f"identity-link:{decision}:{source_hash}:{extraction_id}:{candidate_id}"
+        event = self._base_event("candidate_identity_link", candidate_id, source_hash,
+                                 extraction_id, operation_id)
+        event.update({"previous_candidate_id": str(previous["candidate_id"]),
+                      "identity_group_id": identity_group_id,
+                      "logical_identity_digest": identity_digest,
+                      "comparison_version": 1, "decision": decision})
+        return event
+
     def canonical_candidate_id(self, candidate_id: str) -> str:
         for registered, events in self.registrations.items():
             if candidate_id == registered or any(candidate_id in event.get("legacy_aliases", [])
@@ -401,8 +490,9 @@ class ReviewStore:
             ) for source, source_hash, extraction_id, candidates in batches]
             self._append_many(pending_events, locked=True)
             for event in pending_events:
-                self.registrations.setdefault(event["candidate_id"], []).append(event)
-                self._index_registration(event)
+                if event.get("event") == "candidate_registration":
+                    self.registrations.setdefault(event["candidate_id"], []).append(event)
+                    self._index_registration(event)
             return output
 
     def register_candidates(self, source: str, source_hash: str, extraction_id: str,
@@ -419,11 +509,20 @@ class ReviewStore:
         with (nullcontext() if _lock_held else _state_lock(self.path)):
             if not _lock_held:
                 self._reload()
-            prior_source_registration = any(
-                event.get("source_hash") == source_hash
-                for events in self.registrations.values() for event in events
-            ) or any(event.get("source_hash") == source_hash
-                     for event in (_pending_events or []))
+            source_registrations = list(self._source_registration_index.get(source_hash, []))
+            indexed_source_events = [*self._source_event_index.get(source_hash, []),
+                                     *self._source_path_event_index.get(str(source).casefold(), [])]
+            source_events = list({str(event.get("event_id") or id(event)): event
+                                  for event in indexed_source_events}.values())
+            source_registrations.extend(event for event in (_pending_events or [])
+                                        if event.get("event") == "candidate_registration"
+                                        and event.get("source_hash") == source_hash)
+            source_events.extend(event for event in (_pending_events or [])
+                                 if event.get("event") == "candidate"
+                                 and (str(event.get("candidate_id", "")).startswith(source_hash + ":")
+                                      or str(event.get("source", "")).casefold()
+                                      == str(source).casefold()))
+            prior_source_registration = bool(source_registrations)
             source_import_protected = self._source_has_protected_import_history(source_hash)
             fingerprints = [hashlib.sha256(_canonical(_candidate_payload(item)).encode()).hexdigest()
                             for item in candidates]
@@ -433,44 +532,50 @@ class ReviewStore:
                 and (str(event.get("candidate_id", "")).startswith(source_hash + ":")
                      or str(event.get("source", "")).casefold() == str(source).casefold())
                 and _canonical(event.get("candidate", {})) not in current_payloads
-                for event in self.events
+                for event in source_events
             )
             has_prior_source = (prior_source_registration or prior_source_legacy_candidate
                                 or source_import_protected)
             repeated = {value for value, count in Counter(fingerprints).items() if count > 1}
+            identity_digests = [logical_recipe_identity(_candidate_payload(item)) for item in candidates]
+            repeated_identity_digests = {
+                value for value, count in Counter(identity_digests).items() if count > 1
+            }
             titles = [item.name.casefold().strip() for item in candidates]
             title_counts = Counter(titles)
             exact_index: dict[str, list[dict]] = {}
             prior_index: dict[str, list[dict]] = {}
-            for events in self.registrations.values():
-                for event in events:
-                    if event.get("source_hash") != source_hash:
-                        continue
-                    if event.get("extraction_id") == extraction_id:
-                        exact_index.setdefault(event["fingerprint"], []).append(event)
-                    if event.get("identity_status") == "registered":
-                        prior_index.setdefault(event["fingerprint"], []).append(event)
+            prior_identity_index: dict[str, list[dict]] = {}
+            all_identity_index: dict[str, list[dict]] = {}
+            for event in source_registrations:
+                if event.get("extraction_id") == extraction_id:
+                    exact_index.setdefault(event["fingerprint"], []).append(event)
+                payload = event.get("candidate", {})
+                digest = event.get("logical_identity_digest") or logical_recipe_identity(payload)
+                all_identity_index.setdefault(digest, []).append(event)
+                if event.get("identity_status") == "registered":
+                    prior_index.setdefault(event["fingerprint"], []).append(event)
+                    prior_identity_index.setdefault(digest, []).append(event)
             for event in (_pending_events or []):
                 if event.get("source_hash") != source_hash:
                     continue
                 if event.get("extraction_id") == extraction_id:
                     exact_index.setdefault(event["fingerprint"], []).append(event)
+                payload = event.get("candidate", {})
+                digest = event.get("logical_identity_digest") or logical_recipe_identity(payload)
+                all_identity_index.setdefault(digest, []).append(event)
                 if event.get("identity_status") == "registered":
                     prior_index.setdefault(event["fingerprint"], []).append(event)
+                    prior_identity_index.setdefault(digest, []).append(event)
             legacy_index: dict[str, list[str]] = {}
-            for event in [*self.events, *(_pending_events or [])]:
-                identity = str(event.get("candidate_id", ""))
-                same_source = identity.startswith(source_hash + ":") or any(
-                    item.get("source_hash") == source_hash
-                    for item in self.registrations.get(identity, []))
-                if not same_source and ":" not in identity and source:
-                    same_source = str(event.get("source", "")).casefold() == str(source).casefold()
-                if event.get("event") == "candidate" and same_source:
+            for event in source_events:
+                if event.get("event") == "candidate":
+                    identity = str(event.get("candidate_id", ""))
                     legacy_index.setdefault(_canonical(event.get("candidate", {})), []).append(identity)
             occurrences: dict[str, int] = {}
             output = []
             pending_events = []
-            for candidate, fingerprint in zip(candidates, fingerprints):
+            for candidate, fingerprint, identity_digest in zip(candidates, fingerprints, identity_digests):
                 occurrence = occurrences.get(fingerprint, 0)
                 occurrences[fingerprint] = occurrence + 1
                 exact = exact_index.get(fingerprint, [])
@@ -489,6 +594,33 @@ class ReviewStore:
                     candidate_id, identity_status = prior[0]["candidate_id"], "registered"
                 elif fingerprint not in repeated and prior:
                     candidate_id, identity_status = str(uuid.uuid4()), "needs_reconciliation"
+                elif (fingerprint not in repeated
+                      and identity_digest not in repeated_identity_digests
+                      and prior_identity_index.get(identity_digest)
+                      and not source_import_protected
+                      and not prior_source_legacy_candidate):
+                    groups: dict[str, list[dict]] = {}
+                    unlinked_conflict = False
+                    for match in all_identity_index.get(identity_digest, []):
+                        group_id = (str(match.get("identity_group_id") or "")
+                                    or self._identity_link_group_index.get((str(match["candidate_id"]),
+                                        source_hash, str(match.get("extraction_id", "")))))
+                        if not group_id and match.get("identity_status") == "registered":
+                            group_id = str(match["candidate_id"])
+                        if not group_id:
+                            unlinked_conflict = True
+                        else:
+                            groups.setdefault(group_id, []).append(match)
+                    if len(groups) == 1 and not unlinked_conflict:
+                        identity_group_id, group = next(iter(groups.items()))
+                        previous = max(group, key=lambda item: str(item.get("timestamp", "")))
+                        candidate_id, identity_status = str(uuid.uuid4()), "registered"
+                        pending_events.append(self._identity_link_event(
+                            candidate_id, previous, source_hash, extraction_id, identity_digest,
+                            identity_group_id, "automatic_unique_content_match",
+                        ))
+                    else:
+                        candidate_id, identity_status = str(uuid.uuid4()), "needs_reconciliation"
                 elif fingerprint not in repeated:
                     legacy_matches = legacy_index.get(_canonical(_candidate_payload(candidate)), [])
                     duplicate_title = title_counts[candidate.name.casefold().strip()] > 1
@@ -557,8 +689,17 @@ class ReviewStore:
                                          f"{candidate_id if fingerprint in repeated else 'unique'}")
                 title_legacy_id = (_legacy_identity(source_hash, candidate.name)
                                    if title_counts[candidate.name.casefold().strip()] == 1 else "")
+                identity_group_id = str(candidate_id) if identity_status == "registered" else ""
+                link_event = next((item for item in pending_events
+                                   if item.get("event") == "candidate_identity_link"
+                                   and item.get("candidate_id") == candidate_id), None)
+                if link_event:
+                    identity_group_id = str(link_event["identity_group_id"])
                 event.update({"source": source, "fingerprint": fingerprint,
                               "identity_status": identity_status,
+                              "identity_version": 1,
+                              "logical_identity_digest": identity_digest,
+                              "identity_group_id": identity_group_id,
                               "legacy_id": f"{source_hash}:{fingerprint[:24]}",
                               "title_legacy_id": title_legacy_id,
                               "legacy_aliases": [f"{source_hash}:{fingerprint[:24]}",
@@ -580,11 +721,203 @@ class ReviewStore:
             if _pending_events is None:
                 self._append_many(pending_events, locked=True)
                 for event in pending_events:
-                    self.registrations.setdefault(event["candidate_id"], []).append(event)
-                    self._index_registration(event)
+                    if event.get("event") == "candidate_registration":
+                        self.registrations.setdefault(event["candidate_id"], []).append(event)
+                        self._index_registration(event)
             else:
                 _pending_events.extend(pending_events)
             return output
+
+    def identity_link_status(self, candidate_id: str, source_hash: str, extraction_id: str) -> str:
+        return ("registered" if self._identity_link_group_index.get(
+            (candidate_id, source_hash, extraction_id)) else "needs_reconciliation")
+
+    def identity_reconciliation_candidates(self, source_hash: str | None = None) -> list[dict]:
+        """Read-only diagnostic projection for held versioned registrations."""
+        registrations = [item for events in self.registrations.values() for item in events
+                         if item.get("event") == "candidate_registration"]
+        links = {(item.get("candidate_id"), item.get("source_hash"), item.get("extraction_id"))
+                 for item in self.events if item.get("event") == "candidate_identity_link"
+                 and item.get("decision") in {"confirmed_unique_content_match",
+                                               "confirmed_user_selected_match",
+                                               "automatic_unique_content_match"}}
+        by_source_digest: dict[tuple[str, str], list[dict]] = {}
+        by_source_title: dict[tuple[str, str], list[dict]] = {}
+        by_extraction_digest: dict[tuple[str, str, str], list[dict]] = {}
+        digest_by_object: dict[int, str] = {}
+        for registration in registrations:
+            source_value = str(registration.get("source_hash", ""))
+            content_digest = (registration.get("logical_identity_digest")
+                              or logical_recipe_identity(registration.get("candidate", {})))
+            title_value = str(registration.get("candidate", {}).get("name", "")).casefold()
+            by_source_digest.setdefault((source_value, content_digest), []).append(registration)
+            by_source_title.setdefault((source_value, title_value), []).append(registration)
+            by_extraction_digest.setdefault((source_value, str(registration.get("extraction_id", "")),
+                                              content_digest), []).append(registration)
+            digest_by_object[id(registration)] = str(content_digest)
+        protected_source_cache: dict[str, bool] = {}
+        output = []
+        for held in registrations:
+            held_id = str(held.get("candidate_id", ""))
+            digest = digest_by_object[id(held)]
+            key = (held_id, held.get("source_hash"), held.get("extraction_id"))
+            if held.get("identity_status") != "needs_reconciliation" or key in links:
+                continue
+            if source_hash and held.get("source_hash") != source_hash:
+                continue
+            source_hash_value = str(held.get("source_hash", ""))
+            matches = []
+            matches = [item for item in by_source_digest.get((source_hash_value, str(digest)), [])
+                       if item is not held]
+            groups: dict[str, list[dict]] = {}
+            unlinked_conflict = False
+            registered_matches = []
+            for prior in matches:
+                link_group = self._identity_link_group_index.get((
+                    str(prior.get("candidate_id", "")), source_hash_value,
+                    str(prior.get("extraction_id", "")),
+                ))
+                group_id = str(prior.get("identity_group_id") or link_group or "")
+                if not group_id and prior.get("identity_status") == "registered":
+                    group_id = str(prior.get("candidate_id", ""))
+                if not group_id:
+                    unlinked_conflict = True
+                else:
+                    groups.setdefault(group_id, []).append(prior)
+                    registered_matches.append(prior)
+            current_siblings = by_extraction_digest.get(
+                (source_hash_value, str(held.get("extraction_id", "")), str(digest)), [])
+            if source_hash_value not in protected_source_cache:
+                protected_source_cache[source_hash_value] = self._source_has_protected_import_history(
+                    source_hash_value)
+            source_protected = protected_source_cache[source_hash_value]
+            protected = source_protected
+            eligible = (len(groups) == 1 and not unlinked_conflict and len(current_siblings) == 1
+                        and len(registered_matches) >= 1 and not protected
+                        and source_hash_value and held.get("extraction_id"))
+            prior = (max([item for item in next(iter(groups.values()), [])
+                          if item.get("identity_status") == "registered" or self._identity_link_group_index.get((
+                              str(item.get("candidate_id", "")), source_hash_value,
+                              str(item.get("extraction_id", ""))))],
+                         key=lambda item: str(item.get("timestamp", ""))) if groups else None)
+            title = str(held.get("candidate", {}).get("name", ""))
+            title_matches = [item for item in by_source_title.get((source_hash_value, title.casefold()), [])
+                             if item is not held]
+            possible = []
+            for item in (matches or title_matches)[:8]:
+                previous_candidate = item.get("candidate", {})
+                item_link_group = self._identity_link_group_index.get((
+                    str(item.get("candidate_id", "")), source_hash_value,
+                    str(item.get("extraction_id", "")),
+                ))
+                possible.append({
+                    "candidate_id": item.get("candidate_id"), "extraction_id": item.get("extraction_id"),
+                    "identity_status": ("registered" if item.get("identity_status") == "registered"
+                                         or item_link_group else item.get("identity_status")),
+                    "differences": sorted(authoritative_recipe_differences(
+                        held.get("candidate", {}), previous_candidate)),
+                    "suggestions_differ": held.get("candidate", {}).get("suggestions", [])
+                                          != previous_candidate.get("suggestions", []),
+                    "candidate": previous_candidate,
+                    "history": self._candidate_history_counts(str(item.get("candidate_id", ""))),
+                    "protected": source_protected,
+                })
+            output.append({
+                "candidate_id": held_id, "source_hash": source_hash_value,
+                "source": held.get("source", ""), "extraction_id": held.get("extraction_id", ""),
+                "candidate": held.get("candidate", {}), "fingerprint": held.get("fingerprint", ""),
+                "identity_digest": digest, "authoritative_differences": sorted(
+                    authoritative_recipe_differences(held.get("candidate", {}),
+                                                     prior.get("candidate", {}) if prior else {})),
+                "suggestions_differ": bool(prior and held.get("candidate", {}).get("suggestions", [])
+                                           != prior.get("candidate", {}).get("suggestions", [])),
+                "diagnostics_differ": bool(prior and any(
+                    held.get("candidate", {}).get(field) != prior.get("candidate", {}).get(field)
+                    for field in ("missing_information", "warnings", "confidence", "uncertainties",
+                                  "source_method", "source_line_ranges"))),
+                "previous_candidate_id": prior.get("candidate_id") if prior else None,
+                "previous_extraction_id": prior.get("extraction_id") if prior else None,
+                "previous_candidate": prior.get("candidate", {}) if prior else None,
+                "previous_history": self._candidate_history_counts(str(prior.get("candidate_id", "")))
+                                    if prior else {},
+                "held_history": self._candidate_history_counts(held_id),
+                "possible_matches": possible, "protected": protected,
+                "eligible": bool(eligible),
+                "reason": ("A protected Mealie outcome exists for this source."
+                           if protected else "" if eligible
+                           else "A unique authoritative-content match could not be established."),
+            })
+        return output
+
+    def _candidate_history_counts(self, candidate_id: str) -> dict[str, int]:
+        return dict(self._candidate_history_index.get(candidate_id, {}))
+
+    def confirm_identity_match(self, held_candidate_id: str, previous_candidate_id: str,
+                               evidence: str = "") -> dict:
+        """Append an explicit, idempotent link without changing either candidate stream."""
+        with _state_lock(self.path):
+            self._reload()
+            operation_id = f"identity-confirm:{held_candidate_id}:{previous_candidate_id}"
+            existing = next((item for item in self.events
+                             if item.get("operation_id") == operation_id), None)
+            if existing:
+                if (existing.get("event") != "candidate_identity_link"
+                        or existing.get("previous_candidate_id") != previous_candidate_id):
+                    raise ReviewConflict("identity confirmation operation ID was already used")
+                return existing
+            proposal = next((item for item in self.identity_reconciliation_candidates()
+                             if item.get("candidate_id") == held_candidate_id), None)
+            if not proposal:
+                raise ReviewConflict("this identity match is no longer safe to confirm")
+            safe_pair = (proposal.get("previous_candidate_id") == previous_candidate_id
+                         and proposal.get("eligible"))
+            selected_match = next((item for item in proposal.get("possible_matches", [])
+                                   if item.get("candidate_id") == previous_candidate_id
+                                   and not item.get("differences")
+                                   and item.get("identity_status") == "registered"), None)
+            user_selected = bool(selected_match and evidence.strip() and not proposal.get("protected"))
+            if not (safe_pair or user_selected):
+                raise ReviewConflict("this identity match is no longer safe to confirm")
+            event = self._base_event("candidate_identity_link", held_candidate_id,
+                                     proposal["source_hash"], proposal["extraction_id"], operation_id)
+            previous = next((item for item in self.registrations.get(previous_candidate_id, [])
+                             if item.get("source_hash") == proposal["source_hash"]), {})
+            event.update({"previous_candidate_id": previous_candidate_id,
+                          "identity_group_id": str(previous.get("identity_group_id") or previous_candidate_id),
+                          "logical_identity_digest": proposal["identity_digest"],
+                          "comparison_version": 1,
+                          "decision": ("confirmed_unique_content_match" if safe_pair
+                                       else "confirmed_user_selected_match"),
+                          "evidence": evidence.strip() if user_selected and not safe_pair else ""})
+            expected = {key: value for key, value in event.items()
+                        if key not in {"event_id", "timestamp", "actor"}}
+            prior = self._existing_operation(operation_id, "candidate_identity_link", expected)
+            if prior:
+                return prior
+            self._append(event, locked=True)
+            self._reload()
+            return self._readback(event)
+
+    def defer_identity_match(self, held_candidate_id: str, extraction_id: str) -> dict:
+        operation_id = f"identity-defer:{held_candidate_id}:{extraction_id}"
+        with _state_lock(self.path):
+            self._reload()
+            registration = next((item for item in self.registrations.get(held_candidate_id, [])
+                                 if item.get("extraction_id") == extraction_id
+                                 and item.get("identity_status") == "needs_reconciliation"), None)
+            if not registration:
+                raise ReviewConflict("identity candidate is no longer held")
+            event = self._base_event("candidate_identity_review", held_candidate_id,
+                                     registration.get("source_hash", ""), extraction_id, operation_id)
+            event.update({"decision": "deferred", "comparison_version": 1})
+            expected = {key: value for key, value in event.items()
+                        if key not in {"event_id", "timestamp", "actor"}}
+            prior = self._existing_operation(operation_id, "candidate_identity_review", expected)
+            if prior:
+                return prior
+            self._append(event, locked=True)
+            self._reload()
+            return self._readback(event)
 
     def _exact_registration_batch(self, source_hash: str, extraction_id: str,
                                   candidates: list[RecipeCandidate]) -> list[dict] | None:
@@ -620,6 +953,11 @@ class ReviewStore:
     def _source_has_protected_import_history(self, source_hash: str) -> bool:
         if not source_hash:
             return False
+        if self._protected_source_cache is None:
+            self._protected_source_cache = self._load_protected_source_hashes()
+        return source_hash in self._protected_source_cache
+
+    def _load_protected_source_hashes(self) -> set[str]:
         try:
             if self.state_path.exists():
                 ui_count("ledger_reads")
@@ -627,14 +965,18 @@ class ReviewStore:
                               if line.strip()] if self.state_path.exists() else [])
         except (OSError, json.JSONDecodeError) as exc:
             raise ReviewConflict("import state is unreadable; new identities remain held") from exc
+        protected = set()
         for record in state_records:
             if not isinstance(record, dict) or record.get("status") not in {
                 "IMPORTED", "UNCERTAIN", "NEEDS_MANUAL_CHECK",
             }:
                 continue
-            if (record.get("source_hash") == source_hash
-                    or str(record.get("key", "")).startswith(source_hash + ":")):
-                return True
+            source_hash = str(record.get("source_hash", ""))
+            if source_hash:
+                protected.add(source_hash)
+            key_hash = str(record.get("key", "")).partition(":")[0]
+            if key_hash:
+                protected.add(key_hash)
 
         event_path = self.path.parent / "ui_import_events.jsonl"
         try:
@@ -646,17 +988,21 @@ class ReviewStore:
             raise ReviewConflict("import history is unreadable; new identities remain held") from exc
         attempts: dict[str, str] = {}
         for event in events:
-            if not isinstance(event, dict) or event.get("source_hash") != source_hash:
+            if not isinstance(event, dict):
+                continue
+            source_hash = str(event.get("source_hash", ""))
+            if not source_hash:
                 continue
             attempt_id = str(event.get("attempt_id", ""))
             kind = event.get("event")
             if kind == "intent_started" and attempt_id:
-                attempts[attempt_id] = "started"
+                attempts[(source_hash, attempt_id)] = "started"
             elif kind == "create_rejected" and attempt_id:
-                attempts[attempt_id] = "rejected"
+                attempts[(source_hash, attempt_id)] = "rejected"
             elif kind in {"create_uncertain", "creation_confirmed", "reconciled_existing"}:
-                return True
-        return "started" in attempts.values()
+                protected.add(source_hash)
+        protected.update(source for (source, _attempt), status in attempts.items() if status == "started")
+        return protected
 
     def record_reconciliation(self, *, candidate_id: str, source_hash: str,
                               extraction_id: str, attempt_id: str,
