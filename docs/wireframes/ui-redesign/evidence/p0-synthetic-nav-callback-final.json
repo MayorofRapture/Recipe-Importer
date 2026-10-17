@@ -1,0 +1,103 @@
+{
+  "fixture": "synthetic source-group fixture: 100 groups x 5 recipes = 500 recipes; mixed JPG/PDF; 450 source paths resolvable",
+  "browser_gate": {
+    "populated_editor": true,
+    "loaded_source_scan": true,
+    "image_width_px": 180,
+    "skeletons": 0
+  },
+  "method": "Persistent CDP session per run; physical hit-tested Skip/Previous controls; selected five cross-source boundaries among measured queue actions; app server warm; browser session fresh.",
+  "cross_source_samples": [
+    {
+      "from": "Source 051 Recipe 04",
+      "to": "Source 082 Recipe 00",
+      "direction": "next",
+      "latency_ms": 485,
+      "counter_delta": {
+        "full_page_executions": 1,
+        "fragment_executions": 1,
+        "catalog_loads": 1,
+        "source_hashes": 1,
+        "ledger_reads": 1,
+        "preview_renders": 1,
+        "durable_writes": 0
+      },
+      "physical_target_hit": true
+    },
+    {
+      "from": "Source 082 Recipe 04",
+      "to": "Source 026 Recipe 00",
+      "direction": "next",
+      "latency_ms": 491,
+      "counter_delta": {
+        "full_page_executions": 1,
+        "fragment_executions": 1,
+        "catalog_loads": 1,
+        "source_hashes": 1,
+        "ledger_reads": 1,
+        "preview_renders": 1,
+        "durable_writes": 0
+      },
+      "physical_target_hit": true
+    },
+    {
+      "from": "Source 026 Recipe 04",
+      "to": "Source 083 Recipe 00",
+      "direction": "next",
+      "latency_ms": 457,
+      "counter_delta": {
+        "full_page_executions": 1,
+        "fragment_executions": 1,
+        "catalog_loads": 1,
+        "source_hashes": 1,
+        "ledger_reads": 1,
+        "preview_renders": 1,
+        "durable_writes": 0
+      },
+      "physical_target_hit": true
+    },
+    {
+      "from": "Source 083 Recipe 04",
+      "to": "Source 095 Recipe 00",
+      "direction": "next",
+      "latency_ms": 499,
+      "counter_delta": {
+        "full_page_executions": 1,
+        "fragment_executions": 1,
+        "catalog_loads": 1,
+        "source_hashes": 1,
+        "ledger_reads": 1,
+        "preview_renders": 1,
+        "durable_writes": 0
+      },
+      "physical_target_hit": true
+    },
+    {
+      "from": "Source 095 Recipe 00",
+      "to": "Source 083 Recipe 04",
+      "direction": "previous",
+      "latency_ms": 389,
+      "counter_delta": {
+        "full_page_executions": 1,
+        "fragment_executions": 1,
+        "catalog_loads": 1,
+        "source_hashes": 1,
+        "ledger_reads": 1,
+        "preview_renders": 1,
+        "durable_writes": 0
+      },
+      "physical_target_hit": true
+    }
+  ],
+  "summary_ms": {
+    "count": 5,
+    "median": 485,
+    "p95_nearest_rank": 499,
+    "worst": 499
+  },
+  "evidence_files": [
+    "p0-synthetic-nav-callback-1.json",
+    "p0-synthetic-nav-callback-2.json",
+    "p0-synthetic-nav-callback-previous-boundary5.json"
+  ]
+}

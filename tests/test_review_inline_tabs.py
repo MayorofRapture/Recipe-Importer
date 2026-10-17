@@ -14,6 +14,8 @@ from streamlit.testing.v1 import AppTest
 from tests.ui_fixture_factory import write_ui_fixture
 from ui_data import load_catalog
 from recipe_quality import Suggestion
+from app_pages.common import save_draft
+from review_store import ReviewConflict, ReviewStore
 
 
 APP_PATH = Path(__file__).resolve().parents[1] / "streamlit_app.py"
@@ -72,6 +74,104 @@ class ReviewInlineTabTests(unittest.TestCase):
 
         self.assertEqual(buffer["structured_ingredients"][0], "2 cups chilled rice")
         self.assertTrue(any(item.label == "Instructions" for item in app.get("tab")))
+
+    def test_optional_metadata_stays_local_until_explicit_save(self):
+        tmp = self._temp_dir()
+        with self.subTest("isolated fixture"):
+            fixture = write_ui_fixture(tmp)
+            env = patch.dict(os.environ, {
+                "RECIPE_IMPORTER_OUTPUT_DIR": str(fixture["output"]),
+                "RECIPE_IMPORTER_SOURCE_DIR": str(tmp / "sources"),
+                "RECIPE_IMPORTER_UI_DIAGNOSTICS": "1",
+            }, clear=False)
+            env.start()
+            self.addCleanup(env.stop)
+            app = AppTest.from_file(str(APP_PATH)).run(timeout=10)
+            candidate_id = app.session_state["review_selection"]
+            before_revision = next(item for item in load_catalog(Path(fixture["output"]))
+                                   if item.candidate_id == candidate_id).revision
+
+            app.session_state["review_show_optional_details"] = True
+            app.run(timeout=10)
+            before_writes = app.session_state["_ui_diagnostics"]["durable_writes"]
+            next(item for item in app.text_input if item.label == "Recipe title").set_value("Rice for Two").run(timeout=10)
+            next(item for item in app.text_input if item.label == "Yield").set_value("2 servings").run(timeout=10)
+
+            # AppTest does not model browser fragment isolation; this contract checks that edits stay local.
+            self.assertEqual(app.session_state["_ui_diagnostics"]["durable_writes"], before_writes)
+            self.assertEqual(app.session_state["review_buffers"][candidate_id]["name"], "Rice for Two")
+            self.assertEqual(app.session_state["review_buffers"][candidate_id]["yield_text"], "2 servings")
+            after = next(item for item in load_catalog(Path(fixture["output"]))
+                         if item.candidate_id == candidate_id)
+            self.assertEqual(after.revision, before_revision)
+
+    def test_queue_advance_reuses_the_catalog_loaded_for_that_page_run(self):
+        tmp = self._temp_dir()
+        with self.subTest("isolated fixture"):
+            fixture = write_ui_fixture(tmp)
+            env = patch.dict(os.environ, {
+                "RECIPE_IMPORTER_OUTPUT_DIR": str(fixture["output"]),
+                "RECIPE_IMPORTER_SOURCE_DIR": str(tmp / "sources"),
+            }, clear=False)
+            env.start()
+            self.addCleanup(env.stop)
+            with patch("app_pages.common.load_catalog", wraps=load_catalog) as catalog_loader:
+                app = AppTest.from_file(str(APP_PATH)).run(timeout=10)
+                candidate_id = app.session_state["review_selection"]
+                initial = next(item for item in load_catalog(Path(fixture["output"]), Path(tmp / "sources"))
+                               if item.candidate_id == candidate_id)
+                next(item for item in app.text_input if item.label == "Ingredient 1").set_value(
+                    "1 cup saved before skip").run(timeout=10)
+                before = catalog_loader.call_count
+                next(item for item in app.button if item.label == "Skip for now").click().run(timeout=10)
+
+                self.assertEqual(catalog_loader.call_count - before, 1)
+                self.assertNotEqual(app.session_state["review_selection"], candidate_id)
+                saved = next(item for item in load_catalog(Path(fixture["output"]), Path(tmp / "sources"))
+                             if item.candidate_id == candidate_id)
+                self.assertEqual(saved.revision, initial.revision + 1)
+                self.assertEqual(saved.candidate.ingredients[0], "1 cup saved before skip")
+
+    def test_save_after_fragment_revision_does_not_append_duplicate_on_stale_view(self):
+        tmp = self._temp_dir()
+        fixture = write_ui_fixture(tmp)
+        env = patch.dict(os.environ, {
+            "RECIPE_IMPORTER_OUTPUT_DIR": str(fixture["output"]),
+            "RECIPE_IMPORTER_SOURCE_DIR": str(tmp / "sources"),
+        }, clear=False)
+        env.start()
+        self.addCleanup(env.stop)
+        app = AppTest.from_file(str(APP_PATH)).run(timeout=10)
+        candidate_id = app.session_state["review_selection"]
+        view = next(item for item in load_catalog(Path(fixture["output"]), Path(tmp / "sources"))
+                    if item.candidate_id == candidate_id)
+        buffer = app.session_state["review_buffers"][candidate_id]
+
+        buffer["name"] = "First saved title"
+        first, _ = save_draft(view, buffer)
+        buffer["name"] = "Second saved title"
+        second, _ = save_draft(view, buffer)
+        unchanged, _ = save_draft(view, buffer)
+
+        self.assertEqual(first.revision, view.revision + 1)
+        self.assertEqual(second.revision, first.revision + 1)
+        self.assertEqual(unchanged.revision, second.revision)
+        latest = next(item for item in load_catalog(Path(fixture["output"]), Path(tmp / "sources"))
+                      if item.candidate_id == candidate_id)
+        self.assertEqual(latest.revision, second.revision)
+        self.assertEqual(latest.candidate.name, "Second saved title")
+
+        external = latest.candidate.model_dump(mode="json")
+        external["name"] = "External concurrent title"
+        ReviewStore(Path(fixture["output"]) / "review_events.jsonl").save_revision(
+            candidate_id=candidate_id, source_hash=latest.source_hash,
+            extraction_id=latest.extraction_id, expected_parent=second.revision,
+            operation_id="external-concurrent-save", recipe=external,
+            target_bindings=list(latest.target_bindings),
+        )
+        with self.assertRaises(ReviewConflict):
+            save_draft(view, buffer)
+        self.assertEqual(buffer["name"], "Second saved title")
 
     def test_unsaved_instruction_edit_survives_tab_switch_and_bulk_roundtrip(self):
         with self.subTest("isolated fixture"):

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from ui_diagnostics import count as ui_count
 
 
 class ImportProtectionError(RuntimeError):
@@ -21,6 +22,7 @@ def protected_candidate_ids(output_dir: Path, state_path: Path | None = None) ->
         if not path.exists():
             continue
         try:
+            ui_count("ledger_reads")
             records = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()
                        if line.strip()]
         except (OSError, json.JSONDecodeError) as exc:

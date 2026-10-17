@@ -1,0 +1,106 @@
+{
+  "date": "2026-10-17",
+  "scope": "Sanitized read-only performance evidence for the P0 backend lookup and catalog summary changes.",
+  "population": {
+    "recipe_views": 381,
+    "extraction_cache_files": 376,
+    "state_records": 337,
+    "jsonl_bytes_approx": 1950000
+  },
+  "method": {
+    "tool": "Python cProfile on isolated copies of the same local catalog snapshot",
+    "profile_runs": 5,
+    "counters": "Opt-in UI diagnostics; source_hashes and ledger_reads count actual operations.",
+    "write_safety": "No durable writes observed in any profile run; profile inputs were isolated copies; original source files were read-only.",
+    "limitations": [
+      "cProfile adds runtime overhead; timings describe the profiling process rather than browser latency.",
+      "The baseline has one complete run because its scan took over two minutes; baseline and after run counts differ.",
+      "No source root was configured, so recursive source discovery was measured by a separate 100-file operation-count test, not the full-catalog profile.",
+      "Browser evidence is a separate sequence: one cold first page followed by four warm page sessions on the same server."
+    ]
+  },
+  "baseline": {
+    "revision": "17844df",
+    "mode": "full verified catalog",
+    "runs": 1,
+    "elapsed_ms": 124824,
+    "profile_functions": [
+      {"function": "_state_record", "calls": 381, "cumulative_ms": 121267},
+      {"function": "StateStore.find_candidate", "calls": 15209, "cumulative_ms": 121164},
+      {"function": "_source_for", "calls": 381, "cumulative_ms": 1842},
+      {"function": "_cached_digest", "calls": 381, "cumulative_ms": 1827},
+      {"function": "_load_caches", "calls": 1, "cumulative_ms": 1230},
+      {"function": "ReviewStore._exact_registration_batch", "calls": 370, "cumulative_ms": 105}
+    ]
+  },
+  "current_full_verified": {
+    "runs": 5,
+    "median_ms": 4736,
+    "max_ms": 5294,
+    "source_hashes_total": 1770,
+    "ledger_reads_total": 15,
+    "durable_writes_total": 0,
+    "profile_functions_cumulative_ms_across_5_runs": [
+      {"function": "load_catalog", "calls": 5, "cumulative_ms": 24393},
+      {"function": "_source_for", "calls": 1905, "cumulative_ms": 14380},
+      {"function": "_cached_source_digest", "calls": 1770, "cumulative_ms": 14104},
+      {"function": "_load_caches", "calls": 5, "cumulative_ms": 6999},
+      {"function": "_cached_extraction_batch", "calls": 1850, "cumulative_ms": 6184},
+      {"function": "_state_record", "calls": 1905, "cumulative_ms": 235},
+      {"function": "StateStore.find_candidate", "calls": 1905, "cumulative_ms": 189},
+      {"function": "ReviewStore._exact_registration_batch", "calls": 1850, "cumulative_ms": 137}
+    ]
+  },
+  "current_ui_summary_plus_one_selected_verification": {
+    "verify_sources": false,
+    "runs": 5,
+    "selected_verifications_per_run": 1,
+    "cold": {
+      "median_ms": 1682,
+      "max_ms": 3299,
+      "selected_verified": 5,
+      "source_hashes_total": 5,
+      "ledger_reads_total": 15,
+      "durable_writes_total": 0,
+      "profile_functions_cumulative_ms_across_5_runs": [
+        {"function": "load_catalog", "calls": 5, "cumulative_ms": 9776},
+        {"function": "_load_caches", "calls": 5, "cumulative_ms": 7098},
+        {"function": "_cached_extraction_batch", "calls": 1850, "cumulative_ms": 6424},
+        {"function": "StateStore.find_candidate", "calls": 1905, "cumulative_ms": 173},
+        {"function": "_source_for_display", "calls": 1905, "cumulative_ms": 156},
+        {"function": "ReviewStore._exact_registration_batch", "calls": 1850, "cumulative_ms": 102},
+        {"function": "verify_selected_source", "calls": 5, "cumulative_ms": 27}
+      ]
+    },
+    "warm": {
+      "median_ms": 561,
+      "max_ms": 786,
+      "selected_verified": 5,
+      "source_hashes_total": 5,
+      "ledger_reads_total": 15,
+      "durable_writes_total": 0,
+      "profile_functions_cumulative_ms_across_5_runs": [
+        {"function": "load_catalog", "calls": 5, "cumulative_ms": 3070},
+        {"function": "_load_caches", "calls": 5, "cumulative_ms": 513},
+        {"function": "_state_record", "calls": 1905, "cumulative_ms": 174},
+        {"function": "StateStore.find_candidate", "calls": 1905, "cumulative_ms": 162},
+        {"function": "_source_for_display", "calls": 1905, "cumulative_ms": 152},
+        {"function": "ReviewStore._exact_registration_batch", "calls": 1850, "cumulative_ms": 106},
+        {"function": "verify_selected_source", "calls": 5, "cumulative_ms": 23}
+      ]
+    }
+  },
+  "browser_page_samples_ms": {
+    "cold_first_page": 3993,
+    "warm_subsequent_pages": [1426, 1831, 1500, 1963],
+    "note": "One cold first page and four warm subsequent pages; this is not five independent cold-server starts."
+  },
+  "verification": {
+    "state_store_index_tests": "6 passed",
+    "display_cache_and_summary_tests": "8 passed, including staged-only summary availability regression",
+    "registration_index_tests": "2 passed",
+    "py_compile_backend_modules": "passed",
+    "git_diff_check": "passed",
+    "live_gemini_or_mealie": "not exercised"
+  }
+}

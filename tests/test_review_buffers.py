@@ -24,6 +24,29 @@ APP_PATH = Path(__file__).resolve().parents[1] / "streamlit_app.py"
 
 
 class ReviewBufferTests(unittest.TestCase):
+    def test_jump_and_filter_each_reuse_the_page_catalog(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = write_ui_fixture(Path(tmp))
+            env = patch.dict(os.environ, {
+                "RECIPE_IMPORTER_OUTPUT_DIR": str(fixture["output"]),
+                "RECIPE_IMPORTER_SOURCE_DIR": str(Path(tmp, "sources")),
+            }, clear=False)
+            env.start()
+            self.addCleanup(env.stop)
+            with patch("app_pages.common.load_catalog", wraps=load_catalog) as catalog_loader:
+                app = AppTest.from_file(str(APP_PATH)).run(timeout=10)
+                next(item for item in app.selectbox if item.label == "Show").set_value("All recipes").run(timeout=10)
+                selector = next(item for item in app.selectbox if item.label == "Jump to recipe")
+                before = catalog_loader.call_count
+                selector.set_value("Fried Rice").run(timeout=10)
+                self.assertEqual(catalog_loader.call_count - before, 1)
+                self.assertEqual(app.session_state["review_selection"], app.session_state["review_active_selection"])
+
+                before = catalog_loader.call_count
+                next(item for item in app.text_input if item.label == "Search title or source").set_value("Cranberry").run(timeout=10)
+                self.assertEqual(catalog_loader.call_count - before, 1)
+                self.assertFalse(app.exception)
+
     def test_mode_switch_preserves_unapplied_raw_bulk_text_exactly(self):
         raw_ingredients = "  1 cup flour  \n\n??"
         buffer = {
@@ -115,20 +138,47 @@ class ReviewBufferTests(unittest.TestCase):
             }, clear=False)
             env.start()
             self.addCleanup(env.stop)
-            app = AppTest.from_file(str(APP_PATH)).run(timeout=10)
-            next(item for item in app.selectbox if item.label == "Show").set_value("All recipes").run(timeout=10)
-            selector = next(item for item in app.selectbox if item.label == "Jump to recipe")
-            selector.set_value("Fried Rice").run(timeout=10)
-            next(item for item in app.text_input if item.label == "Ingredient 1").set_value("2 cups cold rice").run(timeout=10)
+            with patch("app_pages.common.load_catalog", wraps=load_catalog) as catalog_loader:
+                app = AppTest.from_file(str(APP_PATH)).run(timeout=10)
+                next(item for item in app.selectbox if item.label == "Show").set_value("All recipes").run(timeout=10)
+                selector = next(item for item in app.selectbox if item.label == "Jump to recipe")
+                selector.set_value("Fried Rice").run(timeout=10)
+                next(item for item in app.text_input if item.label == "Ingredient 1").set_value("2 cups cold rice").run(timeout=10)
+                before = catalog_loader.call_count
 
-            with patch.object(ReviewStore, "save_revision", side_effect=RuntimeError("revision conflict")):
-                next(item for item in app.selectbox if item.label == "Jump to recipe").set_value(
-                    "Cranberry & Caramel Date Bars").run(timeout=10)
+                with patch.object(ReviewStore, "save_revision", side_effect=RuntimeError("revision conflict")):
+                    next(item for item in app.selectbox if item.label == "Jump to recipe").set_value(
+                        "Cranberry & Caramel Date Bars").run(timeout=10)
+                self.assertEqual(catalog_loader.call_count - before, 1)
 
             self.assertFalse(app.exception)
             self.assertEqual(app.session_state["review_selection"], app.session_state["review_active_selection"])
             self.assertEqual(app.session_state["review_buffers"][app.session_state["review_selection"]]
                              ["structured_ingredients"][0], "2 cups cold rice")
+            self.assertTrue(any("revision conflict" in item.value for item in app.error))
+
+    def test_skip_flush_conflict_keeps_selection_and_unsaved_edit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = write_ui_fixture(Path(tmp))
+            env = patch.dict(os.environ, {
+                "RECIPE_IMPORTER_OUTPUT_DIR": str(fixture["output"]),
+                "RECIPE_IMPORTER_SOURCE_DIR": str(Path(tmp, "sources")),
+            }, clear=False)
+            env.start()
+            self.addCleanup(env.stop)
+            app = AppTest.from_file(str(APP_PATH)).run(timeout=10)
+            candidate_id = app.session_state["review_selection"]
+            next(item for item in app.text_input if item.label == "Ingredient 1").set_value(
+                "2 cups retained rice").run(timeout=10)
+
+            with patch.object(ReviewStore, "save_revision", side_effect=RuntimeError("revision conflict")):
+                next(item for item in app.button if item.label == "Skip for now").click().run(timeout=10)
+
+            self.assertFalse(app.exception)
+            self.assertEqual(app.session_state["review_selection"], candidate_id)
+            self.assertEqual(app.session_state["review_active_selection"], candidate_id)
+            self.assertEqual(app.session_state["review_buffers"][candidate_id]
+                             ["structured_ingredients"][0], "2 cups retained rice")
             self.assertTrue(any("revision conflict" in item.value for item in app.error))
 
     def test_save_conflict_blocks_queue_filter_change(self):
@@ -140,13 +190,16 @@ class ReviewBufferTests(unittest.TestCase):
             }, clear=False)
             env.start()
             self.addCleanup(env.stop)
-            app = AppTest.from_file(str(APP_PATH)).run(timeout=10)
-            next(item for item in app.selectbox if item.label == "Show").set_value("All recipes").run(timeout=10)
-            next(item for item in app.selectbox if item.label == "Jump to recipe").set_value("Fried Rice").run(timeout=10)
-            next(item for item in app.text_input if item.label == "Ingredient 1").set_value("2 cups cold rice").run(timeout=10)
+            with patch("app_pages.common.load_catalog", wraps=load_catalog) as catalog_loader:
+                app = AppTest.from_file(str(APP_PATH)).run(timeout=10)
+                next(item for item in app.selectbox if item.label == "Show").set_value("All recipes").run(timeout=10)
+                next(item for item in app.selectbox if item.label == "Jump to recipe").set_value("Fried Rice").run(timeout=10)
+                next(item for item in app.text_input if item.label == "Ingredient 1").set_value("2 cups cold rice").run(timeout=10)
+                before = catalog_loader.call_count
 
-            with patch.object(ReviewStore, "save_revision", side_effect=RuntimeError("revision conflict")):
-                next(item for item in app.text_input if item.label == "Search title or source").set_value("Cranberry").run(timeout=10)
+                with patch.object(ReviewStore, "save_revision", side_effect=RuntimeError("revision conflict")):
+                    next(item for item in app.text_input if item.label == "Search title or source").set_value("Cranberry").run(timeout=10)
+                self.assertEqual(catalog_loader.call_count - before, 1)
 
             self.assertFalse(app.exception)
             self.assertEqual(app.session_state["review_search"], "")

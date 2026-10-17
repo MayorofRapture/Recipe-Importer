@@ -16,6 +16,7 @@ from recipe_quality import RecipeCandidate
 from review_store import ReviewStore
 from ui_data import RecipeView, load_catalog
 from ui_review_state import quick_edit_to_structured, row_ids_for
+from ui_diagnostics import count
 
 
 def paths() -> tuple[Path, Path | None]:
@@ -31,9 +32,10 @@ def paths() -> tuple[Path, Path | None]:
 
 
 def catalog() -> list[RecipeView]:
+    count("catalog_loads")
     output, source_root = paths()
     try:
-        return load_catalog(output, source_root)
+        return load_catalog(output, source_root, verify_sources=False)
     except Exception as exc:
         raise CatalogReadError(
             "Local records could not be read; history is preserved and mutations are blocked. "
@@ -187,7 +189,7 @@ def save_draft(view: RecipeView, buffer: dict[str, Any]):
     output, _ = paths()
     recipe = candidate.model_dump(mode="json")
     revision = int(buffer.get("_revision", view.revision))
-    if (revision > 0 and revision == view.revision and not buffer_is_dirty(view, buffer)):
+    if revision > 0 and not buffer_is_dirty(view, buffer):
         current = review_store().project(
             view.candidate_id, view.source_hash, view.extraction_id, view.candidate,
         )
@@ -208,6 +210,7 @@ def save_draft(view: RecipeView, buffer: dict[str, Any]):
     operation_id = "ui-save:" + hashlib.sha256(
         f"{view.candidate_id}:{view.extraction_id}:{revision}:{operation_material}".encode("utf-8")
     ).hexdigest()
+    count("durable_writes")
     event = review_store().save_revision(
         candidate_id=view.candidate_id, source_hash=view.source_hash,
         extraction_id=view.extraction_id, expected_parent=revision,

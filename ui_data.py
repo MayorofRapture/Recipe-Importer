@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Iterable
 from functools import lru_cache
@@ -43,6 +43,7 @@ class RecipeView:
     target_bindings: tuple[dict[str, Any], ...] = ()
     identity_status: str = "registered"
     source_available: bool = False
+    source_verified: bool = False
     legacy_draft_conflict: bool = False
     revision_target_bindings: tuple[dict[str, Any], ...] = ()
     revision_raw_bulk_text: dict[str, str] = field(default_factory=dict)
@@ -70,7 +71,28 @@ class SourcePage:
     message: str = ""
 
 
-def load_catalog(output_dir: Path, source_root: Path | None = None) -> list[RecipeView]:
+class _SourceIndex:
+    """Lazy per-catalog basename index for legacy source-path recovery."""
+
+    def __init__(self, root: Path):
+        self.root = Path(root)
+        self.by_name: dict[str, list[Path]] = {}
+        self._built = False
+
+    def find(self, name: str) -> list[Path]:
+        if not self._built:
+            for path in self.root.rglob("*"):
+                try:
+                    if path.is_file():
+                        self.by_name.setdefault(path.name, []).append(path)
+                except OSError:
+                    continue
+            self._built = True
+        return self.by_name.get(name, [])
+
+
+def load_catalog(output_dir: Path, source_root: Path | None = None, *,
+                 verify_sources: bool = True) -> list[RecipeView]:
     """Load local extraction results into stable recipe views.
 
     Cache files are grouped by source hash and the newest valid version wins.
@@ -89,6 +111,7 @@ def load_catalog(output_dir: Path, source_root: Path | None = None) -> list[Reci
         protection_unreadable = True
     drafts = DraftStore(output_dir / "ui_drafts.jsonl").all_latest()
     source_by_identity = _source_paths(reviews, state)
+    source_index = _SourceIndex(source_root) if source_root is not None else None
     batch_metadata = _batch_source_metadata(output_dir)
     source_hashes: dict[str, str | None] = {}
 
@@ -96,6 +119,24 @@ def load_catalog(output_dir: Path, source_root: Path | None = None) -> list[Reci
         if not path or not expected_hash:
             return False
         return _cached_digest(Path(path), source_hashes) == expected_hash
+
+    def source_path_for(identity: str, record: dict[str, Any] | None, expected_hash: str,
+                        source_hint: str = "") -> tuple[str, bool]:
+        if verify_sources:
+            path = _source_for(
+                identity, record, source_by_identity, source_root,
+                expected_hash, source_hint, source_hashes, source_index,
+            )
+        else:
+            path = _source_for_display(
+                identity, record, source_by_identity, source_root, source_hint, source_index,
+            )
+        if verify_sources:
+            return path, source_matches(path, expected_hash)
+        try:
+            return path, bool(path and Path(path).is_file())
+        except OSError:
+            return path, False
 
     # These projections depend only on the already-loaded ledger, not on a cache
     # source; build them once instead of rematerializing them for every source.
@@ -146,13 +187,20 @@ def load_catalog(output_dir: Path, source_root: Path | None = None) -> list[Reci
                                     *(source_by_identity.get(str(alias), "")
                                       for alias in registration.get("legacy_aliases", []))]
             source_hint = next((item for item in registration_sources if item), "")
-            source_path = _source_for(identity, record, source_by_identity, source_root,
-                                      source_hash, source_hint, source_hashes)
+            source_path, source_available = source_path_for(
+                identity, record, source_hash, source_hint,
+            )
             source_meta = batch_metadata.get(source_hash, {})
-            if (not source_matches(source_path, source_hash)
-                    and source_matches(str(source_meta.get("staged_path", "")), source_hash)):
-                source_path = str(source_meta["staged_path"])
-            source_available = source_matches(source_path, source_hash)
+            if verify_sources:
+                if (not source_available
+                        and source_matches(str(source_meta.get("staged_path", "")), source_hash)):
+                    source_path = str(source_meta["staged_path"])
+                    source_available = True
+            elif not source_path or not Path(source_path).is_file():
+                staged_path = str(source_meta.get("staged_path", ""))
+                if staged_path and Path(staged_path).is_file():
+                    source_path = staged_path
+                    source_available = True
             warnings = _warnings(reviewed, draft)
             raw_status = str(record.get("status", "")) if record else ""
             approved = bool(effective.import_ready if effective and effective.revision
@@ -199,6 +247,7 @@ def load_catalog(output_dir: Path, source_root: Path | None = None) -> list[Reci
                 target_bindings=tuple(registration.get("target_bindings", [])),
                 identity_status=str(registration.get("identity_status", "registered")),
                 source_available=source_available,
+                source_verified=verify_sources and source_available,
                 legacy_draft_conflict=bool(effective and effective.legacy_draft_conflict),
                 revision_target_bindings=tuple(latest_revision.get("target_bindings", [])),
                 revision_raw_bulk_text=dict(latest_revision.get("raw_bulk_text", {})),
@@ -244,13 +293,18 @@ def load_catalog(output_dir: Path, source_root: Path | None = None) -> list[Reci
         reviewed = RecipeCandidate.model_validate(effective.recipe)
         record = _state_record(state, candidate_id, source_hash, reviewed,
                                tuple(registration.get("legacy_aliases", ())))
-        source_path = _source_for(candidate_id, record, source_by_identity,
-                                  source_root, source_hash, source_hashes=source_hashes)
+        source_path, source_available = source_path_for(candidate_id, record, source_hash)
         source_meta = batch_metadata.get(source_hash, {})
-        if (not source_matches(source_path, source_hash)
-                and source_matches(str(source_meta.get("staged_path", "")), source_hash)):
-            source_path = str(source_meta["staged_path"])
-        source_available = source_matches(source_path, source_hash)
+        if verify_sources:
+            if (not source_available
+                    and source_matches(str(source_meta.get("staged_path", "")), source_hash)):
+                source_path = str(source_meta["staged_path"])
+                source_available = True
+        elif not source_path or not Path(source_path).is_file():
+            staged_path = str(source_meta.get("staged_path", ""))
+            if staged_path and Path(staged_path).is_file():
+                source_path = staged_path
+                source_available = True
         approved = bool(effective.import_ready if effective.revision else legacy_review.approved)
         status = normalize_status(
             str((record or {}).get("status", "")),
@@ -283,6 +337,7 @@ def load_catalog(output_dir: Path, source_root: Path | None = None) -> list[Reci
             target_bindings=tuple(registration.get("target_bindings", [])),
             identity_status=str(registration.get("identity_status", "registered")),
             source_available=source_available,
+            source_verified=verify_sources and source_available,
             legacy_draft_conflict=effective.legacy_draft_conflict,
             revision_target_bindings=tuple(latest_revision.get("target_bindings", [])),
             revision_raw_bulk_text=dict(latest_revision.get("raw_bulk_text", {})),
@@ -419,15 +474,26 @@ def _load_caches(directory: Path) -> list[tuple[str, ExtractionBatch]]:
     for digest, paths in sorted(grouped.items()):
         for path in sorted(paths, key=lambda item: item.stat().st_mtime_ns, reverse=True):
             try:
-                raw = json.loads(path.read_text(encoding="utf-8"))
-                if isinstance(raw, dict) and "batch" in raw:
-                    raw = raw["batch"]
-                loaded.append((str(raw.get("source_hash") or digest) if isinstance(raw, dict) else digest,
-                               ExtractionBatch.model_validate(raw)))
+                stat = path.stat()
+                source_hash, batch = _cached_extraction_batch(
+                    str(path), stat.st_mtime_ns, stat.st_ctime_ns, stat.st_size, digest,
+                )
+                loaded.append((source_hash, batch.model_copy(deep=True)))
                 break
             except (OSError, ValueError, TypeError):
                 continue
     return loaded
+
+
+@lru_cache(maxsize=2048)
+def _cached_extraction_batch(path: str, modified_ns: int, changed_ns: int, size: int,
+                             fallback_hash: str) -> tuple[str, ExtractionBatch]:
+    """Reuse display extraction data until an external writer changes the file metadata."""
+    raw = json.loads(Path(path).read_text(encoding="utf-8"))
+    if isinstance(raw, dict) and "batch" in raw:
+        raw = raw["batch"]
+    source_hash = str(raw.get("source_hash") or fallback_hash) if isinstance(raw, dict) else fallback_hash
+    return source_hash, ExtractionBatch.model_validate(raw)
 
 
 def _source_paths(reviews: ReviewStore, state: StateStore) -> dict[str, str]:
@@ -458,7 +524,8 @@ def _source_paths(reviews: ReviewStore, state: StateStore) -> dict[str, str]:
 def _source_for(identity: str, record: dict[str, Any] | None,
                 source_by_identity: dict[str, str], source_root: Path | None,
                 expected_hash: str = "", source_hint: str = "",
-                source_hashes: dict[str, str | None] | None = None) -> str:
+                source_hashes: dict[str, str | None] | None = None,
+                source_index: _SourceIndex | None = None) -> str:
     value = source_hint or source_by_identity.get(identity) or str((record or {}).get("file", ""))
     candidates: list[Path] = []
     if value:
@@ -468,8 +535,9 @@ def _source_for(identity: str, record: dict[str, Any] | None,
     if source_root is not None and value:
         candidates.append(source_root / Path(value).name)
         if source_root.is_dir():
-            candidates.extend(path for path in source_root.rglob(Path(value).name)
-                              if path not in candidates)
+            fallback = (source_index.find(Path(value).name) if source_index is not None
+                        else source_root.rglob(Path(value).name))
+            candidates.extend(path for path in fallback if path not in candidates)
     for candidate in candidates:
         try:
             if not candidate.is_file():
@@ -487,35 +555,76 @@ def _source_for(identity: str, record: dict[str, Any] | None,
     return ""
 
 
+def _source_for_display(identity: str, record: dict[str, Any] | None,
+                        source_by_identity: dict[str, str], source_root: Path | None,
+                        source_hint: str = "", source_index: _SourceIndex | None = None) -> str:
+    """Resolve an exact path cheaply; accept basename recovery only when unique."""
+    value = source_hint or source_by_identity.get(identity) or str((record or {}).get("file", ""))
+    if not value:
+        return ""
+    original = Path(value)
+    direct = original if original.is_absolute() else (source_root / original if source_root else original)
+    try:
+        if direct.is_file():
+            return str(direct)
+    except OSError:
+        pass
+    if source_root is None or not source_root.is_dir():
+        return value
+    matches = source_index.find(original.name) if source_index is not None else list(source_root.rglob(original.name))
+    existing = []
+    for path in matches:
+        try:
+            if path.is_file():
+                existing.append(path)
+        except OSError:
+            continue
+    return str(existing[0]) if len(existing) == 1 else ""
+
+
+def verify_selected_source(view: RecipeView) -> RecipeView:
+    """Freshly verify one selected scan against its extraction before detail use."""
+    if not view.source_path or not view.source_hash:
+        return replace(view, source_available=False, source_verified=False)
+    try:
+        matches = file_digest(Path(view.source_path)) == view.source_hash
+    except OSError:
+        matches = False
+    return replace(view, source_available=matches, source_verified=matches)
+
+
 def _cached_digest(path: Path, digests: dict[str, str | None]) -> str | None:
     key = str(path)
     if key not in digests:
         try:
-            digests[key] = file_digest(path)
+            stat = path.stat()
+            digests[key] = _cached_source_digest(
+                key, stat.st_mtime_ns, stat.st_ctime_ns, stat.st_size,
+            )
         except OSError:
             digests[key] = None
     return digests[key]
 
 
+@lru_cache(maxsize=4096)
+def _cached_source_digest(path: str, modified_ns: int, changed_ns: int, size: int) -> str:
+    """Cache catalog-only hash results; approval and import rehash source bytes directly."""
+    return file_digest(Path(path))
+
+
 def _state_record(state: StateStore, identity: str, source_hash: str,
                   candidate: RecipeCandidate, aliases: tuple[str, ...] = (),
                   allow_legacy_title_match: bool = True) -> dict[str, Any] | None:
-    for record in state.records.values():
-        if record.get("identity") == identity:
-            return record
-    # Legacy state can still be useful when the title and source hash match.
-    for index in range(len(state.records) + 1):
-        try:
-            record = state.find_candidate(source_hash, index, candidate, aliases,
-                                          allow_legacy_title_match=allow_legacy_title_match)
-        except Exception as exc:
-            from import_recipes import AmbiguousCandidate
-            if isinstance(exc, AmbiguousCandidate):
-                return {"status": "UNCERTAIN", "note": str(exc)}
-            raise
-        if record:
-            return record
-    return None
+    try:
+        return state.find_candidate(
+            source_hash, 0, candidate, tuple(dict.fromkeys((identity, *aliases))),
+            allow_legacy_title_match=allow_legacy_title_match,
+        )
+    except Exception as exc:
+        from import_recipes import AmbiguousCandidate
+        if isinstance(exc, AmbiguousCandidate):
+            return {"status": "UNCERTAIN", "note": str(exc)}
+        raise
 
 
 def _warnings(candidate: RecipeCandidate, draft: Any | None) -> list[str]:

@@ -8,6 +8,7 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from ui_diagnostics import count as ui_count
 
 
 @dataclass(frozen=True)
@@ -84,6 +85,7 @@ class DraftStore:
         latest: DraftRecord | None = None
         if not self.path.exists():
             return None
+        ui_count("ledger_reads")
         for line in self.path.read_text(encoding="utf-8").splitlines():
             if not line.strip():
                 continue
@@ -96,6 +98,7 @@ class DraftStore:
         records: dict[str, DraftRecord] = {}
         if not self.path.exists():
             return records
+        ui_count("ledger_reads")
         for line in self.path.read_text(encoding="utf-8").splitlines():
             if line.strip():
                 record = DraftRecord.from_dict(json.loads(line))

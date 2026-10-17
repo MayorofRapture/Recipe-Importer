@@ -8,6 +8,7 @@ from streamlit.testing.v1 import AppTest
 
 from tests.ui_fixture_factory import write_ui_fixture
 from ui_data import load_catalog
+from reconciliation_service import RetryService
 
 
 APP_PATH = Path(__file__).resolve().parents[1] / "streamlit_app.py"
@@ -15,6 +16,17 @@ REVIEW_PATH = APP_PATH.parent / "app_pages" / "review.py"
 
 
 class StreamlitResponsiveReviewTests(unittest.TestCase):
+    def test_collapsed_retry_panel_does_not_build_a_preview_plan(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = write_ui_fixture(Path(tmp))
+            with patch.dict(os.environ, {
+                "RECIPE_IMPORTER_OUTPUT_DIR": str(fixture["output"]),
+                "RECIPE_IMPORTER_SOURCE_DIR": str(Path(tmp, "sources")),
+            }, clear=False), patch.object(RetryService, "preview", wraps=RetryService.preview) as preview:
+                app = AppTest.from_file(str(REVIEW_PATH)).run(timeout=10)
+                self.assertFalse(app.exception)
+                preview.assert_not_called()
+
     def test_review_has_compact_queue_and_editable_metadata_without_fixed_scroll_regions(self):
         source = REVIEW_PATH.read_text(encoding="utf-8")
 
@@ -59,6 +71,7 @@ class StreamlitResponsiveReviewTests(unittest.TestCase):
                 next(item for item in app.text_input if item.label == "Recipe title").set_value("Rice for Two").run(timeout=10)
                 yield_widget = next(item for item in app.text_input if item.label == "Yield")
                 yield_widget.set_value("2 servings").run(timeout=10)
+                next(item for item in app.button if item.label == "Save draft").click().run(timeout=10)
                 self.assertFalse(app.exception)
                 views = load_catalog(Path(fixture["output"]), Path(tmp, "sources"))
                 fried = next(item for item in views if item.candidate.name == "Rice for Two")

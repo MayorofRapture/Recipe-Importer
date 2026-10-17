@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import uuid
 from pathlib import Path
 import streamlit as st
@@ -21,8 +22,9 @@ from app_pages.common import (
     structured_widget_key,
     sync_buffer,
 )
-from ui_data import render_source_page
+from ui_data import render_source_page, verify_selected_source
 from recipe_quality import is_complete
+from ui_diagnostics import bind_session, count, new_counters, runtime_marker
 
 
 
@@ -193,12 +195,17 @@ def _advance_queue(direction: int) -> None:
     st.rerun()
 
 
-def _apply_pending_advance() -> None:
+def _queue_advance_callback(direction: int) -> None:
+    """Let the ensuing page run load one catalog and flush before changing selection."""
+    st.session_state.review_pending_advance = direction
+
+
+def _apply_pending_advance(views) -> None:
     direction = st.session_state.pop("review_pending_advance", None)
     if direction is None:
         return
     current_id = st.session_state.get("review_active_selection", st.session_state.get("review_selection"))
-    if current_id and not _flush_candidate(current_id):
+    if current_id and not _flush_candidate(current_id, views):
         st.session_state.review_selection = current_id
         return
     ids = st.session_state.get("review_queue_ids", [])
@@ -212,6 +219,29 @@ def _apply_pending_advance() -> None:
         index = ids.index(current) if current in ids else 0
         target = index + direction
         st.session_state.review_selection = None if direction > 0 and target >= len(ids) else ids[max(0, min(len(ids) - 1, target))]
+
+
+def _apply_pending_queue_change(views) -> None:
+    """Flush once, then accept a queued Jump/filter change on this page run."""
+    pending_selection = st.session_state.pop("review_pending_selection", None)
+    pending_filter = st.session_state.pop("review_pending_filter", None)
+    if pending_selection is None and pending_filter is None:
+        return
+
+    current_id = st.session_state.get("review_active_selection", st.session_state.get("review_selection"))
+    if current_id and not _flush_candidate(current_id, views):
+        st.session_state.review_selection = current_id
+        if pending_filter is not None:
+            key, _requested, previous = pending_filter
+            st.session_state[key] = previous
+        return
+
+    if pending_filter is not None:
+        key, requested, _previous = pending_filter
+        st.session_state[key] = requested
+        st.session_state.review_filter_snapshot[key] = requested
+    if pending_selection is not None:
+        st.session_state.review_selection = pending_selection
 
 
 def _save(view, buffer, advance: bool) -> None:
@@ -270,8 +300,10 @@ def _restore_resume_state(views) -> None:
             st.session_state[f"page:{selected}"] = pointer["source_page"]
 
 
-def _flush_candidate(candidate_id: str) -> bool:
-    view = next((item for item in catalog() if item.candidate_id == candidate_id), None)
+def _flush_candidate(candidate_id: str, views=None) -> bool:
+    if views is None:
+        views = catalog()
+    view = next((item for item in views if item.candidate_id == candidate_id), None)
     if view is None or view.protected:
         return True
     buffer = buffer_for(view)
@@ -291,30 +323,32 @@ def _flush_candidate(candidate_id: str) -> bool:
 def _selection_changed() -> None:
     prior = st.session_state.get("review_active_selection")
     requested = st.session_state.get("review_selection")
-    if prior and prior != requested and not _flush_candidate(prior):
+    if prior and prior != requested:
+        st.session_state.review_pending_selection = requested
         st.session_state.review_selection = prior
-        return
-    if requested:
-        st.session_state.review_active_selection = requested
 
 
 def _filter_changed(key: str) -> None:
     snapshots = st.session_state.setdefault("review_filter_snapshot", {})
-    if not _flush_candidate(st.session_state.get("review_active_selection", "")):
-        if key in snapshots:
-            st.session_state[key] = snapshots[key]
-        return
-    snapshots[key] = st.session_state.get(key)
+    previous = snapshots.get(key, st.session_state.get(key))
+    requested = st.session_state.get(key)
+    if requested != previous:
+        st.session_state.review_pending_filter = (key, requested, previous)
+        st.session_state[key] = previous
 
 
 def main() -> None:
+    diagnostics = (st.session_state.setdefault("_ui_diagnostics", new_counters())
+                   if os.environ.get("RECIPE_IMPORTER_UI_DIAGNOSTICS") == "1" else None)
+    bind_session(diagnostics)
+    count("full_page_executions")
     _apply_pending_refresh()
-    _apply_pending_advance()
     try:
         views = catalog()
     except CatalogReadError as exc:
         st.error(str(exc), icon=":material/lock:")
         st.stop()
+    _apply_pending_advance(views)
     if not views:
         st.info("No recipes are waiting for review. Add a source from Uploads to get started.")
         return
@@ -344,6 +378,7 @@ def main() -> None:
         "review_source": st.session_state.review_source,
         "review_status": st.session_state.review_status,
     })
+    _apply_pending_queue_change(views)
     st.session_state.setdefault("review_selection", views[0].candidate_id)
     if st.session_state.get("review_transition_error"):
         st.error(st.session_state.pop("review_transition_error"))
@@ -356,8 +391,8 @@ def main() -> None:
     if "review_selection" in st.session_state and st.session_state.review_selection is None:
         _render_queue(views, queue_page)
         st.success("You’ve reached the end of this queue.")
-        if st.button("Previous recipe", key="queue_end_previous"):
-            _move_in_queue(candidates, -1)
+        st.button("Previous recipe", key="queue_end_previous",
+                  on_click=_queue_advance_callback, args=(-1,))
         return
     selected_id = st.session_state.get("review_selection")
     ids = [view.candidate_id for view in candidates]
@@ -365,19 +400,15 @@ def main() -> None:
         selected_id = ids[0]
         st.session_state.review_selection = selected_id
     st.session_state.review_queue_ids = ids
-    view = next(v for v in candidates if v.candidate_id == selected_id)
+    view = verify_selected_source(next(v for v in candidates if v.candidate_id == selected_id))
     buffer = buffer_for(view)
     sync_buffer(view, buffer)
     st.session_state.review_active_selection = selected_id
     save_resume_pointer(view, buffer)
     position = ids.index(selected_id) + 1
-    header = st.columns([1.25, 4.5], vertical_alignment="bottom")
-    with header[0]:
-        st.title("Review")
-        st.caption(f"{view.status} · {position} of {len(ids)}")
-        _render_queue(views, queue_page)
-    with header[1]:
-        _render_context_strip(view, buffer)
+    st.title("Review")
+    st.caption(f"{view.status} · {position} of {len(ids)}")
+    _render_queue(views, queue_page)
     if view.protected:
         st.warning("Read-only until this recipe’s Mealie outcome is reconciled.")
     workspace_view = _render_actions(view, buffer)
@@ -396,9 +427,12 @@ def main() -> None:
 
 
 def _render_retry_panel(view, views) -> None:
+    panel = st.expander("Try a new extraction", expanded=False, on_change="rerun")
+    if not panel.open:
+        return
     from reconciliation_service import ReconciliationError
 
-    with st.expander("Try a new extraction", expanded=False):
+    with panel:
         try:
             service = retry_service()
             plan = service.preview(view.source_hash)
@@ -657,14 +691,6 @@ def _render_comparison_candidate(candidate: dict, counterpart: dict, *, is_new: 
             st.write(value)
 
 
-def _render_context_strip(view, buffer) -> None:
-    candidate, _ = candidate_from_buffer(view, buffer)
-    widget_key = f"recipe_name:{view.candidate_id}"
-    st.session_state.setdefault(widget_key, candidate.name)
-    st.text_input("Recipe title", key=widget_key, disabled=view.protected,
-                  on_change=_metadata_changed, args=(view.candidate_id,))
-
-
 def _queue_page(views):
     mode = st.session_state.get("review_queue", "Needs action")
     candidates = views if mode == "All recipes" else [v for v in views if not v.protected]
@@ -738,6 +764,10 @@ def _render_source(view) -> None:
         if not view.source_path:
             st.info("Original scan path is unavailable.")
             return
+        if not view.source_verified or not view.source_available:
+            st.warning("The current source file could not be verified against this extraction. Its bytes are not shown as source evidence.")
+            return
+        count("preview_renders")
         page_key = f"page:{view.candidate_id}"
         st.session_state.setdefault(page_key, int(load_resume_pointer().get("source_page", 1)))
         zoom_key = f"zoom:{view.candidate_id}"
@@ -772,25 +802,35 @@ def _render_source(view) -> None:
 
 @st.fragment
 def _render_editor_fragment(view, buffer) -> None:
+    diagnostics = (st.session_state.setdefault("_ui_diagnostics", new_counters())
+                   if os.environ.get("RECIPE_IMPORTER_UI_DIAGNOSTICS") == "1" else None)
+    bind_session(diagnostics)
+    count("fragment_executions")
     # Tab and row widgets rerun this fragment only, so capture both sections
     # before Streamlit cleans up the inactive tab's widget state.
     sync_buffer(view, buffer)
     _render_editor(view, buffer)
+    if diagnostics is not None:
+        with st.expander("Performance counters"):
+            st.caption(runtime_marker(st.context.url))
+            st.json(dict(diagnostics))
 
 
 def _render_editor(view, buffer) -> None:
     with st.container(border=True):
         st.markdown("**Recipe**")
+        name_key = f"recipe_name:{view.candidate_id}"
+        st.session_state.setdefault(name_key, str(buffer.get("name", view.candidate.name)))
+        st.text_input("Recipe title", key=name_key, disabled=view.protected)
         if view.protected:
             st.text_area("Ingredients", "\n".join(view.candidate.ingredients), disabled=True, key=f"protected_i:{view.candidate_id}")
             st.text_area("Instructions", "\n\n".join(view.candidate.instructions), disabled=True, key=f"protected_s:{view.candidate_id}")
             return
         with st.expander("Optional details", expanded=st.session_state.get("review_show_optional_details", False)):
-            st.text_input("Yield", value=str(buffer.get("yield_text", "")), key=f"recipe_yield_text:{view.candidate_id}",
-                          on_change=_metadata_changed, args=(view.candidate_id,))
+            st.text_input("Yield", value=str(buffer.get("yield_text", "")),
+                          key=f"recipe_yield_text:{view.candidate_id}")
             st.text_area("Description", value=str(buffer.get("description", "")), height=84,
-                         key=f"recipe_description:{view.candidate_id}",
-                         on_change=_metadata_changed, args=(view.candidate_id,))
+                         key=f"recipe_description:{view.candidate_id}")
         tab_key = f"recipe_sections:{view.candidate_id}"
         st.session_state.setdefault(tab_key, st.session_state.get(
             f"recipe_section_saved:{view.candidate_id}", "Ingredients"))
@@ -804,6 +844,10 @@ def _render_editor(view, buffer) -> None:
             _render_structured_section(view, buffer, "ingredients")
         if tabs[1].open:
             _render_structured_section(view, buffer, "instructions")
+        if st.button("Save draft", key=f"save:{view.candidate_id}", width="stretch"):
+            _save(view, buffer, advance=False)
+        if buffer_is_dirty(view, buffer):
+            st.caption("Unsaved changes · use Save draft to keep these edits.")
         approval_reason = _approval_block_reason(view, buffer)
         if st.button("Approve & next", key=f"approve:{view.candidate_id}", disabled=bool(approval_reason),
                      type="primary", width="stretch"):
@@ -854,19 +898,6 @@ def _render_bulk_editor(view, buffer, field: str) -> None:
         st.session_state.pop(key, None)
 
 
-def _metadata_changed(candidate_id: str) -> None:
-    view = next((item for item in catalog() if item.candidate_id == candidate_id), None)
-    if view is None:
-        return
-    buffer = buffer_for(view)
-    sync_buffer(view, buffer)
-    try:
-        save_draft(view, buffer)
-        st.session_state.review_save_state = "Saved locally"
-    except Exception as exc:
-        st.session_state.review_save_state = f"Save failed: {exc}"
-
-
 def _queue_choice_changed() -> None:
     requested = st.session_state.get("review_queue_choice")
     current = st.session_state.get("review_active_selection")
@@ -878,20 +909,17 @@ def _queue_choice_changed() -> None:
 
 
 def _render_actions(view, buffer) -> str:
-    cols = st.columns([1, 1.2, 1.4], vertical_alignment="center")
+    cols = st.columns([1, 1], vertical_alignment="center")
     with cols[0]:
         with st.popover("Options"):
             workspace_view = st.radio("Workspace view", ["Side by side", "Source", "Recipe"],
                                       key="review_workspace_view")
-            if st.button("Previous recipe", key=f"previous:{view.candidate_id}",
-                         disabled=view.protected, width="stretch"):
-                _advance_queue(-1)
+            st.button("Previous recipe", key=f"previous:{view.candidate_id}",
+                      disabled=view.protected, width="stretch",
+                      on_click=_queue_advance_callback, args=(-1,))
     with cols[1]:
-        if st.button("Save draft", key=f"save:{view.candidate_id}", disabled=view.protected, width="stretch"):
-            _save(view, buffer, advance=False)
-    with cols[2]:
-        if st.button("Skip for now", key=f"skip:{view.candidate_id}", disabled=view.protected, width="stretch"):
-            _advance_queue(1)
+        st.button("Skip for now", key=f"skip:{view.candidate_id}", disabled=view.protected,
+                  width="stretch", on_click=_queue_advance_callback, args=(1,))
     state = st.session_state.get("review_save_state")
     if state:
         st.caption(state)

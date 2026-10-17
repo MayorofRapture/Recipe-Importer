@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Optional
 
 from recipe_quality import RecipeCandidate, Suggestion, is_complete
+from ui_diagnostics import count as ui_count
 
 
 class ReviewConflict(RuntimeError):
@@ -150,6 +151,7 @@ class ReviewStore:
         self.candidates: dict[str, dict] = {}
         self.decisions: dict[str, list[ReviewDecision]] = {}
         self.candidate_decisions: dict[str, list[ReviewDecision]] = {}
+        self._exact_registration_index: dict[tuple[str, str, str], list[dict]] = {}
         with _state_lock(path):
             self._reload()
 
@@ -162,7 +164,9 @@ class ReviewStore:
         self.approvals = {}
         self.resolutions = {}
         self.events = []
+        self._exact_registration_index = {}
         if self.path.exists():
+            ui_count("ledger_reads")
             for line in self.path.read_text(encoding="utf-8").splitlines():
                 if not line.strip():
                     continue
@@ -172,6 +176,7 @@ class ReviewStore:
                 kind = event.get("event")
                 if kind == "candidate_registration":
                     self.registrations.setdefault(identity, []).append(event)
+                    self._index_registration(event)
                 elif kind == "review_revision":
                     self.revisions.setdefault(identity, []).append(event)
                 elif kind == "review_approval":
@@ -232,6 +237,8 @@ class ReviewStore:
             and re.sub(r"\s+", " ", str(item.get("candidate", {}).get("name", "")).strip().casefold()) == title
         }) > 1
         try:
+            if self.state_path.exists():
+                ui_count("ledger_reads")
             records = ([json.loads(line) for line in state_path.read_text(encoding="utf-8").splitlines()
                         if line.strip()] if state_path.exists() else [])
         except (OSError, json.JSONDecodeError) as exc:
@@ -306,6 +313,7 @@ class ReviewStore:
             self._append_many(pending_events, locked=True)
             for event in pending_events:
                 self.registrations.setdefault(event["candidate_id"], []).append(event)
+                self._index_registration(event)
             return output
 
     def register_candidates(self, source: str, source_hash: str, extraction_id: str,
@@ -484,6 +492,7 @@ class ReviewStore:
                 self._append_many(pending_events, locked=True)
                 for event in pending_events:
                     self.registrations.setdefault(event["candidate_id"], []).append(event)
+                    self._index_registration(event)
             else:
                 _pending_events.extend(pending_events)
             return output
@@ -491,29 +500,32 @@ class ReviewStore:
     def _exact_registration_batch(self, source_hash: str, extraction_id: str,
                                   candidates: list[RecipeCandidate]) -> list[dict] | None:
         """Return stable registrations from this snapshot, or require a fresh locked read."""
-        exact_index: dict[str, list[dict]] = {}
-        for events in self.registrations.values():
-            for event in events:
-                if (event.get("source_hash") == source_hash
-                        and event.get("extraction_id") == extraction_id):
-                    exact_index.setdefault(event.get("fingerprint", ""), []).append(event)
         occurrences: dict[str, int] = {}
         output = []
         for candidate in candidates:
             fingerprint = hashlib.sha256(_canonical(candidate.model_dump(mode="json")).encode()).hexdigest()
             occurrence = occurrences.get(fingerprint, 0)
             occurrences[fingerprint] = occurrence + 1
-            matches = exact_index.get(fingerprint, [])
+            matches = self._exact_registration_index.get(
+                (source_hash, extraction_id, fingerprint), [],
+            )
             if (occurrence != 0 or len(matches) != 1
                     or matches[0].get("identity_status") != "registered"):
                 return None
             output.append(matches[0])
         return output
 
+    def _index_registration(self, event: dict) -> None:
+        key = (str(event.get("source_hash", "")), str(event.get("extraction_id", "")),
+               str(event.get("fingerprint", "")))
+        self._exact_registration_index.setdefault(key, []).append(event)
+
     def _source_has_protected_import_history(self, source_hash: str) -> bool:
         if not source_hash:
             return False
         try:
+            if self.state_path.exists():
+                ui_count("ledger_reads")
             state_records = ([json.loads(line) for line in self.state_path.read_text(encoding="utf-8").splitlines()
                               if line.strip()] if self.state_path.exists() else [])
         except (OSError, json.JSONDecodeError) as exc:
@@ -529,6 +541,8 @@ class ReviewStore:
 
         event_path = self.path.parent / "ui_import_events.jsonl"
         try:
+            if event_path.exists():
+                ui_count("ledger_reads")
             events = ([json.loads(line) for line in event_path.read_text(encoding="utf-8").splitlines()
                        if line.strip()] if event_path.exists() else [])
         except (OSError, json.JSONDecodeError) as exc:

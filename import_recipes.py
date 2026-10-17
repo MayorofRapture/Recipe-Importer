@@ -26,6 +26,7 @@ from google.genai import types
 from model_routing import ModelRouter, UsageLedger, parse_model_config, validate_model_ids
 from recipe_quality import ExtractionBatch, RecipeCandidate, is_complete, needs_review, schema_recipe
 from mealie_client import MealieClient
+from ui_diagnostics import count as ui_count
 import local_ocr
 from ocr_structuring import OcrLineReferences, assemble_line_references, numbered_lines
 from review_store import (ReviewConflict, ReviewDecision, ReviewStore, apply_candidate_decision, apply_review_decision,
@@ -119,8 +120,11 @@ class StateStore:
     def __init__(self, path: Path):
         self.path = path
         self.records: dict[str, dict] = {}
+        self._identity_records: dict[str, list[dict]] = {}
+        self._source_title_records: dict[tuple[str, str], list[dict]] = {}
         self.lock = threading.Lock()
         if path.exists():
+            ui_count("ledger_reads")
             for line in path.read_text(encoding="utf-8").splitlines():
                 if line.strip():
                     record = json.loads(line)
@@ -129,6 +133,40 @@ class StateStore:
                         if not record.get("identity") and key_index.isdigit() and record.get("title"):
                             record["identity"] = _identity_for_title(key_source, str(record["title"]))
                         self.records[record["key"]] = record
+        self._rebuild_indexes()
+
+    def _rebuild_indexes(self) -> None:
+        self._identity_records = {}
+        self._source_title_records = {}
+        for record in self.records.values():
+            self._index_record(record)
+
+    def _index_record(self, record: dict) -> None:
+        identity = record.get("identity")
+        if identity:
+            self._identity_records.setdefault(str(identity), []).append(record)
+        key = str(record.get("key", ""))
+        source_hash, separator, _ = key.partition(":")
+        title = _norm(str(record.get("title", "")))
+        if separator and title:
+            self._source_title_records.setdefault((source_hash, title), []).append(record)
+
+    def _unindex_record(self, record: dict) -> None:
+        identity = record.get("identity")
+        if identity:
+            matches = self._identity_records.get(str(identity), [])
+            self._identity_records[str(identity)] = [item for item in matches if item is not record]
+            if not self._identity_records[str(identity)]:
+                del self._identity_records[str(identity)]
+        key = str(record.get("key", ""))
+        source_hash, separator, _ = key.partition(":")
+        title = _norm(str(record.get("title", "")))
+        lookup = (source_hash, title)
+        if separator and title and lookup in self._source_title_records:
+            matches = self._source_title_records[lookup]
+            self._source_title_records[lookup] = [item for item in matches if item is not record]
+            if not self._source_title_records[lookup]:
+                del self._source_title_records[lookup]
 
     def get(self, key: str) -> Optional[dict]:
         with self.lock:
@@ -138,7 +176,10 @@ class StateStore:
         """Read other UI/CLI writers' completed records under the shared lock."""
         with self.lock:
             with _state_lock(self.path):
-                self.records = StateStore(self.path).records
+                refreshed = StateStore(self.path)
+                self.records = refreshed.records
+                self._identity_records = refreshed._identity_records
+                self._source_title_records = refreshed._source_title_records
 
     def add(self, key: str, status: str, slug: str, filename: str, title: str,
             identity: str = "", *, locked: bool = False, **fields) -> None:
@@ -155,7 +196,11 @@ class StateStore:
                     fh.write(json.dumps(record, ensure_ascii=False) + "\n")
                     fh.flush()
                     os.fsync(fh.fileno())
+            previous = self.records.get(key)
+            if previous is not None:
+                self._unindex_record(previous)
             self.records[key] = record
+            self._index_record(record)
 
     def find_candidate(self, source_hash: str, index: int,
                        candidate: RecipeCandidate, identity_aliases: tuple[str, ...] = (),
@@ -163,28 +208,23 @@ class StateStore:
         identity = candidate_identity(source_hash, candidate)
         legacy = self.records.get(f"{source_hash}:{index}")
         identities = {identity, *identity_aliases}
-        identity_matches = [record for record in self.records.values()
-                            if record.get("identity") in identities]
+        identity_matches = [record for value in identities
+                            for record in self._identity_records.get(value, ())]
         if len(identity_matches) > 1:
             raise AmbiguousCandidate(f"Multiple prior records match {candidate.name!r}; manual reconciliation required")
         if identity_matches:
             return identity_matches[0]
+        title_records = self._source_title_records.get((source_hash, _norm(candidate.name)), ())
+        if len(title_records) > 1 and len({record.get("identity") for record in title_records}) == 1:
+            raise AmbiguousCandidate(f"Multiple legacy records share {candidate.name!r}; manual reconciliation required")
         legacy_identity = _identity_for_title(source_hash, candidate.name)
         if allow_legacy_title_match and legacy and _norm(str(legacy.get("title", ""))) == _norm(candidate.name) \
                 and legacy.get("identity") in {None, legacy_identity}:
             return legacy
-        title_records = [record for record in self.records.values()
-                         if _norm(str(record.get("title", ""))) == _norm(candidate.name)
-                         and str(record.get("key", "")).startswith(source_hash + ":")]
         title_matches = [record for record in title_records
                          if record.get("identity") == legacy_identity]
         if not allow_legacy_title_match and title_matches:
             raise AmbiguousCandidate(f"Legacy identity for duplicate title {candidate.name!r} cannot be assigned to a sibling")
-        all_title_records = [record for record in self.records.values()
-                             if _norm(str(record.get("title", ""))) == _norm(candidate.name)
-                             and str(record.get("key", "")).startswith(source_hash + ":")]
-        if len(all_title_records) > 1 and len({record.get("identity") for record in all_title_records}) == 1:
-            raise AmbiguousCandidate(f"Multiple legacy records share {candidate.name!r}; manual reconciliation required")
         if len(title_matches) == 1:
             return title_matches[0]
         if len(title_matches) > 1:
@@ -210,6 +250,7 @@ def google_client(api_key: str):
 
 
 def file_digest(path: Path) -> str:
+    ui_count("source_hashes")
     digest = hashlib.sha256()
     with path.open("rb") as fh:
         while chunk := fh.read(1024 * 1024):
