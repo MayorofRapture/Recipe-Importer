@@ -13,6 +13,7 @@ import streamlit as st
 
 from quick_edit import parse_ingredients, parse_instructions, to_quick_edit
 from recipe_quality import RecipeCandidate
+from draft_store import DraftStore
 from review_store import ReviewStore
 from ui_data import RecipeView, load_catalog
 from ui_review_state import quick_edit_to_structured, row_ids_for
@@ -31,11 +32,11 @@ def paths() -> tuple[Path, Path | None]:
     return output, Path(source_value) if source_value else None
 
 
-def catalog() -> list[RecipeView]:
+def catalog(*, read_only: bool = False) -> list[RecipeView]:
     count("catalog_loads")
     output, source_root = paths()
     try:
-        return load_catalog(output, source_root, verify_sources=False)
+        return load_catalog(output, source_root, verify_sources=False, read_only=read_only)
     except Exception as exc:
         raise CatalogReadError(
             "Local records could not be read; history is preserved and mutations are blocked. "
@@ -109,6 +110,9 @@ def buffer_for(view: RecipeView) -> dict[str, Any]:
             "name": candidate.name,
             "yield_text": candidate.yield_text or "",
             "description": candidate.description or "",
+            "recipe_notes": "\n".join(candidate.notes),
+            "repair_proposal": (dict(getattr(view.draft, "repair_proposal", {}) or {})
+                                if view.draft is not None else {}),
             "structured_ingredients": list(candidate.ingredients),
             "structured_instructions": list(candidate.instructions),
             "_revision": view.revision,
@@ -143,6 +147,9 @@ def sync_buffer(view: RecipeView, buffer: dict[str, Any]) -> None:
         key = f"recipe_{name}:{view.candidate_id}"
         if key in st.session_state:
             buffer[name] = st.session_state[key]
+    notes_key = f"recipe_notes:{view.candidate_id}"
+    if notes_key in st.session_state:
+        buffer["recipe_notes"] = st.session_state[notes_key]
     for section in ("ingredients", "instructions"):
         bulk_key = f"bulk_{section}:{view.candidate_id}"
         if bulk_key in st.session_state:
@@ -193,6 +200,8 @@ def candidate_from_buffer(view: RecipeView, buffer: dict[str, Any]) -> tuple[Rec
     candidate.name = str(buffer.get("name", candidate.name)).strip()
     candidate.yield_text = str(buffer.get("yield_text", candidate.yield_text or "")).strip() or None
     candidate.description = str(buffer.get("description", candidate.description or "")).strip() or None
+    candidate.notes = [item.strip() for item in str(buffer.get("recipe_notes", "")).splitlines()
+                       if item.strip()]
     if buffer.get("mode") == "structured":
         candidate.ingredients = [str(item).strip() for item in buffer.get("structured_ingredients", []) if str(item).strip()]
         candidate.instructions = [str(item).strip() for item in buffer.get("structured_instructions", []) if str(item).strip()]
@@ -250,6 +259,19 @@ def save_draft(view: RecipeView, buffer: dict[str, Any]):
     return SimpleNamespace(revision=event["revision"], event_id=event["event_id"]), warnings
 
 
+def save_repair_proposal(view: RecipeView, buffer: dict[str, Any], repair_proposal: dict[str, Any]) -> None:
+    """Persist an unapproved proposal beside the current durable editor draft."""
+    candidate, warnings = candidate_from_buffer(view, buffer)
+    output, _ = paths()
+    DraftStore(output / "ui_drafts.jsonl").save(
+        view.candidate_id, view.source_hash, view.source_path,
+        candidate.model_dump(mode="json"), str(buffer.get("raw_ingredients", "")),
+        str(buffer.get("raw_instructions", "")), str(buffer.get("mode", "structured")),
+        warnings, repair_proposal=repair_proposal,
+    )
+    buffer["repair_proposal"] = repair_proposal
+
+
 def buffer_is_dirty(view: RecipeView, buffer: dict[str, Any]) -> bool:
     return buffer.get("_saved_signature") != _buffer_signature(view, buffer)
 
@@ -266,6 +288,7 @@ def _buffer_signature(view: RecipeView, buffer: dict[str, Any]) -> str:
             "instructions": candidate.instructions,
             "yield_text": candidate.yield_text,
             "description": candidate.description,
+            "notes": candidate.notes,
         },
         "raw_bulk_text": {"ingredients": str(buffer.get("raw_ingredients", "")),
                           "instructions": str(buffer.get("raw_instructions", ""))},

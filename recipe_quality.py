@@ -43,6 +43,7 @@ class RecipeCandidate(BaseModel):
     instructions: list[str] = Field(default_factory=list)
     yield_text: Optional[str] = None
     description: Optional[str] = None
+    notes: list[str] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
     missing_information: list[Diagnostic] = Field(default_factory=list)
     suggestions: list[Suggestion] = Field(default_factory=list)
@@ -67,9 +68,12 @@ def is_complete(recipe: RecipeCandidate) -> bool:
 
 def needs_review(recipe: RecipeCandidate) -> bool:
     """Critical findings or unresolved proposals require human review."""
-    return recipe.requires_review or any(item.severity == "critical" for item in recipe.missing_information) or any(
-        item.review_status == "pending" for item in recipe.suggestions
-    )
+    from recipe_validation import validate_recipe
+
+    return (recipe.requires_review
+            or any(item.severity == "critical" for item in recipe.missing_information)
+            or any(item.review_status == "pending" for item in recipe.suggestions)
+            or bool(validate_recipe(recipe)))
 
 
 def schema_recipe(recipe: RecipeCandidate) -> dict:
@@ -86,6 +90,8 @@ def schema_recipe(recipe: RecipeCandidate) -> dict:
     }
     if recipe.yield_text:
         data["recipeYield"] = recipe.yield_text.strip()
-    if recipe.description:
-        data["description"] = recipe.description.strip()
+    description_parts = [recipe.description.strip()] if recipe.description and recipe.description.strip() else []
+    description_parts.extend(f"Recipe note: {note.strip()}" for note in recipe.notes if note.strip())
+    if description_parts:
+        data["description"] = "\n\n".join(description_parts)
     return data

@@ -63,6 +63,18 @@ unverified proposal and source issue, then approve a specific saved revision. Sa
 approval, and import are separate actions. Pending proposals and unapproved retry
 results cannot be imported.
 
+Review also flags ingredient rows that look like preparation instructions,
+substitution notes, or several measured ingredients combined by OCR. These are
+heuristic warnings: compare them with the source before changing anything. Use
+**Review ingredient extraction** to edit one suggested reorganization of ingredients,
+instructions, and notes. Saving the proposal keeps it as a local draft; only **Apply
+proposed repair** creates a new review revision, which must still be reviewed and
+approved. Imported and uncertain recipes stay read-only. **Extraction quality** in
+the Review queue audits current effective recipe revisions and includes imported
+recipes as read-only results; opening the audit does not write review state. Notes and
+substitutions remain outside ingredient rows and are carried into Mealie's recipe
+description.
+
 In Instructions, use **Suggest missing instructions with AI** when there are no usable steps, or **Suggest improvements with AI** when instructions already exist. Each request requires fresh consent and sends only the recipe title, ingredients, and current instructions as text to Gemini; it does not send the scan. If the scan is unavailable, the page explains that suggestions are inferred from recipe text and the scan must still be verified before final approval. The durable job runs in the background, and its result stays labeled inferred and unverified until you accept or edit it. Review the current wording, proposed wording, difference, and uncertainty together beside the relevant step. Declining an optional generated completion leaves the recipe unchanged; critical source findings remain separate. If a proposal is stale, compare it with the current wording and explicitly apply it only when its target still exists, or discard it before requesting again with fresh consent.
 
 The Review panel summarizes suggestion decisions and shows each approval blocker beside a direct Review action. This keeps the next correction close to the reason approval is unavailable. Applied proposals remain distinguishable from accepted edits and declined suggestions, while rejection leaves the source issue visible until a separate follow-up is recorded. If the recipe changes while a generated proposal is pending, compare its original wording with the current wording; explicitly apply it to the current revision when its target still exists, or discard it and request a new proposal with fresh consent.

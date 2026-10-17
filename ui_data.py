@@ -18,6 +18,7 @@ from import_recipes import StateStore, candidate_identity, file_digest
 from import_protection import ImportProtectionError, protected_candidate_ids
 from quick_edit import ParseWarning, parse_ingredients, parse_instructions
 from recipe_quality import ExtractionBatch, RecipeCandidate, is_complete, needs_review
+from recipe_validation import validate_recipe
 from review_store import ReviewStore, apply_candidate_decision, apply_review_decision, extraction_identity
 from ui_contracts import normalize_status
 from review_service import project_legacy_review
@@ -53,6 +54,12 @@ class RecipeView:
     batch_name: str = "Existing library"
     batch_tag: str = ""
     latest_suggestion_request: dict[str, Any] | None = None
+    source_candidate: RecipeCandidate | None = None
+
+    @property
+    def quality_findings(self):
+        from recipe_validation import validate_recipe
+        return tuple(validate_recipe(self.candidate))
 
     @property
     def pending_suggestions(self) -> list:
@@ -94,7 +101,7 @@ class _SourceIndex:
 
 
 def load_catalog(output_dir: Path, source_root: Path | None = None, *,
-                 verify_sources: bool = True) -> list[RecipeView]:
+                 verify_sources: bool = True, read_only: bool = False) -> list[RecipeView]:
     """Load local extraction results into stable recipe views.
 
     Cache files are grouped by source hash and the newest valid version wins.
@@ -157,7 +164,31 @@ def load_catalog(output_dir: Path, source_root: Path | None = None, *,
         ("", source_hash, extraction_identity(source_hash, batch.model_dump(mode="json")), batch.recipes)
         for source_hash, batch in caches
     ]
-    registered_batches = reviews.register_candidate_batches(registration_batches)
+    if read_only:
+        registered_batches = []
+        for (_source, source_hash, extraction_id, candidates) in registration_batches:
+            batch_registrations = []
+            for candidate in candidates:
+                legacy_id = candidate_identity(source_hash, candidate)
+                matches = [registration for events in reviews.registrations.values()
+                           for registration in events
+                           if registration.get("source_hash") == source_hash
+                           and registration.get("extraction_id") == extraction_id
+                           and (registration.get("candidate_id") == legacy_id
+                                or legacy_id in registration.get("legacy_aliases", ())
+                                or registration.get("fingerprint") == legacy_id.rsplit(":", 1)[-1])]
+                if len(matches) == 1:
+                    batch_registrations.append(matches[0])
+                else:
+                    batch_registrations.append({
+                        "candidate_id": legacy_id, "source_hash": source_hash,
+                        "extraction_id": extraction_id, "candidate": candidate.model_dump(mode="json"),
+                        "target_bindings": [], "identity_status": "unregistered",
+                        "legacy_aliases": [], "source": "",
+                    })
+            registered_batches.append(batch_registrations)
+    else:
+        registered_batches = reviews.register_candidate_batches(registration_batches)
 
     for (source_hash, batch), registrations in zip(caches, registered_batches):
         extraction_id = extraction_identity(source_hash, batch.model_dump(mode="json"))
@@ -260,6 +291,8 @@ def load_catalog(output_dir: Path, source_root: Path | None = None, *,
                 batch_tag=str(source_meta.get("batch_tag", "")),
                 latest_suggestion_request=reviews.latest_suggestion_request_loaded(
                     identity, source_hash, extraction_id),
+                source_candidate=RecipeCandidate.model_validate(
+                    registration.get("candidate", candidate.model_dump(mode="json"))),
             ))
 
     # Explicitly declared new retry candidates stay in their attempt cache. They
@@ -276,7 +309,7 @@ def load_catalog(output_dir: Path, source_root: Path | None = None, *,
         if not candidate_id or key in visible:
             continue
         attempt_dir = output_dir / "reextraction_attempts" / str(lineage.get("attempt_id", ""))
-        attempt_candidate = next((item for item in load_catalog(attempt_dir)
+        attempt_candidate = next((item for item in load_catalog(attempt_dir, read_only=read_only)
                                  if item.candidate_id == candidate_id
                                  and item.source_hash == source_hash
                                  and item.extraction_id == extraction_id), None)
@@ -352,6 +385,8 @@ def load_catalog(output_dir: Path, source_root: Path | None = None, *,
             batch_tag=str(source_meta.get("batch_tag", "")),
             latest_suggestion_request=reviews.latest_suggestion_request_loaded(
                 candidate_id, source_hash, extraction_id),
+            source_candidate=RecipeCandidate.model_validate(
+                registration.get("candidate", attempt_candidate.candidate.model_dump(mode="json"))),
         ))
         visible.add(key)
     return views
@@ -413,6 +448,36 @@ def previous_unresolved(views: Iterable[RecipeView], current_id: str | None) -> 
         if view.candidate_id == current_id and index > 0:
             return candidates[index - 1]
     return None
+
+
+def extraction_quality_audit(views: Iterable[RecipeView]) -> dict[str, Any]:
+    """Build a read-only audit from the supplied current effective projections."""
+    rows = []
+    inspected = 0
+    deferred = 0
+    corrected = 0
+    for view in views:
+        inspected += 1
+        findings = list(view.quality_findings)
+        if (getattr(view.draft, "repair_proposal", {}) or {}).get("status") == "deferred":
+            deferred += 1
+        if (view.revision > 0 and view.source_candidate is not None
+                and view.source_candidate is not view.candidate
+                and validate_recipe(view.source_candidate) and not findings):
+            corrected += 1
+        if findings:
+            rows.append({"view": view, "findings": findings})
+    high_priority = sum(1 for row in rows for item in row["findings"]
+                        if item.severity == "critical")
+    return {
+        "rows": rows,
+        "inspected": inspected,
+        "with_issues": len(rows),
+        "high_priority": high_priority,
+        "needs_manual_review": sum(not row["view"].protected for row in rows),
+        "deferred": deferred,
+        "corrected": corrected,
+    }
 
 
 def render_source_page(path: Path, page_number: int = 1, zoom: float = 1) -> SourcePage:

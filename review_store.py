@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Optional
 
 from recipe_quality import RecipeCandidate, Suggestion, is_complete
+from recipe_validation import validate_recipe
 from ui_diagnostics import count as ui_count
 
 
@@ -125,11 +126,20 @@ def _canonical(value: dict) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
+def _candidate_payload(candidate: RecipeCandidate) -> dict:
+    value = candidate.model_dump(mode="json")
+    if not value.get("notes"):
+        value.pop("notes", None)
+    return value
+
+
 def _recipe_digest(recipe: dict) -> str:
     fields = {key: recipe.get(key) for key in (
         "name", "ingredients", "instructions", "yield_text", "description",
-        "prep_time", "perform_time", "total_time", "recipe_category", "tags",
+        "prep_time", "perform_time", "total_time", "recipe_category", "tags", "notes",
     ) if key in recipe}
+    if not fields.get("notes"):
+        fields.pop("notes", None)
     return hashlib.sha256(b"recipe-content-v1\0" + _canonical(fields).encode("utf-8")).hexdigest()
 
 
@@ -143,7 +153,11 @@ def _resolution_digest(resolutions: list[dict]) -> str:
 
 
 def extraction_identity(source_hash: str, extraction: dict) -> str:
-    return hashlib.sha256((source_hash + _canonical(extraction)).encode("utf-8")).hexdigest()
+    normalized = json.loads(json.dumps(extraction, ensure_ascii=False))
+    for candidate in normalized.get("recipes", []) if isinstance(normalized, dict) else []:
+        if isinstance(candidate, dict) and not candidate.get("notes"):
+            candidate.pop("notes", None)
+    return hashlib.sha256((source_hash + _canonical(normalized)).encode("utf-8")).hexdigest()
 
 
 def _legacy_identity(source_hash: str, title: str) -> str:
@@ -411,9 +425,9 @@ class ReviewStore:
             ) or any(event.get("source_hash") == source_hash
                      for event in (_pending_events or []))
             source_import_protected = self._source_has_protected_import_history(source_hash)
-            fingerprints = [hashlib.sha256(_canonical(item.model_dump(mode="json")).encode()).hexdigest()
+            fingerprints = [hashlib.sha256(_canonical(_candidate_payload(item)).encode()).hexdigest()
                             for item in candidates]
-            current_payloads = {_canonical(item.model_dump(mode="json")) for item in candidates}
+            current_payloads = {_canonical(_candidate_payload(item)) for item in candidates}
             prior_source_legacy_candidate = any(
                 event.get("event") == "candidate"
                 and (str(event.get("candidate_id", "")).startswith(source_hash + ":")
@@ -476,7 +490,7 @@ class ReviewStore:
                 elif fingerprint not in repeated and prior:
                     candidate_id, identity_status = str(uuid.uuid4()), "needs_reconciliation"
                 elif fingerprint not in repeated:
-                    legacy_matches = legacy_index.get(_canonical(candidate.model_dump(mode="json")), [])
+                    legacy_matches = legacy_index.get(_canonical(_candidate_payload(candidate)), [])
                     duplicate_title = title_counts[candidate.name.casefold().strip()] > 1
                     if duplicate_title and legacy_matches:
                         candidate_id, identity_status = str(uuid.uuid4()), "needs_reconciliation"
@@ -549,7 +563,7 @@ class ReviewStore:
                               "title_legacy_id": title_legacy_id,
                               "legacy_aliases": [f"{source_hash}:{fingerprint[:24]}",
                                                  *([title_legacy_id] if title_legacy_id else [])],
-                              "candidate": candidate.model_dump(mode="json"),
+                              "candidate": _candidate_payload(candidate),
                               "target_bindings": bindings})
                 # Registration retries are keyed by immutable extraction/fingerprint.
                 existing = next((e for e in [*self.events, *(_pending_events or [])]
@@ -578,12 +592,20 @@ class ReviewStore:
         occurrences: dict[str, int] = {}
         output = []
         for candidate in candidates:
-            fingerprint = hashlib.sha256(_canonical(candidate.model_dump(mode="json")).encode()).hexdigest()
+            fingerprint = hashlib.sha256(_canonical(_candidate_payload(candidate)).encode()).hexdigest()
             occurrence = occurrences.get(fingerprint, 0)
             occurrences[fingerprint] = occurrence + 1
             matches = self._exact_registration_index.get(
                 (source_hash, extraction_id, fingerprint), [],
             )
+            if not matches:
+                # Accept records written after the notes field was introduced,
+                # where an empty notes list was serialized into the fingerprint.
+                legacy_payload = candidate.model_dump(mode="json")
+                legacy_fingerprint = hashlib.sha256(_canonical(legacy_payload).encode()).hexdigest()
+                matches = self._exact_registration_index.get(
+                    (source_hash, extraction_id, legacy_fingerprint), [],
+                )
             if (occurrence != 0 or len(matches) != 1
                     or matches[0].get("identity_status") != "registered"):
                 return None
@@ -671,7 +693,7 @@ class ReviewStore:
                                       target_bindings: list[dict], attempt_id: str,
                                       origin_candidate_id: str) -> dict:
         """Add an explicitly declared new attempt candidate without changing caches."""
-        payload = candidate.model_dump(mode="json")
+        payload = _candidate_payload(candidate)
         fingerprint = hashlib.sha256(_canonical(payload).encode("utf-8")).hexdigest()
         operation_id = f"reconciled-register:{attempt_id}:{candidate_id}"
         event = self._base_event("candidate_registration", candidate_id, source_hash,
@@ -1755,7 +1777,7 @@ class ReviewStore:
             "event": "candidate",
             "source": source,
             "candidate_id": candidate_id,
-            "candidate": candidate.model_dump(mode="json"),
+            "candidate": _candidate_payload(candidate),
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
         self._append(event)
@@ -1860,6 +1882,11 @@ class ReviewStore:
                                     resolution["issue_id"], status, resolution.get("final_value"),
                                     resolution.get("timestamp", ""),
                                 )
+                    effective = self.project_loaded(
+                        identity, str(registration.get("source_hash", "")),
+                        str(registration.get("extraction_id", "")), candidate,
+                    )
+                    candidate = RecipeCandidate.model_validate(effective.recipe)
                 suggestions = {}
                 for suggestion in candidate.suggestions:
                     suggestions.setdefault(suggestion.field_path, []).append(suggestion)
@@ -1912,6 +1939,17 @@ class ReviewStore:
                         "review_status": decision.status if decision else suggestion.review_status,
                         "approved_value": decision.final_value if decision and decision.status in {"approved", "edited"} else "",
                         "suggested_action": "Approve, edit, reject, or defer this proposal.",
+                    })
+                for finding in validate_recipe(candidate):
+                    writer.writerow({
+                        "source": event["source"], "candidate_id": identity,
+                        "recipe": candidate.name, "suggestion_id": finding.diagnostic_id,
+                        "field": finding.field_path, "diagnosis": finding.category,
+                        "detail": finding.explanation, "source_evidence": finding.original_text,
+                        "suggested_completion": "", "confidence": "",
+                        "uncertainty": "Heuristic finding; verify against the source.",
+                        "review_status": "pending", "approved_value": "",
+                        "suggested_action": finding.suggested_action,
                     })
                 if candidate.requires_review and not written_fields and not candidate.suggestions:
                     decision = self.candidate_decision(identity)
@@ -1969,6 +2007,11 @@ def apply_candidate_decision(candidate: RecipeCandidate,
                 if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
                     raise ValueError(f"Edited candidate {field} must be a list of strings")
                 setattr(updated, field, value)
+        if "notes" in values:
+            value = values["notes"]
+            if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+                raise ValueError("Edited candidate notes must be a list of strings")
+            updated.notes = value
         for field in ("yield_text", "description"):
             if field in values:
                 setattr(updated, field, None if values[field] is None else str(values[field]))
@@ -1983,6 +2026,9 @@ def _set_field(candidate: RecipeCandidate, field_path: str, value: str) -> None:
         return
     if field_path in {"yield_text", "description"}:
         setattr(candidate, field_path, value)
+        return
+    if field_path == "notes":
+        candidate.notes = _split_list_value(value)
         return
     if field_path in {"ingredients", "instructions"}:
         setattr(candidate, field_path, _split_list_value(value))

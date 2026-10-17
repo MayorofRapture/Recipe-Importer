@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import time
 import uuid
@@ -20,15 +21,17 @@ from app_pages.common import (
     refresh_buffer_after_decision,
     retry_service,
     review_store,
+    save_repair_proposal,
     save_resume_pointer,
     save_draft,
     structured_widget_key,
     sync_buffer,
     _revision_bindings,
 )
-from ui_data import render_source_page, verify_selected_source
+from ui_data import extraction_quality_audit, render_source_page, verify_selected_source
 from review_queue_state import QueueState
 from recipe_quality import is_complete
+from recipe_validation import propose_repair, validate_recipe
 from suggestion_ui import (
     approval_blockers, render_approval_blockers, render_critical_finding_resolution,
     render_suggestion_card, render_suggestion_summary, suggestion_current_value,
@@ -471,7 +474,8 @@ def _restore_resume_state(views) -> None:
 
 def _flush_candidate(candidate_id: str, views=None) -> bool:
     if views is None:
-        views = catalog()
+        quality_audit_mode = st.session_state.get("review_queue") == "Extraction quality"
+        views = catalog(read_only=quality_audit_mode)
     view = next((item for item in views if item.candidate_id == candidate_id), None)
     if view is None or view.protected:
         return True
@@ -516,7 +520,8 @@ def main() -> None:
         _render_skipped_list()
         return
     try:
-        views = catalog()
+        quality_audit_mode = st.session_state.get("review_queue") == "Extraction quality"
+        views = catalog(read_only=quality_audit_mode)
     except CatalogReadError as exc:
         st.error(str(exc), icon=":material/lock:")
         st.stop()
@@ -558,6 +563,14 @@ def main() -> None:
         st.info(st.session_state.pop("review_filter_restore_notice"))
     queue_page = _queue_page(views)
     candidates = queue_page["candidates"]
+    if st.session_state.get("review_queue") == "Extraction quality":
+        audit = _quality_audit_snapshot(views)
+        metrics = st.columns(4)
+        metrics[0].metric("Recipes inspected", audit["inspected"])
+        metrics[1].metric("Potential issues", audit["with_issues"])
+        metrics[2].metric("High priority", audit["high_priority"])
+        metrics[3].metric("Needs manual review", audit["needs_manual_review"])
+        st.caption(f"Saved corrections: {audit['corrected']} · Deferred: {audit['deferred']}")
     if not candidates:
         _render_queue(views, queue_page)
         st.info("No recipes match these filters. Open Review queue to adjust them.")
@@ -593,8 +606,9 @@ def main() -> None:
     buffer = buffer_for(view)
     sync_buffer(view, buffer)
     st.session_state.review_active_selection = selected_id
-    save_resume_pointer(view, buffer)
-    _queue_state().record_visit(selected_id, view.candidate.name, _navigation_context())
+    if not quality_audit_mode:
+        save_resume_pointer(view, buffer)
+        _queue_state().record_visit(selected_id, view.candidate.name, _navigation_context())
     all_ids = queue_page["all_ids"]
     position = all_ids.index(selected_id) + 1
     st.title("Review")
@@ -615,6 +629,7 @@ def main() -> None:
             _render_source(view)
         with editor:
             _render_editor_fragment(view, buffer)
+    _render_ingredient_repair(view, buffer)
     _render_findings(view, buffer)
     _render_retry_panel(view, views)
 
@@ -886,7 +901,20 @@ def _render_comparison_candidate(candidate: dict, counterpart: dict, *, is_new: 
 
 def _queue_page(views):
     mode = st.session_state.get("review_queue", "Needs action")
-    candidates = views if mode == "All recipes" else [v for v in views if not v.protected]
+    candidates = views if mode in {"All recipes", "Extraction quality"} else [v for v in views if not v.protected]
+    if mode == "Extraction quality":
+        audit = _quality_audit_snapshot(views)
+        matches = audit["by_id"]
+        candidates = [view for view in candidates if view.candidate_id in matches]
+        category = st.session_state.get("review_quality_category", "All issue types")
+        severity = st.session_state.get("review_quality_severity", "All severities")
+        if category != "All issue types":
+            candidates = [view for view in candidates if any(
+                item.category == category for item in matches[view.candidate_id])]
+        if severity != "All severities":
+            desired = "critical" if severity == "High priority" else "warning"
+            candidates = [view for view in candidates if any(
+                item.severity == desired for item in matches[view.candidate_id])]
     if mode == "Needs action":
         candidates = [v for v in candidates if v.status in {"Needs attention", "Ready to review", "Import failed"}]
     needle = st.session_state.get("review_search", "").strip().casefold()
@@ -909,7 +937,7 @@ def _queue_page(views):
 
 
 def _render_queue(views, queue_page) -> None:
-    queue_labels = ["Needs action", "All unresolved", "All recipes"]
+    queue_labels = ["Needs action", "All unresolved", "Extraction quality", "All recipes"]
     with st.popover("Queue"):
         cols = st.columns([1, 1.7, 1.4, 1.4], vertical_alignment="bottom")
         with cols[0]:
@@ -926,6 +954,18 @@ def _render_queue(views, queue_page) -> None:
         with cols[3]:
             statuses = ["Any status", "Needs attention", "Ready to review", "Ready to import", "Imported", "Check Mealie", "Import failed"]
             st.selectbox("Status", statuses, key="review_status", on_change=_filter_changed, args=("review_status",))
+        if st.session_state.review_queue == "Extraction quality":
+            audit = _quality_audit_snapshot(views)
+            categories = sorted({item.category for items in audit["by_id"].values() for item in items})
+            if st.session_state.get("review_quality_category", "All issue types") not in ["All issue types", *categories]:
+                st.session_state.review_quality_category = "All issue types"
+            if st.session_state.get("review_quality_severity", "All severities") not in [
+                    "All severities", "High priority", "Warnings"]:
+                st.session_state.review_quality_severity = "All severities"
+            filters = st.columns(2)
+            filters[0].selectbox("Issue type", ["All issue types", *categories], key="review_quality_category")
+            filters[1].selectbox("Severity", ["All severities", "High priority", "Warnings"], key="review_quality_severity")
+            st.caption("This read-only audit checks current saved recipe revisions. Open a result to compare it with the source.")
         candidates = queue_page["candidates"]
         page, pages = queue_page["page"], queue_page["pages"]
         nav = st.columns([1, 3, 1], vertical_alignment="center")
@@ -951,6 +991,38 @@ def _render_queue(views, queue_page) -> None:
             )
         for item in candidates:
             st.caption(f"{item.candidate.name} - {item.status} - {item.source_display_name} - {item.batch_name}")
+            if st.session_state.review_queue == "Extraction quality":
+                findings = _quality_audit_snapshot(views)["by_id"][item.candidate_id]
+                st.write(findings[0].explanation)
+                if item.identity_status != "registered":
+                    st.caption("Editing is unavailable until this candidate has a stable review identity.")
+                st.button("Review ingredient extraction", key=f"quality_open:{item.candidate_id}",
+                          on_click=_select_quality_result,
+                          args=(item.candidate_id, findings[0].field_path),
+                          disabled=item.identity_status != "registered")
+
+
+def _quality_audit_snapshot(views):
+    signature = tuple((view.candidate_id, view.source_hash, view.extraction_id, view.revision,
+                       view.content_digest, hashlib.sha256(json.dumps(
+                           view.candidate.model_dump(mode="json"), ensure_ascii=False,
+                           sort_keys=True, separators=(",", ":"),
+                       ).encode("utf-8")).hexdigest(), view.status, view.protected,
+                       (getattr(view.draft, "repair_proposal", {}) or {}).get("status"))
+                      for view in views)
+    cached = st.session_state.get("review_quality_audit")
+    if cached and cached["signature"] == signature:
+        return cached["audit"]
+    audit = extraction_quality_audit(views)
+    audit["by_id"] = {row["view"].candidate_id: row["findings"] for row in audit["rows"]}
+    st.session_state.review_quality_audit = {"signature": signature, "audit": audit}
+    return audit
+
+
+def _select_quality_result(candidate_id: str, field_path: str) -> None:
+    st.session_state.review_selection = candidate_id
+    st.session_state.review_show_issues = True
+    st.session_state.review_quality_target = (candidate_id, field_path)
 
 def _render_source(view) -> None:
     with st.container(border=True):
@@ -1025,6 +1097,9 @@ def _render_editor(view, buffer) -> None:
                           key=f"recipe_yield_text:{view.candidate_id}")
             st.text_area("Description", value=str(buffer.get("description", "")), height=84,
                          key=f"recipe_description:{view.candidate_id}")
+            st.text_area("Recipe notes and substitutions", value=str(buffer.get("recipe_notes", "")),
+                         height=84, key=f"recipe_notes:{view.candidate_id}",
+                         help="Kept separate from ingredient rows; notes are included in Mealie's recipe description.")
         tab_key = f"recipe_sections:{view.candidate_id}"
         st.session_state.setdefault(tab_key, st.session_state.get(
             f"recipe_section_saved:{view.candidate_id}", "Ingredients"))
@@ -1138,6 +1213,9 @@ def _render_structured_section(view, buffer, field: str) -> None:
     _render_suggestions(view, buffer, field)
     for index, value in enumerate(list(buffer[value_key])):
         row_id = buffer[ids_key][index]
+        target = st.session_state.get("review_quality_target")
+        if (target == (view.candidate_id, f"{field}[{index}]")):
+            st.warning("Selected extraction quality finding. Compare this row with the source scan.")
         cols = st.columns([0.4, 6, 1.4], vertical_alignment="center")
         with cols[0]:
             st.caption(str(index + 1))
@@ -1523,6 +1601,117 @@ def _render_findings(view, buffer) -> None:
                 buffer["_undo"] = undo
                 return
             st.rerun()
+
+
+def _render_ingredient_repair(view, buffer) -> None:
+    candidate, _ = candidate_from_buffer(view, buffer)
+    findings = validate_recipe(candidate)
+    if not findings:
+        return
+    st.warning("Some ingredient entries may contain preparation instructions or substitution notes.")
+    for finding in findings:
+        with st.expander(f"{finding.field_path}: {finding.category.replace('_', ' ')}"):
+            st.write(finding.explanation)
+            st.code(finding.original_text)
+            if finding.source_references:
+                refs = ", ".join(f"lines {item.get('start')}-{item.get('end')}"
+                                  for item in finding.source_references)
+                st.caption(f"Source reference: {refs}. Verify the wording against the scan.")
+            st.caption(finding.suggested_action)
+    key = f"ingredient_repair_open:{view.candidate_id}"
+    if not st.session_state.get(key):
+        if st.button("Review ingredient extraction", key=f"open_repair:{view.candidate_id}",
+                     disabled=view.protected):
+            st.session_state[key] = True
+            st.rerun()
+        return
+    stored = dict(buffer.get("repair_proposal", {}) or {})
+    valid_stored = (stored.get("source_hash") == view.source_hash
+                    and stored.get("extraction_id") == view.extraction_id
+                    and int(stored.get("base_revision", -1)) == view.revision
+                    and isinstance(stored.get("proposal"), dict))
+    proposed = stored.get("proposal") if valid_stored else propose_repair(candidate).__dict__
+    if not view.source_verified:
+        st.info("Inferred reorganization from the saved extraction text. The original scan is unavailable or not verified.")
+    else:
+        st.info("Suggested reorganization from the saved extraction. Check each proposed value against the visible scan.")
+    with st.form(f"repair_form:{view.candidate_id}"):
+        ingredients_text = st.text_area(
+            "Proposed ingredients", value="\n".join(proposed.get("ingredients", [])), height=180,
+            key=f"repair_ingredients:{view.candidate_id}")
+        instructions_text = st.text_area(
+            "Proposed instructions", value="\n\n".join(proposed.get("instructions", [])), height=180,
+            key=f"repair_instructions:{view.candidate_id}")
+        notes_text = st.text_area(
+            "Proposed notes and substitutions", value="\n".join(proposed.get("notes", [])), height=100,
+            key=f"repair_notes:{view.candidate_id}")
+        for uncertainty in proposed.get("uncertainties", []):
+            st.warning(uncertainty)
+        left, right, cancel = st.columns(3)
+        save_proposal = left.form_submit_button("Save repair draft", width="stretch")
+        apply_proposal = right.form_submit_button("Apply proposed repair", type="primary", width="stretch")
+        cancel_proposal = cancel.form_submit_button("Cancel", width="stretch")
+    if cancel_proposal:
+        save_repair_proposal(view, buffer, {})
+        st.session_state.pop(key, None)
+        st.rerun()
+    if save_proposal or apply_proposal:
+        edited = {
+            "ingredients": [line.strip() for line in ingredients_text.splitlines() if line.strip()],
+            "instructions": [part.strip() for part in instructions_text.split("\n\n") if part.strip()],
+            "notes": [line.strip() for line in notes_text.splitlines() if line.strip()],
+            "uncertainties": list(proposed.get("uncertainties", [])),
+            "inferred": True,
+        }
+        record = {"source_hash": view.source_hash, "extraction_id": view.extraction_id,
+                  "base_revision": view.revision, "proposal": edited}
+        if save_proposal:
+            save_repair_proposal(view, buffer, record)
+            st.session_state.review_save_state = "Repair proposal saved locally. The recipe has not changed."
+            st.rerun()
+        if apply_proposal:
+            blockers = (view.protected or view.identity_status != "registered"
+                        or bool(view.candidate.suggestions) or bool(view.critical_findings))
+            if blockers:
+                st.error("This recipe has protected status or existing review decisions that need reconciliation before a structural repair can be applied.")
+                return
+            prior_buffer = {
+                name: (list(value) if isinstance(value, list) else value)
+                for name, value in buffer.items()
+                if name in {"structured_ingredients", "structured_instructions", "ingredient_ids",
+                            "instruction_ids", "recipe_notes", "raw_ingredients", "raw_instructions",
+                            "mode", "_revision", "_saved_signature"}
+            }
+            old_instructions = prior_buffer.get("structured_instructions", [])
+            old_instruction_ids = prior_buffer.get("instruction_ids", [])
+            buffer["structured_ingredients"] = edited["ingredients"]
+            buffer["structured_instructions"] = edited["instructions"]
+            buffer["ingredient_ids"] = [str(uuid.uuid4()) for _ in edited["ingredients"]]
+            buffer["instruction_ids"] = [
+                old_instruction_ids[old_instructions.index(item)]
+                if item in old_instructions and old_instructions.index(item) < len(old_instruction_ids)
+                else str(uuid.uuid4()) for item in edited["instructions"]
+            ]
+            buffer["recipe_notes"] = "\n".join(edited["notes"])
+            buffer["mode"] = "structured"
+            _update_raw_section(buffer, "ingredients")
+            _update_raw_section(buffer, "instructions")
+            try:
+                saved, _ = save_draft(view, buffer)
+                save_repair_proposal(view, buffer, {})
+                st.session_state.review_save_state = f"Repair saved as review revision {saved.revision}. Review it before approval."
+                st.session_state.pop(key, None)
+                st.rerun()
+            except Exception as exc:
+                buffer.update(prior_buffer)
+                st.error(f"The repair was not saved. The original recipe revision remains intact. {exc}")
+    if st.button("Keep original and defer", key=f"defer_repair:{view.candidate_id}"):
+        save_repair_proposal(view, buffer, {
+            "source_hash": view.source_hash, "extraction_id": view.extraction_id,
+            "base_revision": view.revision, "status": "deferred",
+        })
+        st.session_state.pop(key, None)
+        st.rerun()
 
 
 def _current_value_for_path(candidate, field_path: str) -> str | None:

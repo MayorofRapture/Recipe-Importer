@@ -107,6 +107,24 @@ class QualityReviewTests(unittest.TestCase):
         self.assertEqual(rows[0]["diagnosis"], "ambiguous")
         self.assertEqual(rows[0]["review_status"], "pending")
 
+    def test_review_csv_includes_current_semantic_ingredient_warning(self):
+        candidate = RecipeCandidate(
+            name="Raspberry Cream Center",
+            ingredients=["Combine 2 cups sugar and 1/2 cup butter in a bowl."],
+            instructions=[],
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ReviewStore(Path(tmp) / "review.jsonl")
+            store.add_candidate("scan.jpg", "candidate-id", candidate)
+            output = Path(tmp) / "needs_review.csv"
+            store.write_csv(output)
+            with output.open(newline="", encoding="utf-8-sig") as fh:
+                rows = list(csv.DictReader(fh))
+
+        self.assertEqual(rows[0]["diagnosis"], "instruction_in_ingredients")
+        self.assertEqual(rows[0]["review_status"], "pending")
+        self.assertIn("Combine 2 cups sugar", rows[0]["source_evidence"])
+
     def test_review_csv_includes_suggestion_id_for_jalapeno_suggestion(self):
         candidate = RecipeCandidate(
             name="Jalapeño Peppers",

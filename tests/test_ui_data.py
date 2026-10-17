@@ -10,10 +10,50 @@ from batch_store import BatchStore
 from import_recipes import file_digest
 from recipe_quality import ExtractionBatch, RecipeCandidate
 from review_store import ReviewStore
-from ui_data import load_catalog, next_unresolved, render_source_page
+from ui_data import RecipeView, extraction_quality_audit, load_catalog, next_unresolved, render_source_page
 
 
 class UiDataTests(unittest.TestCase):
+    def test_review_projection_exposes_shared_semantic_ingredient_findings(self):
+        candidate = RecipeCandidate(
+            ingredients=["Combine 1 cup flour and 2 eggs in a bowl."], instructions=[],
+        )
+        view = RecipeView("id", "hash", "", candidate, "Ready to review")
+        self.assertTrue(any("preparation instruction" in item.explanation for item in view.quality_findings))
+
+    def test_quality_audit_uses_effective_views_and_does_not_mutate_them(self):
+        flagged = RecipeView("a", "hash", "", RecipeCandidate(
+            ingredients=["Combine 1 cup flour and 2 eggs in a bowl."]
+        ), "Needs attention")
+        clean = RecipeView("b", "hash2", "", RecipeCandidate(
+            ingredients=["1 cup chopped walnuts"], instructions=["Bake until set."]
+        ), "Imported", protected=True)
+        before = flagged.candidate.model_dump(mode="json")
+
+        audit = extraction_quality_audit([flagged, clean])
+
+        self.assertEqual((audit["inspected"], audit["with_issues"], audit["needs_manual_review"]), (2, 1, 1))
+        self.assertEqual(flagged.candidate.model_dump(mode="json"), before)
+
+    def test_quality_audit_counts_only_saved_corrections_and_durable_deferrals(self):
+        from types import SimpleNamespace
+
+        original = RecipeCandidate(ingredients=["Combine 1 cup flour and 2 eggs in a bowl."])
+        corrected = RecipeView(
+            "corrected", "hash", "", RecipeCandidate(ingredients=["1 cup flour", "2 eggs"],
+                                                      instructions=["Combine in a bowl."]),
+            "Ready to review", revision=1, source_candidate=original,
+        )
+        deferred = RecipeView(
+            "deferred", "hash2", "", original, "Needs attention",
+            draft=SimpleNamespace(repair_proposal={"status": "deferred"}),
+        )
+
+        audit = extraction_quality_audit([corrected, deferred])
+
+        self.assertEqual(audit["corrected"], 1)
+        self.assertEqual(audit["deferred"], 1)
+
     def test_cold_catalog_registers_all_sources_in_one_durable_batch(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

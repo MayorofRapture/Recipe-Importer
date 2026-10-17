@@ -104,8 +104,11 @@ def _norm(value: str) -> str:
 
 
 def candidate_identity(source_hash: str, candidate: RecipeCandidate) -> str:
+    payload = candidate.model_dump(mode="json")
+    if not payload.get("notes"):
+        payload.pop("notes", None)
     fingerprint = hashlib.sha256(json.dumps(
-        candidate.model_dump(mode="json"), ensure_ascii=False,
+        payload, ensure_ascii=False,
         sort_keys=True, separators=(",", ":"),
     ).encode("utf-8")).hexdigest()
     return f"{source_hash}:{fingerprint[:24]}"
@@ -422,7 +425,12 @@ def import_mealie(recipe: RecipeCandidate, mealie_url: str, token: str) -> str:
 
 
 def _quality_issue(batch: ExtractionBatch) -> bool:
-    return not batch.recipes or any(finding.kind in {"unreadable", "cropped", "ambiguous", "not_extracted"} for candidate in batch.recipes for finding in candidate.missing_information)
+    from recipe_validation import validate_recipe
+
+    return (not batch.recipes
+            or any(finding.kind in {"unreadable", "cropped", "ambiguous", "not_extracted"}
+                   for candidate in batch.recipes for finding in candidate.missing_information)
+            or any(validate_recipe(candidate) for candidate in batch.recipes))
 
 
 def _load_cache(path: Path) -> ExtractionBatch:
