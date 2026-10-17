@@ -432,12 +432,166 @@ class ReviewInlineTabTests(unittest.TestCase):
         app.session_state[f"recipe_sections:{candidate_id}"] = "Instructions"
         app.run(timeout=10)
 
-        self.assertTrue(any(item.label == "I authorize this cloud request for this recipe" for item in app.checkbox))
-        self.assertTrue(any("scan and image are not sent" in item.value for item in app.caption))
-        request_button = next(item for item in app.button if item.label == "Suggest instructions with AI")
+        self.assertTrue(any(
+            item.label == "I authorize sending this recipe's title, ingredients, and current instructions to Google Gemini."
+            for item in app.checkbox
+        ))
+        self.assertTrue(any("no source image or PDF is sent" in item.value for item in app.caption))
+        request_button = next(item for item in app.button if item.label == "Suggest improvements with AI")
         self.assertTrue(request_button.disabled)
         store = ReviewStore(Path(fixture["output"]) / "review_events.jsonl")
         self.assertFalse(any(item.get("event") == "suggestion_request" for item in store.events))
+
+    def test_review_ui_recognizes_project_env_gemini_key_without_displaying_it(self):
+        tmp = self._temp_dir()
+        fixture = write_ui_fixture(tmp)
+        env_file = tmp / ".env"
+        env_file.write_text("GEMINI_API_KEY=review-ui-test-key\n", encoding="utf-8")
+        previous_key = os.environ.pop("GEMINI_API_KEY", None)
+
+        def restore_key():
+            if previous_key is None:
+                os.environ.pop("GEMINI_API_KEY", None)
+            else:
+                os.environ["GEMINI_API_KEY"] = previous_key
+
+        self.addCleanup(restore_key)
+        env = patch.dict(os.environ, {
+            "RECIPE_IMPORTER_OUTPUT_DIR": str(fixture["output"]),
+            "RECIPE_IMPORTER_SOURCE_DIR": str(tmp / "sources"),
+        }, clear=False)
+        env.start()
+        self.addCleanup(env.stop)
+
+        with patch("gemini_config.PROJECT_ENV_FILE", env_file):
+            app = AppTest.from_file(str(APP_PATH)).run(timeout=10)
+            app = next(item for item in app.selectbox if item.label == "Jump to recipe").set_value(
+                "Cranberry & Caramel Date Bars").run(timeout=10)
+            candidate_id = app.session_state["review_selection"]
+            app.session_state[f"recipe_sections:{candidate_id}"] = "Instructions"
+            app.run(timeout=10)
+            request_button = next(item for item in app.button
+                                  if item.label == "Suggest improvements with AI")
+            self.assertTrue(request_button.disabled)
+            consent = next(item for item in app.checkbox
+                           if item.label == "I authorize sending this recipe's title, ingredients, and current instructions to Google Gemini.")
+            consent.check().run(timeout=10)
+            request_button = next(item for item in app.button
+                                  if item.label == "Suggest improvements with AI")
+            self.assertFalse(request_button.disabled)
+
+        visible_text = " ".join(item.value for item in [*app.caption, *app.markdown, *app.warning, *app.info])
+        self.assertNotIn("review-ui-test-key", visible_text)
+
+    def test_missing_source_and_empty_instructions_keep_request_action_visible(self):
+        for instructions in ([], [""]):
+            with self.subTest(instructions=instructions):
+                tmp = self._temp_dir()
+                fixture = write_ui_fixture(tmp)
+                source_root = tmp / "sources"
+                env = patch.dict(os.environ, {
+                    "RECIPE_IMPORTER_OUTPUT_DIR": str(fixture["output"]),
+                    "RECIPE_IMPORTER_SOURCE_DIR": str(source_root),
+                    "RECIPE_IMPORTER_FIXTURE_MODE": "false",
+                    "GEMINI_API_KEY": "test-only-key",
+                }, clear=False)
+                env.start()
+                self.addCleanup(env.stop)
+
+                view = next(item for item in load_catalog(Path(fixture["output"]), source_root)
+                            if item.candidate.name == "Cranberry & Caramel Date Bars")
+                buffer = buffer_for(view)
+                buffer["name"] = "RASPBERRY CREAM CENTER"
+                buffer["structured_instructions"] = list(instructions)
+                buffer["instruction_ids"] = []
+                save_draft(view, buffer)
+                Path(fixture["source"]).unlink()
+
+                app = AppTest.from_file(str(APP_PATH)).run(timeout=10)
+                app = next(item for item in app.selectbox if item.label == "Jump to recipe").set_value(
+                    "RASPBERRY CREAM CENTER").run(timeout=10)
+                candidate_id = app.session_state["review_selection"]
+                app.session_state[f"recipe_sections:{candidate_id}"] = "Instructions"
+                app.run(timeout=10)
+
+                self.assertTrue(any(
+                    "Original scan unavailable. Gemini can suggest instructions using the recipe text" in item.value
+                    for item in app.warning
+                ))
+                self.assertTrue(next(item for item in app.button
+                                     if item.label == "Approve & next").disabled)
+                button = next(item for item in app.button
+                              if item.label == "Suggest missing instructions with AI")
+                self.assertTrue(button.disabled)
+                consent = next(item for item in app.checkbox
+                               if item.label == "I authorize sending this recipe's title, ingredients, and current instructions to Google Gemini.")
+                consent.check().run(timeout=10)
+                button = next(item for item in app.button
+                              if item.label == "Suggest missing instructions with AI")
+                self.assertFalse(button.disabled)
+
+    def test_unavailable_source_text_only_proposal_can_be_accepted_but_not_approved(self):
+        tmp = self._temp_dir()
+        fixture = write_ui_fixture(tmp)
+        output = Path(fixture["output"])
+        source_root = tmp / "sources"
+        env = patch.dict(os.environ, {
+            "RECIPE_IMPORTER_OUTPUT_DIR": str(output),
+            "RECIPE_IMPORTER_SOURCE_DIR": str(source_root),
+            "RECIPE_IMPORTER_FIXTURE_MODE": "false",
+            "GEMINI_API_KEY": "test-only-key",
+        }, clear=False)
+        env.start()
+        self.addCleanup(env.stop)
+
+        view = next(item for item in load_catalog(output, source_root)
+                    if item.candidate.name == "Fried Rice")
+        buffer = buffer_for(view)
+        buffer["name"] = "RASPBERRY CREAM CENTER"
+        buffer["structured_instructions"] = []
+        buffer["instruction_ids"] = []
+        save_draft(view, buffer)
+        Path(fixture["source"]).unlink()
+        from suggestion_service import SuggestionService
+        service = SuggestionService(output, proposer=lambda *_: [{
+            "field_path": "instructions", "proposed_value": "Simmer the rice until tender.",
+            "classification": "inferred", "rationale": "The ingredient list supports a basic cooking step.",
+            "uncertainty": "The scan is unavailable, so timing and method are not verified.",
+            "insertion_location": {"field": "instructions", "after": None},
+        }])
+        submitted = []
+
+        def submit(current_view, *, operation_id):
+            request = service.request(current_view, consent=True, operation_id=operation_id)
+            service.process(request["request_id"])
+            submitted.append(request["request_id"])
+            return request
+
+        with patch("app_pages.common.enqueue_suggestion_request", side_effect=submit), patch(
+                "app_pages.review.enqueue_suggestion_request", side_effect=submit):
+            app = AppTest.from_file(str(APP_PATH)).run(timeout=10)
+            app = next(item for item in app.selectbox if item.label == "Jump to recipe").set_value(
+                "RASPBERRY CREAM CENTER").run(timeout=10)
+            candidate_id = app.session_state["review_selection"]
+            app.session_state[f"recipe_sections:{candidate_id}"] = "Instructions"
+            app.run(timeout=10)
+            next(item for item in app.checkbox
+                 if item.label == "I authorize sending this recipe's title, ingredients, and current instructions to Google Gemini.").check().run(timeout=10)
+            request_button = next(item for item in app.button
+                                  if item.label == "Suggest missing instructions with AI")
+            self.assertFalse(request_button.disabled)
+            request_button.click().run(timeout=10)
+            self.assertFalse(app.exception)
+            self.assertEqual(service.status(submitted[0])["status"], "completed")
+            self.assertTrue(any("Simmer the rice until tender." in item.value for item in app.markdown))
+            next(item for item in app.button if item.label == "Accept inferred suggestion").click().run(timeout=10)
+
+        refreshed = next(item for item in load_catalog(output, source_root)
+                         if item.candidate_id == candidate_id)
+        self.assertEqual(refreshed.candidate.instructions, ["Simmer the rice until tender."])
+        self.assertFalse(refreshed.source_available)
+        self.assertTrue(next(item for item in app.button if item.label == "Approve & next").disabled)
+        self.assertTrue(any("Original source unavailable" in item.value for item in app.warning))
 
     def test_fresh_session_discovers_queued_request_and_disables_approval(self):
         tmp = self._temp_dir()
@@ -560,7 +714,7 @@ class ReviewInlineTabTests(unittest.TestCase):
                            if item.key == f"suggestion_consent:{candidate_id}:{view.revision}:{first_nonce}")
             consent.check().run(timeout=10)
             request_button = next(item for item in app.button
-                                  if item.label == "Suggest instructions with AI")
+                                  if item.label == "Suggest improvements with AI")
             self.assertFalse(request_button.disabled)
             request_button.click().run(timeout=10)
             second_nonce = app.session_state[nonce_key]
@@ -570,7 +724,7 @@ class ReviewInlineTabTests(unittest.TestCase):
             next_consent = next(item for item in app.checkbox
                                 if item.key == f"suggestion_consent:{candidate_id}:{view.revision}:{second_nonce}")
             next_consent.check().run(timeout=10)
-            next(item for item in app.button if item.label == "Suggest instructions with AI").click().run(timeout=10)
+            next(item for item in app.button if item.label == "Suggest improvements with AI").click().run(timeout=10)
 
         self.assertEqual(len(submitted), 2)
         self.assertNotEqual(submitted[0][0], submitted[1][0])

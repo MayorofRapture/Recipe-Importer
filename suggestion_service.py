@@ -33,13 +33,14 @@ class SuggestionService:
             raise ValueError("explicit cloud consent is required")
         if get("protected", False):
             raise ReviewConflict("protected recipes cannot request generated suggestions")
-        if not get("source_verified", False):
-            raise ReviewConflict("the original source must be verified before requesting a suggestion")
         candidate = get("candidate")
         if candidate is None:
             raise ValueError("recipe content is required")
         candidate_data = candidate.model_dump(mode="json") if hasattr(candidate, "model_dump") else dict(candidate)
         recipe = {key: candidate_data.get(key) for key in ("name", "ingredients", "instructions")}
+        if not str(recipe.get("name") or "").strip() or not any(
+                str(item or "").strip() for item in recipe.get("ingredients", []) or []):
+            raise ValueError("a recipe title and at least one ingredient are required")
         digest = str(get("content_digest", "") or _recipe_digest(recipe))
         bindings = list(get("revision_target_bindings", get("target_bindings", ())) or ())
         instruction_bindings = [item for item in bindings if item.get("field") == "instructions"]
@@ -131,7 +132,8 @@ class SuggestionService:
     def _configured_proposer(self):
         if os.environ.get("RECIPE_IMPORTER_FIXTURE_MODE", "").strip().casefold() in {"1", "true", "yes", "on"}:
             raise RuntimeError("Fixture mode disables live suggestion requests")
-        api_key = os.environ.get("GEMINI_API_KEY", "").strip()
+        from gemini_config import gemini_api_key
+        api_key = gemini_api_key()
         if not api_key:
             raise RuntimeError("GEMINI_API_KEY is not configured")
         from import_recipes import google_client, types

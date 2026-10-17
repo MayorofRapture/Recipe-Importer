@@ -75,6 +75,32 @@ class SuggestionServiceTests(unittest.TestCase):
         self.assertTrue(all(target["field"] == "instructions"
                             for target in request["instruction_targets"]))
 
+    def test_text_only_request_does_not_require_source_verification(self):
+        store, candidate_id, source_hash, revision = self.setup_recipe(self.root)
+        received = []
+        service = SuggestionService(
+            self.root, store=store,
+            proposer=lambda snapshot, kind: received.append((snapshot, kind)) or [],
+        )
+        view = {
+            "candidate_id": candidate_id, "source_hash": source_hash,
+            "extraction_id": "extract-1", "revision": revision["revision"],
+            "content_digest": revision["content_sha256"], "protected": False,
+            "source_verified": False,
+            "candidate": RecipeCandidate(name="Rice", ingredients=["1 cup rice"], instructions=[]),
+        }
+
+        request = service.request(view, consent=True, operation_id="source-unavailable-request")
+        result = service.process(request["request_id"])
+
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(
+            {key: received[0][0][key] for key in ("name", "ingredients", "instructions")},
+            {"name": "Rice", "ingredients": ["1 cup rice"], "instructions": []},
+        )
+        self.assertEqual(received[0][0]["instruction_targets"], [])
+        self.assertEqual(received[0][1], "instructions")
+
     def test_loaded_suggestion_indexes_refresh_after_append_without_reloading(self):
         store, candidate_id, source_hash, revision = self.setup_recipe(self.root)
         service = SuggestionService(

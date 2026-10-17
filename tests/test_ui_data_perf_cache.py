@@ -9,7 +9,7 @@ import ui_data
 from import_recipes import file_digest
 from recipe_quality import ExtractionBatch, RecipeCandidate
 from ui_data import _SourceIndex, _source_for, _source_for_display, load_catalog, verify_selected_source
-from ui_fixture_factory import write_ui_fixture
+from tests.ui_fixture_factory import write_ui_fixture
 
 
 class ReviewDisplayCacheTests(unittest.TestCase):

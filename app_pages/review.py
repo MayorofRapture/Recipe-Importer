@@ -1297,16 +1297,7 @@ def _rebase_dynamic_suggestion(view, suggestion, final_value: str | None, buffer
 
 
 def _render_instruction_suggestion_request(view) -> None:
-    has_instruction_proposal = any(
-        item.field_path == "instructions" or item.field_path.startswith("instructions[")
-        for item in view.candidate.suggestions
-    )
-    needs_suggestion = not view.candidate.instructions or bool(view.candidate.missing_information) or not has_instruction_proposal
-    if needs_suggestion:
-        _render_suggestion_request_controls(view, prominent=True)
-    else:
-        with st.expander("Suggest improvements to existing instructions"):
-            _render_suggestion_request_controls(view, prominent=False)
+    _render_suggestion_request_controls(view)
 
 
 def _render_suggestion_job_status(view) -> None:
@@ -1367,44 +1358,63 @@ def _render_suggestion_job_status_content(view, request: dict) -> None:
             st.caption(request["error"])
 
 
-def _render_suggestion_request_controls(view, *, prominent: bool) -> None:
+def _render_suggestion_request_controls(view) -> None:
     if view.protected:
         st.caption("AI suggestions are unavailable for protected recipes.")
         return
-    if not view.source_verified:
-        st.caption("Verify the original scan before requesting an AI suggestion.")
-        return
     from runtime_safety import fixture_mode
-    if fixture_mode():
-        st.caption("Fixture mode does not send recipe content to Gemini.")
-        return
     request = _suggestion_request_snapshot(view)
     active = bool(request and request.get("status") in {"queued", "running"})
-    api_available = bool(os.environ.get("GEMINI_API_KEY", "").strip())
-    label = "Suggest instructions with AI" if prominent else "Request improvement suggestions"
+    from gemini_config import gemini_api_key
+    api_available = bool(gemini_api_key())
+    fixture_disabled = fixture_mode()
+    identity_ready = view.identity_status == "registered"
+    enough_information = bool(view.candidate.name.strip()) and any(
+        str(item or "").strip() for item in view.candidate.ingredients
+    )
+    has_usable_instructions = any(
+        str(item or "").strip() for item in view.candidate.instructions
+    )
+    label = ("Suggest missing instructions with AI" if not has_usable_instructions
+             else "Suggest improvements with AI")
     with st.container(border=True):
         st.markdown("**AI-generated instructions are inferred and unverified.**")
-        st.caption("This sends the recipe title, ingredients, and current instructions to Google Gemini as text. The scan and image are not sent. Review the result before using it.")
+        st.caption("Suggestions will be inferred from recipe text, not transcribed from the scan. This sends only the recipe title, ingredients, and current instructions to Google Gemini as text; no source image or PDF is sent.")
+        if not view.source_available:
+            st.warning(
+                "Original scan unavailable. Gemini can suggest instructions using the recipe text, "
+                "but the suggestions will be inferred rather than transcribed. The original scan "
+                "must still be verified before final recipe approval."
+            )
         consent_nonce_key = f"suggestion_consent_nonce:{view.candidate_id}"
         st.session_state.setdefault(consent_nonce_key, uuid.uuid4().hex)
         consent_nonce = st.session_state[consent_nonce_key]
         consent_key = f"suggestion_consent:{view.candidate_id}:{view.revision}:{consent_nonce}"
         consent = st.checkbox(
-            "I authorize this cloud request for this recipe",
+            "I authorize sending this recipe's title, ingredients, and current instructions to Google Gemini.",
             key=consent_key,
-            disabled=active or not api_available,
+            disabled=active or not api_available or fixture_disabled or not identity_ready or not enough_information,
         )
         if not api_available:
             st.caption("Gemini is not configured. Add its API key before requesting suggestions.")
+        if active:
+            st.caption("Another suggestion request is already running for this recipe.")
+        if not identity_ready:
+            st.caption("Recipe identity requires reconciliation before requesting suggestions.")
+        if not enough_information:
+            st.caption("Add a recipe title and at least one ingredient before requesting suggestions.")
+        if fixture_disabled:
+            st.caption("Fixture mode disables live Gemini requests.")
         if st.button(label, key=f"request_instructions:{view.candidate_id}:{view.revision}:{consent_nonce}",
-                     disabled=active or not api_available or not consent,
-                     type="primary" if prominent else "secondary"):
+                     disabled=(active or not api_available or fixture_disabled or not identity_ready
+                               or not enough_information or not consent),
+                     type="primary"):
+            st.session_state[consent_nonce_key] = uuid.uuid4().hex
             try:
                 operation_id = f"ui-instruction-request:{view.candidate_id}:{view.revision}:{uuid.uuid4().hex}"
                 result = enqueue_suggestion_request(view, operation_id=operation_id)
                 st.session_state[f"suggestion_request:{view.candidate_id}"] = result["request_id"]
                 _invalidate_suggestion_request_snapshot(view.candidate_id)
-                st.session_state[consent_nonce_key] = uuid.uuid4().hex
                 st.rerun()
             except Exception as exc:
                 st.error(f"The suggestion request was not started. Your recipe remains unchanged. {exc}")
