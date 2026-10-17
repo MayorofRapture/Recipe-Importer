@@ -43,14 +43,16 @@ class StreamlitStructuredReviewTests(unittest.TestCase):
             recipe_selector = next(item for item in app.selectbox if item.label == "Jump to recipe")
             recipe_selector.set_value("Cranberry & Caramel Date Bars").run(timeout=10)
             visible = "\n".join(item.value for item in [*app.markdown, *app.caption, *app.text] if hasattr(item, "value"))
-            self.assertIn("Unverified proposal", visible)
-            self.assertTrue(any("Use suggestion" in button.label for button in app.button))
+            self.assertIn("AI-inferred completion", visible)
+            self.assertIn("unverified", visible.casefold())
+            self.assertTrue(any("Accept inferred suggestion" in button.label for button in app.button))
             self.assertTrue(any("Approve & next" in button.label for button in app.button))
 
             approve = next(button for button in app.button if "Approve & next" in button.label)
             self.assertTrue(approve.disabled)
-            captions = [item.value for item in app.caption if hasattr(item, "value")]
-            self.assertTrue(any("critical" in value.casefold() or "proposal" in value.casefold() for value in captions))
+            blockers = [item.value for item in app.warning if hasattr(item, "value")]
+            self.assertTrue(any("critical source issue unresolved" in value.casefold()
+                                for value in blockers), blockers)
 
 
 if __name__ == "__main__":

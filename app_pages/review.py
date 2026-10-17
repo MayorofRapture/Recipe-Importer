@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import time
 import uuid
 from pathlib import Path
 import streamlit as st
@@ -11,6 +12,8 @@ from app_pages.common import (
     CatalogReadError,
     buffer_for,
     buffer_is_dirty,
+    enqueue_suggestion_request,
+    suggestion_service,
     candidate_from_buffer,
     catalog,
     load_resume_pointer,
@@ -21,9 +24,16 @@ from app_pages.common import (
     save_draft,
     structured_widget_key,
     sync_buffer,
+    _revision_bindings,
 )
 from ui_data import render_source_page, verify_selected_source
+from review_queue_state import QueueState
 from recipe_quality import is_complete
+from suggestion_ui import (
+    approval_blockers, render_approval_blockers, render_critical_finding_resolution,
+    render_suggestion_card, render_suggestion_summary, suggestion_current_value,
+    suggestion_status_label,
+)
 from ui_diagnostics import bind_session, count, new_counters, runtime_marker
 
 
@@ -49,50 +59,76 @@ def _move_in_queue(candidates, direction: int) -> None:
 
 def _resolve_suggestion(view, suggestion, disposition: str, final_value: str | None, buffer,
                         evidence_reference: str = "") -> None:
+    generated = bool(getattr(suggestion, "generated", False))
+    if generated:
+        store = review_store()
+        proposal_id = str(getattr(suggestion, "suggestion_id", ""))
+        operation_id = f"ui-dynamic:{view.candidate_id}:{proposal_id}:{disposition}:{uuid.uuid4().hex}"
+        if disposition == "discard_stale":
+            store.discard_stale_dynamic_suggestion(
+                candidate_id=view.candidate_id, proposal_id=proposal_id,
+                operation_id=operation_id,
+            )
+        elif disposition in {"accepted", "edited"}:
+            candidate, _warnings = candidate_from_buffer(view, buffer)
+            store.apply_dynamic_suggestion(
+                candidate_id=view.candidate_id, proposal_id=proposal_id,
+                expected_parent=view.revision, recipe=candidate.model_dump(mode="json"),
+                target_bindings=_revision_bindings(view, buffer, candidate),
+                disposition=disposition, final_value=final_value,
+                operation_id=operation_id,
+            )
+        else:
+            store.resolve_dynamic_suggestion(
+                candidate_id=view.candidate_id, proposal_id=proposal_id,
+                disposition=disposition, final_value=final_value,
+                operation_id=operation_id,
+            )
+        st.session_state.review_refresh_candidate = view.candidate_id
+        return
+
     store = review_store()
     binding = next((item for item in view.target_bindings
                     if item.get("issue_id") == suggestion.suggestion_id), None)
     if binding is None:
         raise ValueError("The proposal has no unambiguous registered target.")
     saved, _ = save_draft(view, buffer)
-    revision = saved.revision
     digest = hashlib.sha256((disposition + str(final_value or "") + evidence_reference).encode("utf-8")).hexdigest()[:20]
     store.resolve_issue(
         candidate_id=view.candidate_id, source_hash=view.source_hash,
-        extraction_id=view.extraction_id, revision=revision,
+        extraction_id=view.extraction_id, revision=saved.revision,
         issue_id=suggestion.suggestion_id, target_id=binding["target_id"],
         disposition=disposition, final_value=final_value,
-        operation_id=f"ui-issue:{view.candidate_id}:{revision}:{suggestion.suggestion_id}:{digest}",
+        operation_id=f"ui-issue:{view.candidate_id}:{saved.revision}:{suggestion.suggestion_id}:{digest}",
         evidence_reference=evidence_reference,
     )
     st.session_state.review_refresh_candidate = view.candidate_id
-    if disposition in {"accepted", "edited"}:
-        for index, finding in enumerate(view.candidate.missing_information):
-            if finding.field_path != suggestion.field_path or finding.severity != "critical":
-                continue
-            finding_binding = next((item for item in view.target_bindings
-                                    if item.get("target_kind") == "finding"
-                                    and item.get("field_path_at_extraction") == finding.field_path), None)
-            if finding_binding:
-                store.resolve_issue(
-                    candidate_id=view.candidate_id, source_hash=view.source_hash,
-                    extraction_id=view.extraction_id, revision=revision,
-                    issue_id=finding_binding["issue_id"], target_id=finding_binding["target_id"],
-                    disposition="human_completion", final_value=final_value,
-                    operation_id=f"ui-finding:{view.candidate_id}:{revision}:{index}:{digest}",
-                )
-                st.session_state.review_refresh_candidate = view.candidate_id
 
 
 def _apply_proposal(view, suggestion, disposition: str, final_value: str | None, buffer) -> None:
+    generated = bool(getattr(suggestion, "generated", False))
+    evidence_reference = ""
+    if disposition == "declined" and not generated:
+        field_path = str(getattr(suggestion, "field_path", ""))
+        has_critical_finding = any(
+            finding.severity == "critical" and finding.field_path == field_path
+            for finding in view.critical_findings
+        )
+        if has_critical_finding:
+            # Keep a source-backed critical issue open until its own explicit
+            # correction or completion action is recorded.
+            disposition = "rejected"
+        else:
+            # Optional metadata can be declined with a clear, durable reason.
+            disposition = "not_recipe_content"
+            evidence_reference = "Reviewer declined this optional completion; no source content was added."
     if disposition in {"accepted", "edited"}:
         binding = next((item for item in view.target_bindings
                         if item.get("issue_id") == suggestion.suggestion_id), None)
-        if binding is None:
-            raise ValueError("The proposal has no registered target.")
-        target_id = binding.get("source_target_id")
-        target_kind = binding.get("source_target_kind")
-        field = binding.get("field")
+        target_id = (getattr(suggestion, "target_id", None) if generated else
+                     binding.get("source_target_id") if binding else None)
+        target_kind = binding.get("source_target_kind") if binding else ("row" if target_id else "field")
+        field = binding.get("field") if binding else "instructions"
         if target_kind == "row" and field in {"ingredients", "instructions"}:
             ids_key = "ingredient_ids" if field == "ingredients" else "instruction_ids"
             values_key = "structured_ingredients" if field == "ingredients" else "structured_instructions"
@@ -100,6 +136,18 @@ def _apply_proposal(view, suggestion, disposition: str, final_value: str | None,
             if not target_id or target_id not in row_ids:
                 raise ValueError("The original recipe row is no longer present; this proposal cannot be applied by position.")
             buffer[values_key][row_ids.index(target_id)] = str(final_value or "")
+            _update_raw_section(buffer, field)
+        elif generated and field == "instructions":
+            values = buffer.setdefault("structured_instructions", [])
+            ids = buffer.setdefault("instruction_ids", [])
+            location = getattr(suggestion, "insertion_location", {}) or {}
+            index = location.get("index")
+            if index is None:
+                index = len(values)
+            if not isinstance(index, int) or index < 0 or index > len(values):
+                raise ValueError("The requested instruction location is no longer available.")
+            values.insert(index, str(final_value or ""))
+            ids.insert(index, str(uuid.uuid4()))
             _update_raw_section(buffer, field)
         elif target_kind == "field" and field in {"ingredients", "instructions"}:
             from quick_edit import parse_ingredients, parse_instructions
@@ -111,23 +159,31 @@ def _apply_proposal(view, suggestion, disposition: str, final_value: str | None,
             _update_raw_section(buffer, field)
         else:
             raise ValueError("The proposal has no exact ingredient or instruction target.")
-    _resolve_suggestion(view, suggestion, disposition, final_value, buffer)
+    _resolve_suggestion(view, suggestion, disposition, final_value, buffer,
+                        evidence_reference=evidence_reference)
 
 
-def _resolve_finding(view, buffer, finding, index: int) -> None:
+def _resolve_finding(view, buffer, finding, index: int, disposition: str = "source_corrected",
+                     evidence_reference: str = "") -> None:
     binding = next((item for item in view.target_bindings
                     if item.get("target_kind") == "finding"
                     and item.get("field_path_at_extraction") == finding.field_path), None)
     if binding is None:
         raise ValueError("The source issue has no unambiguous registered target.")
+    if disposition == "deferred":
+        st.session_state.review_save_state = "Review remains open. The source issue has not been cleared."
+        return
     saved, _ = save_draft(view, buffer)
+    current_candidate, _warnings = candidate_from_buffer(view, buffer)
     review_store().resolve_issue(
         candidate_id=view.candidate_id, source_hash=view.source_hash,
         extraction_id=view.extraction_id, revision=saved.revision,
         issue_id=binding["issue_id"], target_id=binding["target_id"],
-        disposition="source_corrected", final_value=None,
-        operation_id=f"ui-finding:{view.candidate_id}:{saved.revision}:{index}:source-corrected",
-        evidence_reference="Operator confirmed and corrected the field against the source scan.",
+        disposition=disposition,
+        final_value=(_current_value_for_path(current_candidate, finding.field_path)
+                     if disposition == "human_completion" else None),
+        operation_id=f"ui-finding:{view.candidate_id}:{saved.revision}:{index}:{disposition}",
+        evidence_reference=evidence_reference,
     )
     st.session_state.review_refresh_candidate = view.candidate_id
 
@@ -153,22 +209,68 @@ def _apply_pending_refresh() -> None:
 
 
 def _approval_block_reason(view, buffer) -> str | None:
-    if view.protected:
-        return "Approval is unavailable while this recipe needs Mealie reconciliation."
-    if view.identity_status != "registered":
-        return "This recipe cannot be approved until its identity is reconciled with the source."
-    if not view.source_available:
-        return "Relink the original scan and verify it matches this extraction before approving."
-    if view.legacy_draft_conflict:
-        return "A newer legacy draft exists. Save the current review revision and approve it again."
     candidate, _ = candidate_from_buffer(view, buffer)
-    if not is_complete(candidate):
-        return "Add a recipe name, at least one ingredient, and at least one instruction before approving."
-    if any(item.severity == "critical" for item in candidate.missing_information):
-        return "Resolve the critical source warning before approving this recipe."
-    if any(item.review_status == "pending" for item in candidate.suggestions):
-        return "Resolve each unverified proposal before approving this recipe."
-    return None
+    blockers = _approval_blockers(view, candidate)
+    return blockers[0].label if blockers else None
+
+
+def _approval_blockers(view, candidate=None):
+    request = _suggestion_request_snapshot(view)
+    return approval_blockers(
+        view, candidate, suggestion_request_status=request.get("status") if request else None)
+
+
+def _suggestion_request_snapshot(view):
+    """Seed from catalog state and poll durable storage only for active work."""
+    candidate_id = view.candidate_id
+    key = f"suggestion_request_snapshot:{candidate_id}"
+    cached = st.session_state.get(key)
+    identity = (view.source_hash, view.extraction_id)
+    now = time.monotonic()
+    catalog_request = view.latest_suggestion_request
+    if cached and cached.get("identity") == identity:
+        request = cached.get("request")
+        if catalog_request and (not request or
+                                catalog_request.get("request_id") != request.get("request_id")):
+            request = catalog_request
+            cached = {"identity": identity, "checked_at": now, "request": request}
+            st.session_state[key] = cached
+        status = request.get("status") if request else None
+        if status not in {"queued", "running"}:
+            return request
+        if now - cached.get("checked_at", 0.0) < 2.0:
+            return request
+        request = suggestion_service().status(request["request_id"])
+    else:
+        request = catalog_request
+    st.session_state[key] = {"identity": identity, "checked_at": now, "request": request}
+    return request
+
+
+def _invalidate_suggestion_request_snapshot(candidate_id: str) -> None:
+    st.session_state.pop(f"suggestion_request_snapshot:{candidate_id}", None)
+
+
+def _jump_to_blocker(anchor: str, candidate_id: str) -> None:
+    st.session_state.review_jump_to = anchor
+    st.session_state.review_show_issues = True
+    if anchor in {"suggestions", "suggestion-request"}:
+        # Tabs register their session-state key when the editor fragment is
+        # rendered. Defer changing it until the next app run, before that
+        # fragment creates the widget.
+        st.session_state[f"review_pending_section:{candidate_id}"] = "Instructions"
+    st.rerun()
+
+
+def _queue_state() -> QueueState:
+    from app_pages.common import paths
+    output, _ = paths()
+    return QueueState(output)
+
+
+def _navigation_context() -> dict:
+    return {key: st.session_state.get(key) for key in (
+        "review_queue", "review_search", "review_source", "review_status", "review_page")}
 
 
 def _advance_queue(direction: int) -> None:
@@ -197,18 +299,59 @@ def _advance_queue(direction: int) -> None:
 
 def _queue_advance_callback(direction: int) -> None:
     """Let the ensuing page run load one catalog and flush before changing selection."""
-    st.session_state.review_pending_advance = direction
+    st.session_state.review_pending_advance = {"direction": direction, "skip": direction > 0}
+
+
+def _back_callback() -> None:
+    current = st.session_state.get("review_selection", st.session_state.get("review_active_selection"))
+    st.session_state.review_pending_return = _queue_state().back(current, record=True)
+
+
+def _open_skipped_callback() -> None:
+    st.session_state.review_show_skipped = True
+
+
+def _return_from_skipped(candidate_id: str, context: dict) -> None:
+    st.session_state.review_show_skipped = False
+    st.session_state.review_pending_return = {"candidate_id": candidate_id, "context": context}
+
+
+def _render_skipped_list() -> None:
+    st.title("Skipped recipes")
+    st.caption("Skipped recipes remain here until you decide what to do with them.")
+    st.button("Back to review", key="close_skipped", on_click=lambda: st.session_state.update(review_show_skipped=False))
+    for index, item in enumerate(reversed(_queue_state().skipped())):
+        st.button(f"Return to {item['title']}", key=f"return_skipped:{index}:{item['candidate_id']}",
+                  on_click=_return_from_skipped, args=(item["candidate_id"], item.get("context", {})))
 
 
 def _apply_pending_advance(views) -> None:
-    direction = st.session_state.pop("review_pending_advance", None)
-    if direction is None:
+    return_event = st.session_state.pop("review_pending_return", None)
+    pending = st.session_state.pop("review_pending_advance", None)
+    if pending is None and return_event is None:
         return
+    if pending is None:
+        pending = {"direction": 0, "return": return_event}
+    direction = pending["direction"] if isinstance(pending, dict) else pending
     current_id = st.session_state.get("review_active_selection", st.session_state.get("review_selection"))
     if current_id and not _flush_candidate(current_id, views):
         st.session_state.review_selection = current_id
+        if isinstance(pending, dict) and pending.get("return"):
+            st.session_state.review_pending_return = pending["return"]
         return
-    ids = st.session_state.get("review_queue_ids", [])
+    if isinstance(pending, dict) and pending.get("return"):
+        event = pending["return"]
+        for key, value in event.get("context", {}).items():
+            if value is not None:
+                st.session_state[key] = value
+        _route_return_target(views, event["candidate_id"])
+        st.session_state.review_selection = event["candidate_id"]
+        return
+    if pending.get("skip") if isinstance(pending, dict) else False:
+        current_view = next((item for item in views if item.candidate_id == current_id), None)
+        if current_view:
+            _queue_state().record_skip(current_id, current_view.candidate.name, _navigation_context())
+    ids = st.session_state.get("review_all_queue_ids", st.session_state.get("review_queue_ids", []))
     current = st.session_state.get("review_selection")
     if not ids:
         st.session_state.review_selection = None
@@ -218,7 +361,32 @@ def _apply_pending_advance(views) -> None:
     else:
         index = ids.index(current) if current in ids else 0
         target = index + direction
-        st.session_state.review_selection = None if direction > 0 and target >= len(ids) else ids[max(0, min(len(ids) - 1, target))]
+        st.session_state.review_selection = None if target < 0 or target >= len(ids) else ids[target]
+        if st.session_state.review_selection:
+            target_index = ids.index(st.session_state.review_selection)
+            st.session_state.review_page = target_index // 25 + 1
+
+
+def _route_return_target(views, candidate_id: str) -> None:
+    """Keep explicit Back/skipped targets visible even if their old filters changed."""
+    queue_page = _queue_page(views)
+    all_ids = queue_page["all_ids"]
+    if candidate_id not in all_ids:
+        st.session_state.review_queue = "All recipes"
+        st.session_state.review_search = ""
+        st.session_state.review_source = "All source files"
+        st.session_state.review_status = "Any status"
+        st.session_state.review_filter_restore_notice = (
+            "Showing the requested recipe outside the saved queue filters."
+        )
+        queue_page = _queue_page(views)
+        all_ids = queue_page["all_ids"]
+    st.session_state.review_filter_snapshot = {
+        key: st.session_state.get(key) for key in (
+            "review_queue", "review_search", "review_source", "review_status")
+    }
+    if candidate_id in all_ids:
+        st.session_state.review_page = all_ids.index(candidate_id) // 25 + 1
 
 
 def _apply_pending_queue_change(views) -> None:
@@ -261,8 +429,9 @@ def _approve(view, buffer) -> None:
     if any(item.severity == "critical" for item in candidate.missing_information):
         st.error("Resolve the critical source warning before approving this recipe.")
         return
-    if any(item.review_status == "pending" for item in candidate.suggestions):
-        st.error("Resolve each unverified proposal before approving this recipe.")
+    if any((getattr(item, "dynamic_status", None) or item.review_status)
+           in {"pending", "stale", "target_missing", "rejected"} for item in candidate.suggestions):
+        st.error("Resolve each unverified proposal or source issue before approving this recipe.")
         return
     saved = None
     try:
@@ -343,6 +512,9 @@ def main() -> None:
     bind_session(diagnostics)
     count("full_page_executions")
     _apply_pending_refresh()
+    if st.session_state.get("review_show_skipped"):
+        _render_skipped_list()
+        return
     try:
         views = catalog()
     except CatalogReadError as exc:
@@ -382,17 +554,29 @@ def main() -> None:
     st.session_state.setdefault("review_selection", views[0].candidate_id)
     if st.session_state.get("review_transition_error"):
         st.error(st.session_state.pop("review_transition_error"))
+    if st.session_state.get("review_filter_restore_notice"):
+        st.info(st.session_state.pop("review_filter_restore_notice"))
     queue_page = _queue_page(views)
     candidates = queue_page["candidates"]
     if not candidates:
         _render_queue(views, queue_page)
         st.info("No recipes match these filters. Open Review queue to adjust them.")
+        controls = st.columns([1, 1.8], vertical_alignment="center")
+        controls[0].button("Back", key="empty_queue_back", on_click=_back_callback,
+                            disabled=_queue_state().back(st.session_state.get("review_selection")) is None,
+                            width="stretch")
+        controls[1].button(f"Skipped recipes ({len(_queue_state().skipped())})", key="empty_queue_skipped",
+                           on_click=_open_skipped_callback, width="stretch")
         return
     if "review_selection" in st.session_state and st.session_state.review_selection is None:
         _render_queue(views, queue_page)
         st.success("You’ve reached the end of this queue.")
-        st.button("Previous recipe", key="queue_end_previous",
-                  on_click=_queue_advance_callback, args=(-1,))
+        cols = st.columns([1, 1.8], vertical_alignment="center")
+        cols[0].button("Back", key="queue_end_back", on_click=_back_callback,
+                       disabled=_queue_state().back(st.session_state.get("review_selection")) is None,
+                       width="stretch")
+        cols[1].button(f"Skipped recipes ({len(_queue_state().skipped())})", key="queue_end_skipped",
+                       on_click=_open_skipped_callback, width="stretch")
         return
     selected_id = st.session_state.get("review_selection")
     ids = [view.candidate_id for view in candidates]
@@ -400,14 +584,23 @@ def main() -> None:
         selected_id = ids[0]
         st.session_state.review_selection = selected_id
     st.session_state.review_queue_ids = ids
+    st.session_state.review_all_queue_ids = queue_page["all_ids"]
     view = verify_selected_source(next(v for v in candidates if v.candidate_id == selected_id))
+    pending_section_key = f"review_pending_section:{selected_id}"
+    pending_section = st.session_state.pop(pending_section_key, None)
+    if pending_section:
+        st.session_state[f"recipe_sections:{selected_id}"] = pending_section
     buffer = buffer_for(view)
     sync_buffer(view, buffer)
     st.session_state.review_active_selection = selected_id
     save_resume_pointer(view, buffer)
-    position = ids.index(selected_id) + 1
+    _queue_state().record_visit(selected_id, view.candidate.name, _navigation_context())
+    all_ids = queue_page["all_ids"]
+    position = all_ids.index(selected_id) + 1
     st.title("Review")
-    st.caption(f"{view.status} · {position} of {len(ids)}")
+    st.caption(f"{view.status} · {position} of {len(all_ids)}")
+    _render_navigation(view)
+    _render_suggestion_job_status(view)
     _render_queue(views, queue_page)
     if view.protected:
         st.warning("Read-only until this recipe’s Mealie outcome is reconciled.")
@@ -706,11 +899,12 @@ def _queue_page(views):
     status = st.session_state.get("review_status", "Any status")
     if status != "Any status":
         candidates = [v for v in candidates if v.status == status]
+    all_candidates = candidates
     pages = max(1, (len(candidates) + 24) // 25)
     page = min(max(1, int(st.session_state.get("review_page", 1))), pages)
     st.session_state.review_page = page
     start, end = (page - 1) * 25, min(page * 25, len(candidates))
-    return {"candidates": candidates[start:end], "total": len(candidates),
+    return {"candidates": candidates[start:end], "all_ids": [v.candidate_id for v in all_candidates], "total": len(candidates),
             "pages": pages, "page": page, "start": start, "end": end}
 
 
@@ -848,12 +1042,17 @@ def _render_editor(view, buffer) -> None:
             _save(view, buffer, advance=False)
         if buffer_is_dirty(view, buffer):
             st.caption("Unsaved changes · use Save draft to keep these edits.")
-        approval_reason = _approval_block_reason(view, buffer)
-        if st.button("Approve & next", key=f"approve:{view.candidate_id}", disabled=bool(approval_reason),
+        render_suggestion_summary(st, view.candidate.suggestions)
+        candidate, _ = candidate_from_buffer(view, buffer)
+        blockers = _approval_blockers(view, candidate)
+        if blockers:
+            render_approval_blockers(
+                st, blockers,
+                on_jump=lambda anchor: _jump_to_blocker(anchor, view.candidate_id),
+            )
+        if st.button("Approve & next", key=f"approve:{view.candidate_id}", disabled=bool(blockers),
                      type="primary", width="stretch"):
             _approve(view, buffer)
-        if approval_reason:
-            st.caption(approval_reason)
 
 
 def _remember_recipe_section(candidate_id: str) -> None:
@@ -909,21 +1108,24 @@ def _queue_choice_changed() -> None:
 
 
 def _render_actions(view, buffer) -> str:
-    cols = st.columns([1, 1], vertical_alignment="center")
-    with cols[0]:
-        with st.popover("Options"):
-            workspace_view = st.radio("Workspace view", ["Side by side", "Source", "Recipe"],
-                                      key="review_workspace_view")
-            st.button("Previous recipe", key=f"previous:{view.candidate_id}",
-                      disabled=view.protected, width="stretch",
-                      on_click=_queue_advance_callback, args=(-1,))
-    with cols[1]:
-        st.button("Skip for now", key=f"skip:{view.candidate_id}", disabled=view.protected,
-                  width="stretch", on_click=_queue_advance_callback, args=(1,))
+    with st.popover("Options"):
+        workspace_view = st.radio("Workspace view", ["Side by side", "Source", "Recipe"],
+                                  key="review_workspace_view")
     state = st.session_state.get("review_save_state")
     if state:
         st.caption(state)
     return workspace_view
+
+
+def _render_navigation(view) -> None:
+    skipped_count = len(_queue_state().skipped())
+    cols = st.columns([1, 1.4, 1.8], vertical_alignment="center")
+    cols[0].button("Back", key="review_back", on_click=_back_callback,
+                   disabled=_queue_state().back(view.candidate_id) is None, width="stretch")
+    cols[1].button("Skip for now", key=f"header_skip:{view.candidate_id}",
+                   on_click=_queue_advance_callback, args=(1,), width="stretch")
+    cols[2].button(f"Skipped recipes ({skipped_count})", key="open_skipped",
+                   on_click=_open_skipped_callback, width="stretch")
 
 
 def _render_structured_section(view, buffer, field: str) -> None:
@@ -931,6 +1133,8 @@ def _render_structured_section(view, buffer, field: str) -> None:
               "instructions": ("Instructions", "step", "instruction_ids", "structured_instructions", "structured_s")}
     label, kind, ids_key, value_key, widget_prefix = labels[field]
     st.markdown(f"**{label}**")
+    if field == "instructions":
+        _render_instruction_suggestion_request(view)
     _render_suggestions(view, buffer, field)
     for index, value in enumerate(list(buffer[value_key])):
         row_id = buffer[ids_key][index]
@@ -1005,62 +1209,215 @@ def _mutate_row(view, buffer, values_key: str, ids_key: str, index: int, action:
 
 
 def _render_suggestions(view, buffer, field: str, row_id: str | None = None) -> None:
-    for suggestion in view.pending_suggestions:
+    for suggestion in view.candidate.suggestions:
         path = suggestion.field_path
         if path != field and not path.startswith(field + "["):
             continue
-        binding = next((item for item in view.target_bindings
+        current_bindings = (view.revision_target_bindings or view.target_bindings)
+        binding = next((item for item in current_bindings
                         if item.get("issue_id") == suggestion.suggestion_id), None)
-        target_id = binding.get("source_target_id") if binding else None
-        target_kind = binding.get("source_target_kind") if binding else None
+        target_id = getattr(suggestion, "target_id", None) or (binding.get("source_target_id") if binding else None)
+        target_kind = binding.get("source_target_kind") if binding else ("row" if target_id else "field")
         row_ids = buffer.get("ingredient_ids" if field == "ingredients" else "instruction_ids", [])
-        exact_row = (target_kind == "row" and target_id in row_ids)
-        whole_field = path == field and target_kind == "field" and bool(target_id)
+        exact_row = target_kind == "row" and target_id in row_ids
+        whole_field = path == field and target_kind == "field"
         if row_id is not None:
             if not exact_row or target_id != row_id:
                 continue
         elif exact_row:
             continue
-        can_apply = exact_row or whole_field
+        can_apply = exact_row or whole_field or bool(getattr(suggestion, "generated", False))
+        current = suggestion_current_value(suggestion, view.candidate, current_bindings)
         with st.container(border=True):
-            st.markdown(f"**Unverified proposal · {path}**")
-            if not can_apply:
-                st.caption("No exact original row is available. Review the scan; this proposal cannot be applied by position.")
-            st.write(suggestion.proposed_value)
-            st.caption(f"Why: {suggestion.rationale} · Uncertainty: {suggestion.uncertainty or 'Not stated'} · Confidence: {suggestion.confidence}")
-            editing_key = f"suggestion_editing:{view.candidate_id}:{suggestion.suggestion_id}"
-            if st.session_state.get(editing_key):
-                value_key = f"suggestion_edit:{view.candidate_id}:{suggestion.suggestion_id}"
-                st.session_state.setdefault(
-                    value_key,
-                    buffer.get("_suggestion_edits", {}).get(suggestion.suggestion_id, suggestion.proposed_value),
-                )
-                edited = st.text_area("Edit suggestion", key=value_key, height=88)
-                actions = st.columns(2)
-                if actions[0].button("Use edited version", key=f"edit_s:{view.candidate_id}:{suggestion.suggestion_id}",
-                                     disabled=not can_apply or not edited.strip()):
-                    _run_issue_action(lambda: _apply_proposal(view, suggestion, "edited", edited, buffer))
-                if actions[1].button("Cancel edit", key=f"cancel_edit_s:{view.candidate_id}:{suggestion.suggestion_id}"):
-                    st.session_state.pop(editing_key, None)
-                    st.session_state.pop(value_key, None)
-                    st.rerun()
+            status = getattr(suggestion, "dynamic_status", None) or getattr(suggestion, "review_status", "pending")
+            if not can_apply and status == "pending":
+                st.caption("The original target is unavailable. Review this proposal in Issues; it cannot be applied by position.")
+                continue
+            action = render_suggestion_card(
+                st, suggestion, current_value=current,
+                key_prefix=f"inline:{view.candidate_id}:{field}:{row_id or 'section'}",
+                can_apply=can_apply, can_rebase=not buffer_is_dirty(view, buffer),
+                critical_finding=any(
+                    finding.severity == "critical" and finding.field_path == path
+                    for finding in view.critical_findings
+                ), buffer=buffer,
+            )
+        if action is not None:
+            disposition = action.disposition
+            if getattr(suggestion, "generated", False) and disposition == "rejected":
+                disposition = "declined"
+            if disposition == "rebased":
+                _run_issue_action(lambda: _rebase_dynamic_suggestion(
+                    view, suggestion, action.final_value, buffer))
             else:
-                actions = st.columns(3)
-                if actions[0].button("Use suggestion", key=f"approve_s:{view.candidate_id}:{suggestion.suggestion_id}",
-                                     disabled=not can_apply):
-                    _run_issue_action(lambda: _apply_proposal(view, suggestion, "accepted", suggestion.proposed_value, buffer))
-                if actions[1].button("Edit suggestion", key=f"start_edit_s:{view.candidate_id}:{suggestion.suggestion_id}"):
-                    st.session_state[editing_key] = True
-                    st.session_state[f"suggestion_edit:{view.candidate_id}:{suggestion.suggestion_id}"] = suggestion.proposed_value
-                    buffer.setdefault("_suggestion_edits", {})[suggestion.suggestion_id] = suggestion.proposed_value
-                    st.rerun()
-                if actions[2].button("Reject", key=f"reject_s:{view.candidate_id}:{suggestion.suggestion_id}"):
-                    _run_issue_action(lambda: _apply_proposal(view, suggestion, "rejected", None, buffer))
+                _run_issue_action(lambda: _apply_proposal(view, suggestion, disposition, action.final_value, buffer))
+
+
+def _rebase_dynamic_suggestion(view, suggestion, final_value: str | None, buffer) -> None:
+    if not getattr(suggestion, "generated", False):
+        raise ValueError("Only a generated suggestion can be compared to a newer recipe revision.")
+    if buffer_is_dirty(view, buffer):
+        raise ValueError("Save the current recipe edits before comparing this suggestion.")
+    target_id = str(getattr(suggestion, "target_id", "") or "")
+    insertion_location = None
+    if target_id:
+        target = next((item for item in view.revision_target_bindings
+                       if item.get("target_id") == target_id
+                       and item.get("field") == "instructions"
+                       and isinstance(item.get("position"), int)), None)
+        if target is None:
+            raise ValueError("The original instruction step is no longer available; discard this suggestion instead.")
+        position = int(target["position"])
+        values = buffer.setdefault("structured_instructions", [])
+        ids = buffer.setdefault("instruction_ids", [])
+        if position >= len(values) or position >= len(ids) or ids[position] != target_id:
+            raise ValueError("The instruction step moved or disappeared; compare it again before applying.")
+        values[position] = str(final_value or "")
+    else:
+        values = buffer.setdefault("structured_instructions", [])
+        ids = buffer.setdefault("instruction_ids", [])
+        insertion_location = {"field": "instructions", "index": len(values)}
+        values.append(str(final_value or ""))
+        ids.append(str(uuid.uuid4()))
+    _update_raw_section(buffer, "instructions")
+    candidate, _warnings = candidate_from_buffer(view, buffer)
+    review_store().rebase_and_apply_dynamic_suggestion(
+        candidate_id=view.candidate_id,
+        proposal_id=str(getattr(suggestion, "suggestion_id", "")),
+        expected_parent=view.revision,
+        expected_content_digest=view.content_digest,
+        recipe=candidate.model_dump(mode="json"),
+        target_bindings=_revision_bindings(view, buffer, candidate),
+        disposition="accepted", final_value=str(final_value or ""),
+        source_path=view.source_path, confirmed=True,
+        insertion_location=insertion_location,
+        operation_id=f"ui-dynamic-rebase:{view.candidate_id}:{getattr(suggestion, 'suggestion_id', '')}:{uuid.uuid4().hex}",
+    )
+    st.session_state.review_refresh_candidate = view.candidate_id
+
+
+def _render_instruction_suggestion_request(view) -> None:
+    has_instruction_proposal = any(
+        item.field_path == "instructions" or item.field_path.startswith("instructions[")
+        for item in view.candidate.suggestions
+    )
+    needs_suggestion = not view.candidate.instructions or bool(view.candidate.missing_information) or not has_instruction_proposal
+    if needs_suggestion:
+        _render_suggestion_request_controls(view, prominent=True)
+    else:
+        with st.expander("Suggest improvements to existing instructions"):
+            _render_suggestion_request_controls(view, prominent=False)
+
+
+def _render_suggestion_job_status(view) -> None:
+    request = _suggestion_request_snapshot(view)
+    if not request:
+        return
+    if request.get("status") in {"queued", "running"}:
+        _poll_suggestion_job_status(view)
+        return
+    _render_suggestion_job_status_content(view, request)
+
+
+@st.fragment(run_every="2s")
+def _poll_suggestion_job_status(view) -> None:
+    request = _suggestion_request_snapshot(view)
+    if not request or request.get("status") not in {"queued", "running"}:
+        # Drop the periodic fragment as soon as the durable worker is terminal.
+        st.rerun(scope="app")
+        return
+    _render_suggestion_job_status_content(view, request)
+
+
+def _render_suggestion_job_status_content(view, request: dict) -> None:
+    candidate_id = view.candidate_id
+    request_id = request["request_id"]
+    status = request.get("status", "queued")
+    labels = {"queued": "AI suggestion request is waiting to start.",
+              "running": "AI is preparing unverified suggestions. You can continue editing.",
+              "completed": "AI suggestions are ready for review.",
+              "failed": "The suggestion request failed. Your recipe is unchanged.",
+              "quota_blocked": "Gemini quota is unavailable. Your recipe is unchanged.",
+              "interrupted": "The request stopped before completion. Start a new request when ready.",
+              "cancelled": "The suggestion request was cancelled.",
+              "stale": "The recipe changed while suggestions were generated; compare before using them."}
+    if status in {"queued", "running"}:
+        st.info(labels.get(status, "AI suggestion request is in progress."))
+        actions = st.columns(2)
+        if status == "queued" and actions[0].button(
+                "Resume queued request", key=f"resume_suggestion:{request_id}"):
+            try:
+                suggestion_service().resume(request_id)
+                _invalidate_suggestion_request_snapshot(candidate_id)
+                st.rerun(scope="app")
+            except Exception as exc:
+                st.error(f"The queued request could not be resumed. {exc}")
+        if actions[1].button("Cancel request", key=f"cancel_suggestion:{request_id}"):
+            try:
+                suggestion_service().cancel(request_id)
+                _invalidate_suggestion_request_snapshot(candidate_id)
+                st.rerun(scope="app")
+            except Exception as exc:
+                st.error(f"The request could not be cancelled. {exc}")
+    elif status == "completed":
+        st.success(labels[status])
+    elif status in {"failed", "quota_blocked", "interrupted", "cancelled", "stale"}:
+        st.warning(labels.get(status, "The suggestion request did not complete."))
+        if request.get("error"):
+            st.caption(request["error"])
+
+
+def _render_suggestion_request_controls(view, *, prominent: bool) -> None:
+    if view.protected:
+        st.caption("AI suggestions are unavailable for protected recipes.")
+        return
+    if not view.source_verified:
+        st.caption("Verify the original scan before requesting an AI suggestion.")
+        return
+    from runtime_safety import fixture_mode
+    if fixture_mode():
+        st.caption("Fixture mode does not send recipe content to Gemini.")
+        return
+    request = _suggestion_request_snapshot(view)
+    active = bool(request and request.get("status") in {"queued", "running"})
+    api_available = bool(os.environ.get("GEMINI_API_KEY", "").strip())
+    label = "Suggest instructions with AI" if prominent else "Request improvement suggestions"
+    with st.container(border=True):
+        st.markdown("**AI-generated instructions are inferred and unverified.**")
+        st.caption("This sends the recipe title, ingredients, and current instructions to Google Gemini as text. The scan and image are not sent. Review the result before using it.")
+        consent_nonce_key = f"suggestion_consent_nonce:{view.candidate_id}"
+        st.session_state.setdefault(consent_nonce_key, uuid.uuid4().hex)
+        consent_nonce = st.session_state[consent_nonce_key]
+        consent_key = f"suggestion_consent:{view.candidate_id}:{view.revision}:{consent_nonce}"
+        consent = st.checkbox(
+            "I authorize this cloud request for this recipe",
+            key=consent_key,
+            disabled=active or not api_available,
+        )
+        if not api_available:
+            st.caption("Gemini is not configured. Add its API key before requesting suggestions.")
+        if st.button(label, key=f"request_instructions:{view.candidate_id}:{view.revision}:{consent_nonce}",
+                     disabled=active or not api_available or not consent,
+                     type="primary" if prominent else "secondary"):
+            try:
+                operation_id = f"ui-instruction-request:{view.candidate_id}:{view.revision}:{uuid.uuid4().hex}"
+                result = enqueue_suggestion_request(view, operation_id=operation_id)
+                st.session_state[f"suggestion_request:{view.candidate_id}"] = result["request_id"]
+                _invalidate_suggestion_request_snapshot(view.candidate_id)
+                st.session_state[consent_nonce_key] = uuid.uuid4().hex
+                st.rerun()
+            except Exception as exc:
+                st.error(f"The suggestion request was not started. Your recipe remains unchanged. {exc}")
 
 
 def _render_findings(view, buffer) -> None:
-    issue_count = len(view.critical_findings) + len(view.pending_suggestions)
-    with st.expander(f"Issues and source notes · {issue_count} unresolved", expanded=issue_count > 0):
+    active_statuses = {"pending", "stale", "target_missing", "rejected"}
+    unresolved_suggestions = [item for item in view.candidate.suggestions
+                              if (getattr(item, "dynamic_status", None)
+                                  or getattr(item, "review_status", "pending")) in active_statuses]
+    issue_count = len(view.critical_findings) + len(unresolved_suggestions)
+    with st.expander(f"Issues and source notes ? {issue_count} unresolved",
+                     expanded=bool(st.session_state.pop("review_show_issues", False)) or issue_count > 0):
         if view.warnings:
             st.markdown("**Source and OCR notes**")
             for warning in view.warnings:
@@ -1071,57 +1428,86 @@ def _render_findings(view, buffer) -> None:
                 if finding.source_evidence:
                     st.caption(f"Source evidence: {finding.source_evidence}")
                 st.caption(f"Next: {finding.suggested_action}")
-                if st.button("I corrected this from the source", key=f"resolve_finding:{view.candidate_id}:{index}"):
-                    _run_issue_action(lambda: _resolve_finding(view, buffer, finding, index))
-        for suggestion in view.pending_suggestions:
-            if suggestion.field_path in {"ingredients", "instructions"} or suggestion.field_path.startswith(("ingredients[", "instructions[")):
-                continue
+                resolution = render_critical_finding_resolution(
+                    st, finding, key_prefix=f"{view.candidate_id}:{index}:{finding.field_path}")
+                if resolution and resolution != "deferred":
+                    evidence = ("Operator verified the field against the original source scan."
+                                if resolution == "source_corrected"
+                                else "Operator explicitly accepted the current wording as inferred recipe content.")
+                    _run_issue_action(lambda: _resolve_finding(
+                        view, buffer, finding, index, resolution, evidence))
+        for suggestion in view.candidate.suggestions:
+            status = getattr(suggestion, "dynamic_status", None) or getattr(suggestion, "review_status", "pending")
+            path = suggestion.field_path
+            current_bindings = (view.revision_target_bindings or view.target_bindings)
+            binding = next((item for item in view.target_bindings
+                            if item.get("issue_id") == suggestion.suggestion_id), None)
+            target_id = getattr(suggestion, "target_id", None)
+            mapped = bool(getattr(suggestion, "generated", False) or
+                          (binding and (binding.get("source_target_id") or binding.get("target_id"))) or
+                          (target_id and any(item.get("target_id") == target_id
+                                             for item in current_bindings)))
+            current = suggestion_current_value(suggestion, view.candidate, current_bindings)
+            if path in {"ingredients", "instructions"} or path.startswith(("ingredients[", "instructions[")):
+                if status not in active_statuses:
+                    continue
+                if status in {"pending", "stale"} and mapped:
+                    # The mapped proposal and its decisions are shown inline by the field editor.
+                    continue
             with st.container(border=True):
-                st.markdown(f"**Unverified proposal · {suggestion.field_path}**")
+                st.markdown(f"**{path} ? {suggestion_status_label(status)}**")
+                st.caption("Source-supported proposal" if getattr(suggestion, "classification", "inferred") == "source_supported"
+                           else "AI-inferred completion ? unverified")
+                if current:
+                    st.markdown("**Current recipe wording**")
+                    st.write(current)
+                st.markdown("**Proposed wording**")
                 st.write(suggestion.proposed_value)
-                st.caption(f"Why: {suggestion.rationale} · Uncertainty: {suggestion.uncertainty or 'Not stated'} · Confidence: {suggestion.confidence}")
-                editing_key = f"editing_scalar_suggestion:{view.candidate_id}:{suggestion.suggestion_id}"
-                value_key = f"suggestion:{view.candidate_id}:{suggestion.suggestion_id}"
-                if st.session_state.get(editing_key):
-                    st.session_state.setdefault(value_key, suggestion.proposed_value)
-                    edited = st.text_area("Edit suggestion", key=value_key, height=88)
-                    actions = st.columns(3)
-                    if actions[0].button("Use suggestion", key=f"approve_s:{view.candidate_id}:{suggestion.suggestion_id}"):
-                        _run_issue_action(lambda: _resolve_suggestion(view, suggestion, "accepted", suggestion.proposed_value, buffer))
-                    if actions[1].button("Use edited version", key=f"edit_s:{view.candidate_id}:{suggestion.suggestion_id}",
-                                         disabled=not edited.strip()):
-                        _run_issue_action(lambda: _resolve_suggestion(view, suggestion, "edited", edited, buffer))
-                    if actions[2].button("Reject", key=f"reject_s:{view.candidate_id}:{suggestion.suggestion_id}"):
-                        _run_issue_action(lambda: _resolve_suggestion(view, suggestion, "rejected", None, buffer))
-                else:
-                    actions = st.columns(3)
-                    if actions[0].button("Use suggestion", key=f"approve_s:{view.candidate_id}:{suggestion.suggestion_id}"):
-                        _run_issue_action(lambda: _resolve_suggestion(view, suggestion, "accepted", suggestion.proposed_value, buffer))
-                    if actions[1].button("Edit suggestion", key=f"start_edit_s:{view.candidate_id}:{suggestion.suggestion_id}"):
-                        st.session_state[editing_key] = True
-                        st.session_state[value_key] = suggestion.proposed_value
-                        st.rerun()
-                    if actions[2].button("Reject", key=f"reject_s:{view.candidate_id}:{suggestion.suggestion_id}"):
-                        _run_issue_action(lambda: _resolve_suggestion(view, suggestion, "rejected", None, buffer))
-                current_value = _current_value_for_path(view.candidate, suggestion.field_path)
-                if current_value is not None:
-                    if st.button("Keep verified current value", key=f"keep_current:{view.candidate_id}:{suggestion.suggestion_id}"):
+                st.caption(f"Why: {suggestion.rationale} ? Uncertainty: {suggestion.uncertainty or 'Not stated'}")
+                if status == "pending":
+                    action = render_suggestion_card(
+                        st, suggestion, current_value=current,
+                        key_prefix=f"issues:{view.candidate_id}", can_apply=mapped or getattr(suggestion, "generated", False),
+                        critical_finding=any(item.severity == "critical" and item.field_path == path
+                                             for item in view.critical_findings), buffer=buffer,
+                    )
+                    if action is not None:
+                        disposition = action.disposition
+                        if getattr(suggestion, "generated", False) and disposition == "rejected":
+                            disposition = "declined"
+                        _run_issue_action(lambda: _apply_proposal(
+                            view, suggestion, disposition, action.final_value, buffer))
+                elif status == "rejected":
+                    st.info("Rejecting this proposal leaves the source issue unresolved. Confirm a separate follow-up if appropriate.")
+                    verified = st.checkbox(
+                        "I verified the current wording against the source scan",
+                        key=f"keep_original_verified:{view.candidate_id}:{suggestion.suggestion_id}",
+                    )
+                    if st.button("Keep verified original value",
+                                 key=f"keep_current:{view.candidate_id}:{suggestion.suggestion_id}",
+                                 disabled=not verified or not current):
                         _run_issue_action(lambda: _resolve_suggestion(
-                            view, suggestion, "source_corrected", current_value, buffer))
-                evidence = st.text_input("Source note for optional omission",
-                                         key=f"omission_evidence:{view.candidate_id}:{suggestion.suggestion_id}")
-                if st.button("Record optional omission", key=f"omit_s:{view.candidate_id}:{suggestion.suggestion_id}",
-                             disabled=not evidence.strip()):
-                    _run_issue_action(lambda: _resolve_suggestion(
-                        view, suggestion, "not_recipe_content", None, buffer, evidence.strip()))
-                st.caption("Rejecting a proposal alone never clears a separate critical source finding.")
+                            view, suggestion, "source_corrected", current, buffer,
+                            "Operator checked the current value against the original source scan."))
+                    evidence_key = f"omission_evidence:{view.candidate_id}:{suggestion.suggestion_id}"
+                    evidence = st.text_input("Evidence for justified omission", key=evidence_key)
+                    if st.button("Record justified omission",
+                                 key=f"omit_s:{view.candidate_id}:{suggestion.suggestion_id}",
+                                 disabled=not evidence.strip()):
+                        _run_issue_action(lambda: _resolve_suggestion(
+                            view, suggestion, "not_recipe_content", None, buffer, evidence.strip()))
+                    if st.button("Defer review", key=f"defer_s:{view.candidate_id}:{suggestion.suggestion_id}"):
+                        _run_issue_action(lambda: _resolve_suggestion(
+                            view, suggestion, "deferred", None, buffer, "Operator deferred this proposal."))
+                elif status in {"stale", "target_missing"}:
+                    st.warning("This proposal cannot be applied to the current recipe. Compare it with the current wording or request a new suggestion for this revision.")
     if buffer.get("_undo"):
         if st.button("Undo last edit", key=f"undo:{view.candidate_id}"):
             undo = buffer.pop("_undo")
             buffer.update(undo)
             try:
                 record, _ = save_draft(view, buffer)
-                st.session_state.review_save_state = f"Undo saved locally · revision {record.revision}"
+                st.session_state.review_save_state = f"Undo saved locally ? revision {record.revision}"
             except Exception as exc:
                 st.error(f"Undo could not be saved; your current buffer is retained. {exc}")
                 buffer["_undo"] = undo
@@ -1131,10 +1517,11 @@ def _render_findings(view, buffer) -> None:
 
 def _current_value_for_path(candidate, field_path: str) -> str | None:
     import re
-    match = re.fullmatch(r"ingredients\[(\d+)\]", field_path)
+    match = re.fullmatch(r"(ingredients|instructions)\[(\d+)\]", field_path)
     if match:
-        index = int(match.group(1))
-        return candidate.ingredients[index] if index < len(candidate.ingredients) else None
+        values = getattr(candidate, match.group(1))
+        index = int(match.group(2))
+        return values[index] if index < len(values) else None
     if field_path == "yield_text":
         return candidate.yield_text or ""
     if field_path == "description":

@@ -40,6 +40,7 @@ class RecipeView:
     import_ready: bool = False
     extraction_id: str = ""
     revision: int = 0
+    content_digest: str = ""
     target_bindings: tuple[dict[str, Any], ...] = ()
     identity_status: str = "registered"
     source_available: bool = False
@@ -51,6 +52,7 @@ class RecipeView:
     source_display_name: str = ""
     batch_name: str = "Existing library"
     batch_tag: str = ""
+    latest_suggestion_request: dict[str, Any] | None = None
 
     @property
     def pending_suggestions(self) -> list:
@@ -244,6 +246,7 @@ def load_catalog(output_dir: Path, source_root: Path | None = None, *,
                 import_ready=(status == "Ready to import" and not protected),
                 extraction_id=extraction_id,
                 revision=effective.revision if effective else 0,
+                content_digest=effective.content_sha256 if effective else "",
                 target_bindings=tuple(registration.get("target_bindings", [])),
                 identity_status=str(registration.get("identity_status", "registered")),
                 source_available=source_available,
@@ -255,6 +258,8 @@ def load_catalog(output_dir: Path, source_root: Path | None = None, *,
                 source_display_name=str(source_meta.get("original_filename") or human_source_name(source_path)),
                 batch_name=str(source_meta.get("batch_name") or "Existing library"),
                 batch_tag=str(source_meta.get("batch_tag", "")),
+                latest_suggestion_request=reviews.latest_suggestion_request_loaded(
+                    identity, source_hash, extraction_id),
             ))
 
     # Explicitly declared new retry candidates stay in their attempt cache. They
@@ -345,6 +350,8 @@ def load_catalog(output_dir: Path, source_root: Path | None = None, *,
             source_display_name=str(source_meta.get("original_filename") or human_source_name(source_path)),
             batch_name=str(source_meta.get("batch_name") or "Existing library"),
             batch_tag=str(source_meta.get("batch_tag", "")),
+            latest_suggestion_request=reviews.latest_suggestion_request_loaded(
+                candidate_id, source_hash, extraction_id),
         ))
         visible.add(key)
     return views
@@ -425,6 +432,15 @@ def render_source_page(path: Path, page_number: int = 1, zoom: float = 1) -> Sou
                                  int(page_number), float(zoom))
 
 
+def _source_preview_pixel_limit(zoom: float) -> tuple[int, int]:
+    """Keep Fit close to display resolution while retaining two inspect tiers."""
+    if zoom <= 1:
+        return (1200, 1600)
+    if zoom <= 1.5:
+        return (1800, 2400)
+    return (2400, 3200)
+
+
 @lru_cache(maxsize=4)
 def _render_source_cached(path_value: str, modified_ns: int, size: int,
                           page_number: int, zoom: float) -> SourcePage:
@@ -440,8 +456,9 @@ def _render_source_cached(path_value: str, modified_ns: int, size: int,
                 if page_number < 1 or page_number > page_count:
                     return SourcePage(None, page_count, page_number, "That source page is unavailable.")
                 page = document[page_number - 1]
-                scale = min(1.5 * zoom, 2400 / max(1, page.rect.width),
-                            3200 / max(1, page.rect.height))
+                max_width, max_height = _source_preview_pixel_limit(zoom)
+                scale = min(1.5 * zoom, max_width / max(1, page.rect.width),
+                            max_height / max(1, page.rect.height))
                 pixmap = page.get_pixmap(matrix=fitz.Matrix(scale, scale), alpha=False)
                 from PIL import Image
 
@@ -454,7 +471,7 @@ def _render_source_cached(path_value: str, modified_ns: int, size: int,
 
             with Image.open(path) as source:
                 image = source.convert("RGB")
-                image.thumbnail((2400, 3200))
+                image.thumbnail(_source_preview_pixel_limit(zoom))
                 return SourcePage(image.copy(), 1, 1)
         return SourcePage(None, 0, page_number, "This source format cannot be previewed yet.")
     except Exception as exc:

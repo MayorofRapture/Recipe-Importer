@@ -498,6 +498,81 @@ class ReviewAuthorityTests(unittest.TestCase):
         self.assertIsNone(projection.recipe["yield_text"])
         self.assertEqual(projection.recipe["suggestions"][0]["review_status"], "rejected")
 
+    def test_explicit_optional_decline_projects_as_declined_and_can_approve(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ReviewStore(Path(tmp) / "review_events.jsonl")
+            candidate = RecipeCandidate(
+                name="Soup", ingredients=["water"], instructions=["Cook."],
+                suggestions=[Suggestion(
+                    suggestion_id="yield", field_path="yield_text", proposed_value="4 servings",
+                    rationale="An unverified guess.",
+                )],
+            )
+            registration = store.register_candidates("scan", SOURCE_HASH, "extract-1", [candidate])[0]
+            issue = next(item for item in registration["target_bindings"] if item.get("issue_id") == "yield")
+            store.save_revision(
+                candidate_id=registration["candidate_id"], source_hash=SOURCE_HASH,
+                extraction_id="extract-1", expected_parent=0, operation_id="decline-optional-revision",
+                recipe=candidate.model_dump(mode="json"), target_bindings=[],
+            )
+            store.resolve_issue(
+                candidate_id=registration["candidate_id"], source_hash=SOURCE_HASH,
+                extraction_id="extract-1", revision=1, issue_id="yield", target_id=issue["target_id"],
+                disposition="not_recipe_content", final_value=None, evidence_reference="Optional field omitted from scan.",
+                operation_id="decline-optional-proposal",
+            )
+            projection = store.project(registration["candidate_id"], SOURCE_HASH, "extract-1", candidate)
+            self.assertEqual(projection.recipe["suggestions"][0]["review_status"], "declined")
+            self.assertFalse(projection.import_ready)
+            store.approve_revision(
+                candidate_id=registration["candidate_id"], source_hash=SOURCE_HASH,
+                extraction_id="extract-1", revision=1, operation_id="approve-after-optional-decline",
+                source_path=_source_path(tmp),
+            )
+            approved = store.project(registration["candidate_id"], SOURCE_HASH, "extract-1", candidate)
+
+        self.assertTrue(approved.import_ready)
+        self.assertEqual(approved.recipe["yield_text"], None)
+        self.assertEqual(approved.recipe["suggestions"][0]["review_status"], "declined")
+
+    def test_optional_decline_does_not_resolve_separate_critical_finding(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ReviewStore(Path(tmp) / "review_events.jsonl")
+            candidate = RecipeCandidate(
+                name="Soup", ingredients=["water"], instructions=["Cook."],
+                missing_information=[Diagnostic(
+                    field_path="instructions", kind="missing_from_source", detail="Timing absent.",
+                    severity="critical",
+                )],
+                suggestions=[Suggestion(
+                    suggestion_id="yield", field_path="yield_text", proposed_value="4 servings",
+                    rationale="An unverified guess.",
+                )],
+            )
+            registration = store.register_candidates("scan", SOURCE_HASH, "extract-1", [candidate])[0]
+            issue = next(item for item in registration["target_bindings"] if item.get("issue_id") == "yield")
+            store.save_revision(
+                candidate_id=registration["candidate_id"], source_hash=SOURCE_HASH,
+                extraction_id="extract-1", expected_parent=0, operation_id="decline-optional-critical-revision",
+                recipe=candidate.model_dump(mode="json"), target_bindings=[],
+            )
+            store.resolve_issue(
+                candidate_id=registration["candidate_id"], source_hash=SOURCE_HASH,
+                extraction_id="extract-1", revision=1, issue_id="yield", target_id=issue["target_id"],
+                disposition="not_recipe_content", final_value=None, evidence_reference="Optional field omitted.",
+                operation_id="decline-optional-with-critical",
+            )
+            projection = store.project(registration["candidate_id"], SOURCE_HASH, "extract-1", candidate)
+            with self.assertRaisesRegex(ReviewConflict, "pending proposals"):
+                store.approve_revision(
+                    candidate_id=registration["candidate_id"], source_hash=SOURCE_HASH,
+                    extraction_id="extract-1", revision=1, operation_id="cannot-approve-critical",
+                    source_path=_source_path(tmp),
+                )
+
+        self.assertFalse(projection.import_ready)
+        self.assertEqual(projection.recipe["suggestions"][0]["review_status"], "declined")
+
     def test_rejected_proposal_does_not_resolve_its_critical_finding(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = ReviewStore(Path(tmp) / "review_events.jsonl")

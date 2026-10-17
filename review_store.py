@@ -2,10 +2,12 @@
 from __future__ import annotations
 
 import csv
+import ctypes
 import json
 import os
 import re
 import hashlib
+import socket
 import uuid
 from collections import Counter
 import time
@@ -77,6 +79,46 @@ def _state_lock(path: Path):
                 msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
             else:
                 fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def _windows_process_is_alive(pid: int, kernel32=None) -> bool:
+    """Query process state without sending a signal or terminating the process."""
+    from ctypes import wintypes
+
+    api = kernel32 or ctypes.WinDLL("kernel32", use_last_error=True)
+    api.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+    api.OpenProcess.restype = wintypes.HANDLE
+    api.GetExitCodeProcess.argtypes = (wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD))
+    api.GetExitCodeProcess.restype = wintypes.BOOL
+    api.CloseHandle.argtypes = (wintypes.HANDLE,)
+    api.CloseHandle.restype = wintypes.BOOL
+
+    # QUERY_LIMITED_INFORMATION | SYNCHRONIZE
+    handle = api.OpenProcess(0x1000 | 0x00100000, False, pid)
+    if not handle:
+        # Only ERROR_INVALID_PARAMETER definitively means that PID does not
+        # identify a process. Treat access denied and other unknown failures as
+        # live to avoid replaying an uncertain provider request.
+        return ctypes.get_last_error() != 87
+    try:
+        exit_code = wintypes.DWORD()
+        if not api.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+            return True
+        return exit_code.value == 259  # STILL_ACTIVE
+    finally:
+        api.CloseHandle(handle)
+
+
+def _process_is_alive(pid: int) -> bool:
+    if os.name == "nt":
+        return _windows_process_is_alive(pid)
+    try:
+        os.kill(pid, 0)
+        return True
+    except PermissionError:
+        return True
+    except (ProcessLookupError, OSError):
+        return False
 
 
 def _canonical(value: dict) -> str:
@@ -165,6 +207,12 @@ class ReviewStore:
         self.resolutions = {}
         self.events = []
         self._exact_registration_index = {}
+        self._suggestion_requests_by_candidate: dict[str, list[dict]] = {}
+        self._suggestion_requests_by_id: dict[str, dict] = {}
+        self._suggestion_request_status_by_id: dict[str, dict] = {}
+        self._dynamic_suggestions_by_candidate: dict[str, list[dict]] = {}
+        self._dynamic_suggestions_by_id: dict[str, dict] = {}
+        self._dynamic_decisions_by_candidate: dict[str, dict[str, dict]] = {}
         if self.path.exists():
             ui_count("ledger_reads")
             for line in self.path.read_text(encoding="utf-8").splitlines():
@@ -172,6 +220,7 @@ class ReviewStore:
                     continue
                 event = json.loads(line)
                 self.events.append(event)
+                self._index_suggestion_event(event)
                 identity = event.get("candidate_id", "")
                 kind = event.get("event")
                 if kind == "candidate_registration":
@@ -212,6 +261,32 @@ class ReviewStore:
             fh.flush()
             os.fsync(fh.fileno())
         self.events.extend(events)
+        for event in events:
+            self._index_suggestion_event(event)
+
+    def _index_suggestion_event(self, event: dict) -> None:
+        """Keep suggestion lookups proportional to one candidate, not the ledger."""
+        kind = event.get("event")
+        candidate_id = str(event.get("candidate_id", ""))
+        request_id = str(event.get("request_id", ""))
+        if kind == "suggestion_request":
+            self._suggestion_requests_by_candidate.setdefault(candidate_id, []).append(event)
+            self._suggestion_requests_by_id[request_id] = event
+            self._suggestion_request_status_by_id[request_id] = {
+                key: value for key, value in event.items()
+                if key not in {"event", "event_id", "timestamp", "actor"}
+            }
+        elif kind == "suggestion_request_status" and request_id:
+            current = self._suggestion_request_status_by_id.get(request_id)
+            if current is not None:
+                current.update({key: value for key, value in event.items()
+                                if key not in {"event", "event_id", "timestamp", "actor"}})
+        elif kind == "dynamic_suggestion":
+            self._dynamic_suggestions_by_candidate.setdefault(candidate_id, []).append(event)
+            self._dynamic_suggestions_by_id[str(event.get("proposal_id", ""))] = event
+        elif kind == "dynamic_suggestion_decision":
+            decisions = self._dynamic_decisions_by_candidate.setdefault(candidate_id, {})
+            decisions[str(event.get("proposal_id", ""))] = event
 
     def _readback(self, event: dict) -> dict:
         readback = next((item for item in self.events if item.get("event_id") == event["event_id"]), None)
@@ -723,6 +798,666 @@ class ReviewStore:
             self._reload()
             return self._readback(event)
 
+    def create_suggestion_request(self, *, candidate_id: str, source_hash: str,
+                                  extraction_id: str, revision: int, content_digest: str,
+                                  recipe_snapshot: dict, suggestion_type: str,
+                                  operation_id: str, consent: bool,
+                                  target_bindings: list[dict] | None = None) -> dict:
+        """Durably record an explicitly authorized, exact-revision text request."""
+        if not consent:
+            raise ValueError("explicit cloud consent is required")
+        if suggestion_type != "instructions":
+            raise ValueError("unsupported suggestion type")
+        if (set(recipe_snapshot) != {"name", "ingredients", "instructions"}
+                or not isinstance(recipe_snapshot.get("name"), str)
+                or not isinstance(recipe_snapshot.get("ingredients"), list)
+                or not isinstance(recipe_snapshot.get("instructions"), list)):
+            raise ValueError("suggestion requests may include only recipe title, ingredients, and instructions")
+        request_id = hashlib.sha256(
+            f"{candidate_id}\0{source_hash}\0{extraction_id}\0{revision}\0{suggestion_type}\0{operation_id}".encode()
+        ).hexdigest()
+        with _state_lock(self.path):
+            self._reload()
+            registration = next((item for item in self.registrations.get(candidate_id, [])
+                                 if item.get("source_hash") == source_hash
+                                 and item.get("extraction_id") == extraction_id), None)
+            if not registration or registration.get("identity_status") != "registered":
+                raise ReviewConflict("candidate identity is not ready for a suggestion request")
+            if self._protected_import_outcome(registration):
+                raise ReviewConflict("protected recipes cannot request generated suggestions")
+            latest = max((item for item in self.revisions.get(candidate_id, [])
+                          if item.get("source_hash") == source_hash
+                          and item.get("extraction_id") == extraction_id),
+                         key=lambda item: int(item["revision"]), default=None)
+            if (latest is None or int(latest["revision"]) != int(revision)
+                    or latest.get("content_sha256") != content_digest):
+                raise ReviewConflict("suggestion request must match the current saved recipe revision")
+            latest_targets = latest.get("target_bindings", [])
+            requested_targets = []
+            for target in (target_bindings or []):
+                match = next((item for item in latest_targets
+                              if item.get("target_id") == target.get("target_id")
+                              and item.get("field") == "instructions"), None)
+                if (not match or not isinstance(match.get("position"), int)
+                        or match["position"] < 0 or match["position"] >= len(recipe_snapshot["instructions"])):
+                    raise ReviewConflict("suggestion target is not bound to this recipe revision")
+                requested_targets.append({"target_id": match["target_id"], "field": "instructions",
+                                          "position": match["position"],
+                                          "current_value": recipe_snapshot["instructions"][match["position"]]})
+            prior_request = self._suggestion_requests_by_id.get(request_id)
+            if prior_request:
+                return self._suggestion_request_loaded(request_id)
+            existing = next((item for item in reversed(
+                self._suggestion_requests_by_candidate.get(candidate_id, []))
+                             if item.get("source_hash") == source_hash
+                             and item.get("extraction_id") == extraction_id
+                             and item.get("revision") == int(revision)
+                             and item.get("suggestion_type") == suggestion_type), None)
+            if existing:
+                result = self._suggestion_request_loaded(existing["request_id"]) or dict(existing)
+                status = result.get("status", "queued")
+                if status in {"queued", "running"}:
+                    return result
+                if status == "completed":
+                    proposals = [item for item in self._dynamic_suggestions_by_candidate.get(candidate_id, [])
+                                 if item.get("request_id") == existing["request_id"]]
+                    terminal_decisions = {
+                        "accepted", "edited", "declined", "rejected", "stale_discarded",
+                    }
+                    unresolved = any(
+                        item.get("status") in {"pending", "stale", "target_missing"}
+                        and self._dynamic_decisions_by_candidate.get(candidate_id, {})
+                        .get(item.get("proposal_id"), {}).get("disposition") not in terminal_decisions
+                        for item in proposals
+                    )
+                    if unresolved:
+                        return result
+            event = self._base_event("suggestion_request", candidate_id, source_hash,
+                                     extraction_id, operation_id)
+            event.update({"request_id": request_id, "revision": int(revision),
+                          "content_digest": content_digest,
+                          "recipe_snapshot_digest": _recipe_digest(recipe_snapshot),
+                          "instruction_targets": requested_targets,
+                          "recipe_snapshot": json.loads(_canonical(recipe_snapshot)),
+                          "suggestion_type": suggestion_type, "consent": True,
+                          "status": "queued", "prompt_version": "instruction-suggestion-v1",
+                          "schema_version": "instruction-suggestion-v1"})
+            self._append(event, locked=True)
+            self._reload()
+            return self._readback(event)
+
+    def get_suggestion_request(self, request_id: str) -> dict | None:
+        with _state_lock(self.path):
+            self._reload()
+            return self._suggestion_request_loaded(request_id)
+
+    def _suggestion_request_loaded(self, request_id: str) -> dict | None:
+        request = self._suggestion_requests_by_id.get(request_id)
+        if not request:
+            return None
+        return dict(self._suggestion_request_status_by_id.get(request_id, request))
+
+    def latest_suggestion_request_loaded(self, candidate_id: str, source_hash: str,
+                                         extraction_id: str) -> dict | None:
+        """Return the newest request from this store snapshot without reloading."""
+        request = next((item for item in reversed(
+            self._suggestion_requests_by_candidate.get(candidate_id, []))
+                        if item.get("source_hash") == source_hash
+                        and item.get("extraction_id") == extraction_id), None)
+        return self._suggestion_request_loaded(request["request_id"]) if request else None
+
+    def latest_suggestion_request(self, candidate_id: str, source_hash: str,
+                                  extraction_id: str) -> dict | None:
+        """Return the newest durable request for a candidate/source/extraction tuple."""
+        with _state_lock(self.path):
+            self._reload()
+            return self.latest_suggestion_request_loaded(candidate_id, source_hash, extraction_id)
+
+    def claim_suggestion_request(self, request_id: str, worker_claim_id: str) -> dict | None:
+        """Atomically claim queued work so only one process can call the provider."""
+        with _state_lock(self.path):
+            self._reload()
+            request = next((item for item in self.events if item.get("event") == "suggestion_request"
+                            and item.get("request_id") == request_id), None)
+            if not request:
+                raise ReviewConflict("suggestion request was not found")
+            if self._suggestion_request_status_loaded(request_id) != "queued":
+                return self._suggestion_request_loaded(request_id)
+            event = self._base_event("suggestion_request_status", request["candidate_id"],
+                                     request["source_hash"], request["extraction_id"],
+                                     f"{request_id}:claim:{uuid.uuid4().hex}")
+            event.update({"request_id": request_id, "status": "running", "error": "",
+                          "model_id": "", "worker_host": socket.gethostname(),
+                          "worker_pid": os.getpid(), "worker_claim_id": worker_claim_id})
+            self._append(event, locked=True)
+            self._reload()
+            return self._suggestion_request_loaded(request_id)
+
+    def recover_interrupted_suggestion_requests(self) -> list[str]:
+        """Mark running requests interrupted only when their claimed worker is gone."""
+        recovered = []
+        with _state_lock(self.path):
+            self._reload()
+            requests = [item for item in self.events if item.get("event") == "suggestion_request"]
+            for request in requests:
+                request_id = request.get("request_id", "")
+                if self._suggestion_request_status_loaded(request_id) != "running":
+                    continue
+                latest = self._suggestion_request_loaded(request_id) or {}
+                host = latest.get("worker_host", "")
+                pid = latest.get("worker_pid")
+                if host and host != socket.gethostname():
+                    # A different host may still own the provider call; never replay it here.
+                    continue
+                alive = False
+                if host == socket.gethostname() and isinstance(pid, int) and pid > 0:
+                    alive = _process_is_alive(pid)
+                if alive:
+                    continue
+                event = self._base_event("suggestion_request_status", request["candidate_id"],
+                                         request["source_hash"], request["extraction_id"],
+                                         f"{request_id}:interrupted:{uuid.uuid4().hex}")
+                event.update({"request_id": request_id, "status": "interrupted",
+                              "error": "Worker stopped during provider request; create a new authorized request.",
+                              "model_id": ""})
+                self._append(event, locked=True)
+                recovered.append(request_id)
+            if recovered:
+                self._reload()
+        return recovered
+
+    def update_suggestion_request(self, request_id: str, status: str, *, error: str = "",
+                                  model_id: str = "", locked: bool = False) -> dict:
+        allowed = {"running", "completed", "failed", "quota_blocked", "interrupted", "cancelled", "stale"}
+        if status not in allowed:
+            raise ValueError("unsupported suggestion request status")
+        context = nullcontext() if locked else _state_lock(self.path)
+        with context:
+            if not locked:
+                self._reload()
+            request = next((item for item in self.events if item.get("request_id") == request_id
+                            and item.get("event") == "suggestion_request"), None)
+            if not request:
+                raise ReviewConflict("suggestion request was not found")
+            current_status = next((item.get("status") for item in reversed(self.events)
+                                   if item.get("event") == "suggestion_request_status"
+                                   and item.get("request_id") == request_id), request.get("status", "queued"))
+            if status == "running" and current_status != "queued":
+                raise ReviewConflict(f"suggestion request cannot start from {current_status}")
+            if status == "cancelled" and current_status not in {"queued", "running"}:
+                raise ReviewConflict(f"suggestion request cannot be cancelled from {current_status}")
+            if status not in {"running", "cancelled"} and current_status != "running":
+                raise ReviewConflict(f"suggestion request cannot finish from {current_status}")
+            event = self._base_event("suggestion_request_status", request["candidate_id"],
+                                     request["source_hash"], request["extraction_id"],
+                                     f"{request_id}:{status}:{uuid.uuid4().hex}")
+            event.update({"request_id": request_id, "status": status,
+                          "error": str(error)[:300], "model_id": model_id})
+            self._append(event, locked=True)
+            self._reload()
+            return event
+
+    def cancel_suggestion_request(self, request_id: str) -> dict:
+        """Durably cancel queued/running work; publication uses the same ledger lock."""
+        with _state_lock(self.path):
+            self._reload()
+            request = next((item for item in self.events if item.get("event") == "suggestion_request"
+                            and item.get("request_id") == request_id), None)
+            if not request:
+                raise ReviewConflict("suggestion request was not found")
+            current_status = self._suggestion_request_status_loaded(request_id)
+            if current_status not in {"queued", "running"}:
+                result = dict(request)
+                result["status"] = current_status
+                return result
+            event = self._base_event("suggestion_request_status", request["candidate_id"],
+                                     request["source_hash"], request["extraction_id"],
+                                     f"{request_id}:cancel:{uuid.uuid4().hex}")
+            event.update({"request_id": request_id, "status": "cancelled",
+                          "error": "Cancelled by the reviewer.", "model_id": ""})
+            self._append(event, locked=True)
+            self._reload()
+            return event
+
+    def record_dynamic_proposals(self, request_id: str, proposals: list[dict]) -> list[dict]:
+        with _state_lock(self.path):
+            self._reload()
+            request = next((item for item in self.events if item.get("request_id") == request_id
+                            and item.get("event") == "suggestion_request"), None)
+            if not request:
+                raise ReviewConflict("suggestion request was not found")
+            current_status = next((item.get("status") for item in reversed(self.events)
+                                   if item.get("event") == "suggestion_request_status"
+                                   and item.get("request_id") == request_id), request.get("status", "queued"))
+            if current_status != "running":
+                raise ReviewConflict("only an active suggestion request can publish proposals")
+            latest = max((item for item in self.revisions.get(request["candidate_id"], [])
+                          if item.get("source_hash") == request["source_hash"]
+                          and item.get("extraction_id") == request["extraction_id"]),
+                         key=lambda item: int(item["revision"]), default=None)
+            stale = (latest is None or int(latest["revision"]) != int(request["revision"])
+                     or latest.get("content_sha256") != request["content_digest"])
+            prepared = []
+            for index, raw in enumerate(proposals):
+                proposal = dict(raw)
+                required = ("field_path", "proposed_value", "classification", "rationale", "uncertainty")
+                if any(not str(proposal.get(key, "")).strip() for key in required):
+                    raise ValueError("proposal is missing required structured fields")
+                if proposal["classification"] != "inferred":
+                    raise ValueError("invalid suggestion classification")
+                location = proposal.get("insertion_location")
+                is_bound_step = bool(proposal.get("target_id") and any(
+                    item.get("target_id") == proposal["target_id"]
+                    for item in request.get("instruction_targets", [])))
+                if proposal.get("target_id") and not is_bound_step:
+                    raise ValueError("proposal target is not bound to the requested recipe revision")
+                if ((str(proposal["field_path"]) != "instructions" and not re.fullmatch(
+                        r"instructions\[\d+\]", str(proposal["field_path"])))
+                        or (not is_bound_step and not isinstance(location, dict))):
+                    raise ValueError("instruction proposal needs a mapped target or explicit insertion location")
+                proposal_id = hashlib.sha256(
+                    f"{request_id}\0{index}\0{_canonical(proposal)}".encode("utf-8")
+                ).hexdigest()
+                event = self._base_event("dynamic_suggestion", request["candidate_id"],
+                                         request["source_hash"], request["extraction_id"],
+                                         f"proposal:{proposal_id}")
+                event.update({"request_id": request_id, "proposal_id": proposal_id,
+                              "revision": request["revision"], "content_digest": request["content_digest"],
+                              "field_path": str(proposal["field_path"]),
+                              "target_id": str(proposal.get("target_id", "")),
+                              "insertion_location": proposal.get("insertion_location"),
+                              "proposed_value": str(proposal["proposed_value"]),
+                              "classification": proposal["classification"],
+                              "rationale": str(proposal["rationale"]),
+                              "uncertainty": str(proposal["uncertainty"]),
+                              "model_id": str(proposal.get("model_id", "")),
+                              "prompt_version": request["prompt_version"],
+                              "schema_version": request["schema_version"],
+                              "status": "stale" if stale else "pending"})
+                prepared.append(event)
+            current_status = self._suggestion_request_status_loaded(request_id)
+            if current_status != "running":
+                raise ReviewConflict(f"suggestion request cannot publish from {current_status}")
+            missing = [event for event in prepared
+                       if not any(item.get("proposal_id") == event["proposal_id"] for item in self.events)]
+            status_event = self._base_event("suggestion_request_status", request["candidate_id"],
+                                            request["source_hash"], request["extraction_id"],
+                                            f"{request_id}:publish:{uuid.uuid4().hex}")
+            status_event.update({"request_id": request_id,
+                                 "status": "stale" if stale else "completed",
+                                 "error": "", "model_id": ""})
+            self._append_many([*missing, status_event], locked=True)
+            self._reload()
+            return [self._readback(event) for event in prepared]
+
+    def dynamic_suggestions_for(self, candidate_id: str, source_hash: str,
+                                extraction_id: str) -> list[dict]:
+        with _state_lock(self.path):
+            self._reload()
+            return [dict(item) for item in self._dynamic_suggestions_by_candidate.get(candidate_id, [])
+                    if item.get("source_hash") == source_hash
+                    and item.get("extraction_id") == extraction_id]
+
+    def _suggestion_request_status_loaded(self, request_id: str) -> str:
+        request = self._suggestion_request_status_by_id.get(request_id)
+        return str(request.get("status", "queued")) if request else "queued"
+
+    def resolve_dynamic_suggestion(self, *, candidate_id: str, proposal_id: str,
+                                   disposition: str, final_value: str | None = None,
+                                   operation_id: str) -> dict:
+        if disposition not in {"accepted", "edited", "declined", "rejected"}:
+            raise ValueError("unsupported generated suggestion decision")
+        with _state_lock(self.path):
+            self._reload()
+            proposal = next((item for item in self.events if item.get("event") == "dynamic_suggestion"
+                             and item.get("candidate_id") == candidate_id
+                             and item.get("proposal_id") == proposal_id), None)
+            if not proposal:
+                raise ReviewConflict("generated proposal was not found")
+            if proposal.get("status") != "pending":
+                raise ReviewConflict("proposal is stale or already resolved")
+            latest = max((item for item in self.revisions.get(candidate_id, [])
+                          if item.get("source_hash") == proposal["source_hash"]
+                          and item.get("extraction_id") == proposal["extraction_id"]),
+                         key=lambda item: int(item["revision"]), default=None)
+            if (latest is None or int(latest["revision"]) != int(proposal["revision"])
+                    or latest.get("content_sha256") != proposal["content_digest"]):
+                raise ReviewConflict("recipe changed; proposal is stale and requires an explicit rebase decision")
+            if disposition in {"accepted", "edited"} and not str(final_value or proposal["proposed_value"]).strip():
+                raise ValueError("accepted suggestion content cannot be empty")
+            if disposition in {"accepted", "edited"}:
+                location = proposal.get("insertion_location") or {}
+                values = latest.get("recipe", {}).get("instructions")
+                target = next((item for item in latest.get("target_bindings", [])
+                               if item.get("target_id") == proposal.get("target_id")
+                               and item.get("field") == "instructions"), None)
+                position = target.get("position") if target else None
+                valid_target = isinstance(values, list) and isinstance(position, int) and 0 <= position < len(values)
+                index = location.get("index")
+                valid_insert = (isinstance(values, list) and location.get("field") == "instructions"
+                                and isinstance(index, int) and 0 <= index <= len(values))
+                valid_empty_append = (isinstance(values, list) and not values
+                                      and location.get("field") == "instructions"
+                                      and location.get("after") is None)
+                if not (valid_target or valid_insert or valid_empty_append):
+                    raise ReviewConflict("proposal target is missing or changed; it cannot be applied")
+            event = self._base_event("dynamic_suggestion_decision", candidate_id,
+                                     proposal["source_hash"], proposal["extraction_id"], operation_id)
+            event.update({"proposal_id": proposal_id, "request_id": proposal["request_id"],
+                          "revision": proposal["revision"], "content_digest": proposal["content_digest"],
+                          "disposition": disposition, "final_value": final_value})
+            expected = {k: v for k, v in event.items() if k not in {"event_id", "timestamp", "actor"}}
+            prior = self._existing_operation(operation_id, "dynamic_suggestion_decision", expected)
+            if prior:
+                return prior
+            self._append(event, locked=True)
+            self._reload()
+            return self._readback(event)
+
+    def discard_stale_dynamic_suggestion(self, *, candidate_id: str, proposal_id: str,
+                                          operation_id: str) -> dict:
+        """Record review of a stale result without applying or rebasing its content."""
+        with _state_lock(self.path):
+            self._reload()
+            proposal = next((item for item in self.events if item.get("event") == "dynamic_suggestion"
+                             and item.get("candidate_id") == candidate_id
+                             and item.get("proposal_id") == proposal_id), None)
+            if not proposal:
+                raise ReviewConflict("generated proposal was not found")
+            latest = max((item for item in self.revisions.get(candidate_id, [])
+                          if item.get("source_hash") == proposal["source_hash"]
+                          and item.get("extraction_id") == proposal["extraction_id"]),
+                         key=lambda item: int(item["revision"]), default=None)
+            if (latest is None or (int(latest["revision"]) == int(proposal["revision"])
+                                   and latest.get("content_sha256") == proposal.get("content_digest"))):
+                raise ReviewConflict("proposal is not stale")
+            event = self._base_event("dynamic_suggestion_decision", candidate_id,
+                                     proposal["source_hash"], proposal["extraction_id"], operation_id)
+            event.update({"proposal_id": proposal_id, "request_id": proposal["request_id"],
+                          "base_revision": proposal["revision"], "revision": latest["revision"],
+                          "current_content_digest": latest["content_sha256"],
+                          "content_digest": proposal["content_digest"],
+                          "disposition": "stale_discarded", "final_value": None})
+            expected = {k: v for k, v in event.items() if k not in {"event_id", "timestamp", "actor"}}
+            prior = self._existing_operation(operation_id, "dynamic_suggestion_decision", expected)
+            if prior:
+                return prior
+            if any(item.get("event") == "dynamic_suggestion_decision"
+                   and item.get("proposal_id") == proposal_id for item in self.events):
+                raise ReviewConflict("proposal already has a recorded decision")
+            self._append(event, locked=True)
+            self._reload()
+            return self._readback(event)
+
+    def rebase_and_apply_dynamic_suggestion(self, *, candidate_id: str, proposal_id: str,
+                                            expected_parent: int, expected_content_digest: str,
+                                            recipe: dict, target_bindings: list[dict],
+                                            disposition: str, final_value: str | None,
+                                            source_path: str | Path, confirmed: bool,
+                                            insertion_location: dict | None = None,
+                                            operation_id: str) -> tuple[dict, dict]:
+        """Explicitly compare a stale proposal against the current revision and apply it atomically."""
+        if not confirmed:
+            raise ValueError("explicit comparison and rebase confirmation is required")
+        if disposition not in {"accepted", "edited"}:
+            raise ValueError("rebase application requires accepted or edited disposition")
+        value = str(final_value or "").strip()
+        if not value:
+            raise ValueError("accepted suggestion content cannot be empty")
+        with _state_lock(self.path):
+            self._reload()
+            proposal = next((item for item in self.events if item.get("event") == "dynamic_suggestion"
+                             and item.get("candidate_id") == candidate_id
+                             and item.get("proposal_id") == proposal_id), None)
+            if not proposal:
+                raise ReviewConflict("generated proposal was not found")
+            proposal_decision = next((item for item in self.events
+                                      if item.get("event") == "dynamic_suggestion_decision"
+                                      and item.get("proposal_id") == proposal_id), None)
+            if proposal_decision:
+                prior_revision = next((item for item in self.events
+                                       if item.get("event") == "review_revision"
+                                       and item.get("operation_id") == f"{operation_id}:revision"), None)
+                prior_decision = next((item for item in self.events
+                                       if item.get("event") == "dynamic_suggestion_decision"
+                                       and item.get("operation_id") == f"{operation_id}:decision"), None)
+                if (prior_revision and prior_decision
+                        and prior_decision.get("proposal_id") == proposal_id
+                        and prior_decision.get("final_value") == value
+                        and int(prior_revision.get("parent_revision", -1)) == int(expected_parent)
+                        and prior_decision.get("rebase_to_digest") == expected_content_digest):
+                    replay_recipe = json.loads(_canonical(recipe))
+                    replay_recipe["suggestions"] = prior_revision.get("recipe", {}).get("suggestions", [])
+                    if _recipe_digest(replay_recipe) == prior_revision.get("content_sha256"):
+                        return self._readback(prior_revision), self._readback(prior_decision)
+                raise ReviewConflict("proposal already has a recorded decision")
+            if proposal.get("status") not in {"pending", "stale"}:
+                raise ReviewConflict("proposal is not available for explicit rebase")
+            registration = next((item for item in self.registrations.get(candidate_id, [])
+                                 if item.get("source_hash") == proposal.get("source_hash")
+                                 and item.get("extraction_id") == proposal.get("extraction_id")), None)
+            if not registration or registration.get("identity_status") != "registered":
+                raise ReviewConflict("candidate identity is not ready for rebase")
+            if self._protected_import_outcome(registration):
+                raise ReviewConflict("protected recipes cannot apply generated suggestions")
+            latest = max((item for item in self.revisions.get(candidate_id, [])
+                          if item.get("source_hash") == proposal["source_hash"]
+                          and item.get("extraction_id") == proposal["extraction_id"]),
+                         key=lambda item: int(item["revision"]), default=None)
+            if (latest is None or int(latest["revision"]) != int(expected_parent)
+                    or latest.get("content_sha256") != expected_content_digest):
+                raise ReviewConflict("recipe changed during comparison; reload and compare again")
+            if (int(latest["revision"]) == int(proposal["revision"])
+                    and latest.get("content_sha256") == proposal.get("content_digest")):
+                raise ReviewConflict("proposal is not stale and does not need a rebase")
+            try:
+                actual_source_hash = hashlib.sha256(Path(source_path).read_bytes()).hexdigest()
+            except OSError as exc:
+                raise ReviewConflict("source scan is unavailable; stale proposal cannot be rebased") from exc
+            if actual_source_hash != proposal["source_hash"]:
+                raise ReviewConflict("source scan bytes changed; stale proposal cannot be rebased")
+
+            effective_current = self.project_loaded(
+                candidate_id, proposal["source_hash"], proposal["extraction_id"],
+                RecipeCandidate.model_validate(latest["recipe"]),
+            )
+            current_recipe = json.loads(_canonical(effective_current.recipe))
+            current_instructions = current_recipe.get("instructions")
+            if not isinstance(current_instructions, list):
+                raise ReviewConflict("current instructions are unavailable for comparison")
+            current_targets = json.loads(_canonical(latest.get("target_bindings", [])))
+            current_rows = [item for item in current_targets
+                            if item.get("field") in {"ingredients", "instructions"}
+                            and isinstance(item.get("position"), int)]
+            provided_rows = [item for item in target_bindings
+                             if item.get("field") in {"ingredients", "instructions"}
+                             and isinstance(item.get("position"), int)]
+
+            def row_identity(item):
+                return (str(item.get("target_id", "")), item.get("field"), item.get("position"))
+
+            current_identities = {row_identity(item) for item in current_rows}
+            provided_identities = [row_identity(item) for item in provided_rows]
+            if (any(not identity[0] for identity in provided_identities)
+                    or len(set(provided_identities)) != len(provided_identities)
+                    or len({identity[0] for identity in provided_identities}) != len(provided_identities)):
+                raise ReviewConflict("target bindings contain a missing or duplicate row identity")
+            target_id = str(proposal.get("target_id", ""))
+            comparison_current_value = None
+            confirmed_location = None
+            canonical_targets = current_targets
+            if target_id:
+                target = next((item for item in latest.get("target_bindings", [])
+                               if item.get("target_id") == target_id
+                               and item.get("field") == "instructions"), None)
+                if not target:
+                    raise ReviewConflict("proposal target was removed or changed; it cannot be rebased")
+                if set(provided_identities) != current_identities:
+                    raise ReviewConflict("rebasing a target must preserve all current row bindings exactly")
+                supplied = next((item for item in target_bindings
+                                 if item.get("target_id") == target_id
+                                 and item.get("field") == "instructions"), None)
+                position = target.get("position") if target else None
+                if (not target or not supplied or supplied.get("position") != position
+                        or not isinstance(position, int) or position < 0 or position >= len(current_instructions)):
+                    raise ReviewConflict("proposal target was removed or changed; it cannot be rebased")
+                comparison_current_value = current_instructions[position]
+                expected_recipe = json.loads(_canonical(current_recipe))
+                expected_recipe["instructions"][position] = value
+                submitted_recipe = json.loads(_canonical(recipe))
+                # Suggestion review statuses are projection metadata. Keep the
+                # exact current projection in the revision while comparing all
+                # authoritative recipe fields strictly.
+                submitted_recipe["suggestions"] = expected_recipe.get("suggestions", [])
+                if _canonical(submitted_recipe) != _canonical(expected_recipe):
+                    fields = sorted(key for key in set(submitted_recipe) | set(expected_recipe)
+                                    if _canonical(submitted_recipe.get(key)) != _canonical(expected_recipe.get(key)))
+                    raise ReviewConflict("rebased recipe must preserve current content; changed fields: "
+                                         + ", ".join(fields))
+                recipe = expected_recipe
+                digest = _recipe_digest(recipe)
+                for binding in canonical_targets:
+                    if binding.get("target_id") == target_id and binding.get("field") == "instructions":
+                        if "value_sha256" in binding:
+                            binding["value_sha256"] = hashlib.sha256(value.encode("utf-8")).hexdigest()
+            else:
+                if (len(provided_identities) != len(current_identities) + 1
+                        or not current_identities.issubset(set(provided_identities))):
+                    raise ReviewConflict("rebasing an insertion must preserve all current row bindings and add one row")
+                location = dict(insertion_location or {})
+                index = location.get("index")
+                if (location.get("field") != "instructions" or index != len(current_instructions)):
+                    raise ReviewConflict("stale insertion must be explicitly placed at the current end of instructions")
+                confirmed_location = {"field": "instructions", "index": index}
+                expected_recipe = json.loads(_canonical(current_recipe))
+                expected_recipe["instructions"].append(value)
+                submitted_recipe = json.loads(_canonical(recipe))
+                submitted_recipe["suggestions"] = expected_recipe.get("suggestions", [])
+                if _canonical(submitted_recipe) != _canonical(expected_recipe):
+                    fields = sorted(key for key in set(submitted_recipe) | set(expected_recipe)
+                                    if _canonical(submitted_recipe.get(key)) != _canonical(expected_recipe.get(key)))
+                    raise ReviewConflict("rebased recipe must preserve current content; changed fields: "
+                                         + ", ".join(fields))
+                recipe = expected_recipe
+                digest = _recipe_digest(recipe)
+                inserted_rows = [item for item in provided_rows
+                                 if row_identity(item) not in current_identities]
+                inserted_target = (inserted_rows[0] if len(inserted_rows) == 1 else None)
+                all_current_target_ids = {str(item.get("target_id", "")) for item in current_targets}
+                if (not inserted_target or inserted_target.get("field") != "instructions"
+                        or inserted_target.get("position") != index
+                        or str(inserted_target.get("target_id", "")) in all_current_target_ids):
+                    raise ReviewConflict("rebased insertion needs a target binding at the current end")
+                canonical_targets.append({
+                    "target_id": str(inserted_target["target_id"]), "target_kind": "row",
+                    "field": "instructions", "position": index,
+                    "value_sha256": hashlib.sha256(value.encode("utf-8")).hexdigest(),
+                })
+
+            revision_event = self._base_event("review_revision", candidate_id,
+                                              proposal["source_hash"], proposal["extraction_id"],
+                                              f"{operation_id}:revision")
+            revision_event.update({"revision": expected_parent + 1, "parent_revision": expected_parent,
+                                   "recipe": recipe, "target_bindings": canonical_targets,
+                                   "raw_bulk_text": {"ingredients": "", "instructions": ""},
+                                   "mode": "structured", "warnings": [],
+                                   "content_sha256": digest, "content_digest_version": 1})
+            decision_event = self._base_event("dynamic_suggestion_decision", candidate_id,
+                                              proposal["source_hash"], proposal["extraction_id"],
+                                              f"{operation_id}:decision")
+            decision_event.update({"proposal_id": proposal_id, "request_id": proposal["request_id"],
+                                   "base_revision": proposal["revision"],
+                                   "revision": expected_parent + 1,
+                                   "application_revision": expected_parent + 1,
+                                   "application_content_digest": digest,
+                                   "content_digest": proposal["content_digest"],
+                                   "disposition": disposition, "final_value": value,
+                                   "confirmed_rebase": True,
+                                   "rebase_from_revision": proposal["revision"],
+                                   "rebase_from_digest": proposal["content_digest"],
+                                   "rebase_to_revision": expected_parent,
+                                   "rebase_to_digest": expected_content_digest,
+                                   "target_id": target_id,
+                                   "comparison_current_value": comparison_current_value,
+                                   "comparison_insertion_location": confirmed_location})
+            expected_revision = {key: value for key, value in revision_event.items()
+                                 if key not in {"event_id", "timestamp", "actor"}}
+            expected_decision = {key: value for key, value in decision_event.items()
+                                 if key not in {"event_id", "timestamp", "actor"}}
+            prior_revision = self._existing_operation(f"{operation_id}:revision", "review_revision", expected_revision)
+            prior_decision = self._existing_operation(f"{operation_id}:decision", "dynamic_suggestion_decision", expected_decision)
+            if prior_revision or prior_decision:
+                if prior_revision and prior_decision:
+                    return prior_revision, prior_decision
+                raise ReviewConflict("rebase operation has incomplete durable history")
+            self._append_many([revision_event, decision_event], locked=True)
+            self._reload()
+            return self._readback(revision_event), self._readback(decision_event)
+
+    def apply_dynamic_suggestion(self, *, candidate_id: str, proposal_id: str,
+                                 expected_parent: int, recipe: dict,
+                                 target_bindings: list[dict], disposition: str,
+                                 final_value: str | None, operation_id: str) -> tuple[dict, dict]:
+        """Atomically save accepted wording and its proposal decision at one revision."""
+        if disposition not in {"accepted", "edited"}:
+            raise ValueError("application requires accepted or edited disposition")
+        value = str(final_value or "").strip()
+        if not value:
+            raise ValueError("accepted suggestion content cannot be empty")
+        digest = _recipe_digest(recipe)
+        with _state_lock(self.path):
+            self._reload()
+            proposal = next((item for item in self.events if item.get("event") == "dynamic_suggestion"
+                             and item.get("candidate_id") == candidate_id
+                             and item.get("proposal_id") == proposal_id), None)
+            if not proposal or proposal.get("status") != "pending":
+                raise ReviewConflict("generated proposal is unavailable or already resolved")
+            revisions = [item for item in self.revisions.get(candidate_id, [])
+                         if item.get("source_hash") == proposal["source_hash"]
+                         and item.get("extraction_id") == proposal["extraction_id"]]
+            latest = max(revisions, key=lambda item: int(item["revision"]), default=None)
+            if (latest is None or int(latest["revision"]) != int(expected_parent)
+                    or int(latest["revision"]) != int(proposal["revision"])
+                    or latest.get("content_sha256") != proposal.get("content_digest")):
+                raise ReviewConflict("recipe changed; proposal is stale and requires an explicit rebase decision")
+            location = proposal.get("insertion_location") or {}
+            values = recipe.get("instructions")
+            target = next((item for item in target_bindings
+                           if item.get("target_id") == proposal.get("target_id")
+                           and item.get("field") == "instructions"), None)
+            position = target.get("position") if target else None
+            if not isinstance(values, list) or value not in values:
+                raise ReviewConflict("accepted wording must be present in the saved instruction revision")
+            if proposal.get("target_id") and not (isinstance(position, int) and 0 <= position < len(values)):
+                raise ReviewConflict("proposal target is missing in the saved revision")
+            if not proposal.get("target_id") and location.get("field") != "instructions":
+                raise ReviewConflict("proposal insertion location is not bound to instructions")
+            revision_event = self._base_event("review_revision", candidate_id,
+                                              proposal["source_hash"], proposal["extraction_id"],
+                                              f"{operation_id}:revision")
+            revision_event.update({"revision": expected_parent + 1, "parent_revision": expected_parent,
+                                   "recipe": recipe, "target_bindings": target_bindings,
+                                   "raw_bulk_text": {"ingredients": "", "instructions": ""},
+                                   "mode": "structured", "warnings": [],
+                                   "content_sha256": digest, "content_digest_version": 1})
+            decision_event = self._base_event("dynamic_suggestion_decision", candidate_id,
+                                              proposal["source_hash"], proposal["extraction_id"],
+                                              f"{operation_id}:decision")
+            decision_event.update({"proposal_id": proposal_id, "request_id": proposal["request_id"],
+                                   "base_revision": expected_parent, "revision": expected_parent + 1,
+                                   "application_revision": expected_parent + 1,
+                                   "application_content_digest": digest, "content_digest": proposal["content_digest"],
+                                   "disposition": disposition, "final_value": value})
+            if any(item.get("proposal_id") == proposal_id
+                   and item.get("event") == "dynamic_suggestion_decision" for item in self.events):
+                raise ReviewConflict("proposal already has a recorded decision")
+            current = max((int(item["revision"]) for item in revisions), default=0)
+            if current != expected_parent:
+                raise ReviewConflict(f"revision changed: expected {expected_parent}, current {current}")
+            self._append_many([revision_event, decision_event], locked=True)
+            self._reload()
+            return self._readback(revision_event), self._readback(decision_event)
+
     def approve_revision(self, *, candidate_id: str, source_hash: str, extraction_id: str,
                          revision: int, operation_id: str, source_path: str | Path) -> dict:
         with _state_lock(self.path):
@@ -777,6 +1512,23 @@ class ReviewStore:
                             }
                             and not _mapped_issue_target(issue, snapshot)):
                         raise ReviewConflict("resolved source target is not present in this recipe revision")
+            dynamic = [item for item in self._dynamic_suggestions_by_candidate.get(candidate_id, [])
+                       if item.get("source_hash") == source_hash
+                       and item.get("extraction_id") == extraction_id]
+            decisions = {item.get("proposal_id"): item
+                         for item in self._dynamic_decisions_by_candidate.get(candidate_id, {}).values()
+                         if item.get("revision") == revision
+                         and item.get("disposition") in {"accepted", "edited", "declined", "stale_discarded"}}
+            if any(item.get("status") in {"pending", "stale", "target_missing"}
+                   and item.get("proposal_id") not in decisions
+                   for item in dynamic):
+                raise ReviewConflict("pending generated proposals must be resolved before approval")
+            active_requests = [item for item in self._suggestion_requests_by_candidate.get(candidate_id, [])
+                               if item.get("source_hash") == source_hash
+                               and item.get("extraction_id") == extraction_id]
+            if any(self._suggestion_request_status_loaded(item["request_id"]) in {"queued", "running"}
+                   for item in active_requests):
+                raise ReviewConflict("a generated suggestion request is still in progress")
             event = self._base_event("review_approval", candidate_id, source_hash,
                                      extraction_id, operation_id)
             event.update({"revision": revision, "content_sha256": snapshot["content_sha256"],
@@ -857,6 +1609,68 @@ class ReviewStore:
         resolutions = tuple(item for item in self.resolutions.get(candidate_id, [])
                             if item.get("extraction_id") == extraction_id
                             and item.get("revision") == latest["revision"])
+        dynamic = [item for item in self._dynamic_suggestions_by_candidate.get(candidate_id, [])
+                   if item.get("source_hash") == source_hash
+                   and item.get("extraction_id") == extraction_id]
+        dynamic_decisions = self._dynamic_decisions_by_candidate.get(candidate_id, {})
+        resolved_dynamic_ids = {key for key, item in dynamic_decisions.items()
+                                if item.get("disposition") in {"accepted", "edited", "declined", "stale_discarded"}}
+        for item in dynamic:
+            decision = dynamic_decisions.get(item.get("proposal_id"))
+            proposal_is_current = (int(item.get("revision", -1)) == int(latest["revision"])
+                                    and item.get("content_digest") == latest.get("content_sha256"))
+            status = (decision.get("disposition") if decision else item.get("status", "pending"))
+            final_value = (decision.get("final_value") or item.get("proposed_value")) if decision else ""
+            applied_in_later_revision = False
+            if decision and decision.get("application_revision"):
+                applied_revision = next((revision for revision in self.revisions.get(candidate_id, [])
+                                         if int(revision.get("revision", -1)) == int(decision["application_revision"])
+                                         and revision.get("content_sha256") == decision.get("application_content_digest")), None)
+                applied_in_later_revision = applied_revision is not None
+            has_durable_decision = bool(decision and (
+                decision.get("disposition") in {"declined", "rejected", "stale_discarded"}
+                or applied_in_later_revision
+            ))
+            if not proposal_is_current and not has_durable_decision:
+                status = "stale"
+            review_status = {"accepted": "approved", "edited": "edited",
+                             "declined": "declined", "rejected": "rejected",
+                             "stale_discarded": "rejected"}.get(status, "pending")
+            projected_suggestion = {
+                "suggestion_id": item["proposal_id"], "field_path": item["field_path"],
+                "proposed_value": item["proposed_value"], "rationale": item["rationale"],
+                "confidence": "low", "uncertainty": item["uncertainty"],
+                "review_status": review_status, "generated": True,
+                "classification": item["classification"], "request_id": item["request_id"],
+                "target_id": item.get("target_id", ""),
+                "insertion_location": item.get("insertion_location") or {},
+                "dynamic_status": status,
+            }
+            suggestions = recipe.setdefault("suggestions", [])
+            existing_suggestion = next((value for value in suggestions
+                                        if value.get("suggestion_id") == item["proposal_id"]), None)
+            if existing_suggestion is None:
+                suggestions.append(projected_suggestion)
+            else:
+                existing_suggestion.update(projected_suggestion)
+            if proposal_is_current and decision and decision.get("disposition") in {"accepted", "edited"}:
+                value = decision.get("final_value") or item["proposed_value"]
+                location = item.get("insertion_location") or {}
+                field_name = str(location.get("field", ""))
+                values = recipe.get(field_name)
+                if field_name == "instructions" and isinstance(values, list):
+                    index = location.get("index")
+                    if index is None and location.get("after") is None and not values:
+                        values.append(value)
+                    elif isinstance(index, int) and 0 <= index <= len(values):
+                        values.insert(index, value)
+                    elif item.get("target_id"):
+                        target = next((target for target in latest.get("target_bindings", [])
+                                       if target.get("target_id") == item["target_id"]
+                                       and target.get("field") == "instructions"), None)
+                        position = target.get("position") if target else None
+                        if isinstance(position, int) and 0 <= position < len(values):
+                            values[position] = value
         if registration:
             for resolution in resolutions:
                 issue = next((item for item in registration["target_bindings"]
@@ -879,7 +1693,7 @@ class ReviewStore:
                         if suggestion.get("suggestion_id") == resolution.get("issue_id"):
                             suggestion["review_status"] = {
                                 "accepted": "approved", "edited": "edited",
-                                "rejected": "rejected", "not_recipe_content": "rejected",
+                                "rejected": "rejected", "not_recipe_content": "declined",
                             }[disposition]
             resolved_findings = {item.get("issue_id") for item in registration["target_bindings"]
                                  if item.get("target_kind") == "finding"
@@ -889,6 +1703,10 @@ class ReviewStore:
             recipe["missing_information"] = [item for item in recipe.get("missing_information", [])
                                               if not any(issue_id.endswith(":" + item.get("field_path", ""))
                                                          for issue_id in resolved_findings)]
+        try:
+            complete = is_complete(RecipeCandidate.model_validate(recipe))
+        except (TypeError, ValueError):
+            complete = False
         pending = bool(registration and any(
             item.get("target_kind") in {"proposal", "finding"}
             and (item.get("target_kind") != "finding" or item.get("severity") == "critical")
@@ -900,13 +1718,29 @@ class ReviewStore:
                             {"source_corrected", "human_completion", "not_recipe_content", "accepted", "edited"}
                         ) for res in resolutions)
             for item in registration["target_bindings"]))
+        pending = pending or any(
+            item.get("proposal_id") not in resolved_dynamic_ids
+            and (item.get("status") in {"stale", "target_missing"}
+                 or (item.get("status") == "pending"
+                     and int(item.get("revision", -1)) == int(latest["revision"])))
+            for item in dynamic
+        )
+        active_request = any(
+            self._suggestion_request_status_loaded(item["request_id"]) in {"queued", "running"}
+            for item in self._suggestion_requests_by_candidate.get(candidate_id, [])
+            if item.get("source_hash") == source_hash and item.get("extraction_id") == extraction_id)
+        approved = approved and not pending and not active_request
+        if any(dynamic_decisions.get(item.get("proposal_id"), {}).get("disposition") in {"accepted", "edited"}
+               and int(item.get("revision", -1)) == int(latest["revision"])
+               for item in dynamic):
+            approved = False
         unmapped_resolution = bool(registration and any(
             resolution.get("disposition") in {"source_corrected", "human_completion", "accepted", "edited"}
             and not _mapped_issue_target(issue, latest)
             for resolution in resolutions
             for issue in registration["target_bindings"]
             if issue.get("issue_id") == resolution.get("issue_id")))
-        import_ready = approved and complete and not pending and not unmapped_resolution
+        import_ready = approved and complete and not pending and not active_request and not unmapped_resolution
         if import_ready:
             recipe["requires_review"] = False
         return EffectiveReview(candidate_id, recipe, int(latest["revision"]),
@@ -1013,7 +1847,7 @@ class ReviewStore:
                     dispositions = {
                         "accepted": "approved", "human_completion": "approved",
                         "edited": "edited", "source_corrected": "edited",
-                        "rejected": "rejected", "not_recipe_content": "rejected",
+                        "rejected": "rejected", "not_recipe_content": "declined",
                         "deferred": "pending",
                     }
                     for resolution in self.resolutions.get(identity, []):

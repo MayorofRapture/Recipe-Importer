@@ -95,11 +95,14 @@ class UsageLedger:
 
     def reserve_scheduled(self, model: str, rpd: int = 0, *, model_rpm: float = 0,
                           global_rpm: float = 0,
+                          tpm: int = 0, tokens: int = 0,
                           sleep: Callable[[float], None] = time.sleep) -> None:
         """Reserve one daily request and a shared global/per-model start slot."""
-        self._reserve(model, rpd, model_rpm=model_rpm, global_rpm=global_rpm, sleep=sleep)
+        self._reserve(model, rpd, model_rpm=model_rpm, global_rpm=global_rpm,
+                      tpm=tpm, tokens=tokens, sleep=sleep)
 
     def _reserve(self, model: str, rpd: int, *, model_rpm: float, global_rpm: float,
+                 tpm: int = 0, tokens: int = 0,
                  sleep: Callable[[float], None]) -> None:
         global_interval = 60.0 / global_rpm if global_rpm > 0 else 0.0
         model_interval = 60.0 / model_rpm if model_rpm > 0 else 0.0
@@ -121,6 +124,20 @@ class UsageLedger:
                 start = max(now, float(self.data.get("global_next_start", 0)),
                             float(model_windows.get(model, 0)))
                 wait = max(0.0, start - now)
+                token_windows = self.data.setdefault("model_token_windows", {}).setdefault(model, [])
+                token_windows[:] = [item for item in token_windows if now - float(item[0]) < 60]
+                if tpm and tokens > tpm:
+                    raise QuotaExhausted(f"Suggestion request exceeds configured TPM allowance for {model}")
+                if tpm and sum(int(item[1]) for item in token_windows) + tokens > tpm:
+                    required = sum(int(item[1]) for item in token_windows) + tokens - tpm
+                    elapsed_tokens = 0
+                    token_wait = 60.0
+                    for timestamp, count in token_windows:
+                        elapsed_tokens += int(count)
+                        if elapsed_tokens >= required:
+                            token_wait = max(0.0, float(timestamp) + 60 - now)
+                            break
+                    wait = max(wait, token_wait)
                 if not wait:
                     entry["requests"] = int(entry.get("requests", 0)) + 1
                     if shared_global_interval:
@@ -129,6 +146,8 @@ class UsageLedger:
                     if shared_model_interval:
                         model_intervals[model] = shared_model_interval
                         model_windows[model] = start + shared_model_interval
+                    if tpm and tokens:
+                        token_windows.append([now, int(tokens)])
                     self._save()
                     self.data = self._read_current()
                     return
@@ -192,7 +211,9 @@ class ModelRouter:
         self.max_transient_retries = max_transient_retries
 
     def run(self, attempt: Callable[[ModelConfig], Any],
-            quality_check: Callable[[Any], bool] | None = None) -> RouteResult:
+            quality_check: Callable[[Any], bool] | None = None,
+            *, retry_transient: bool = True, stop_on_transient: bool = False,
+            request_tokens: int = 0) -> RouteResult:
         remaining = list(self.models)
         route_reason = "primary"
         total_attempts = 0
@@ -202,7 +223,9 @@ class ModelRouter:
             model = remaining.pop(0)
             attempted_models.append(model.id)
             try:
-                value = self._run_model(model, attempt)
+                value = self._run_model(model, attempt, retry_transient=retry_transient,
+                                        stop_on_transient=stop_on_transient,
+                                        request_tokens=request_tokens)
                 total_attempts += 1
                 if quality_check is not None and quality_check(value):
                     quality = next((item for item in remaining if item.role == "quality_escalation"), None)
@@ -216,7 +239,17 @@ class ModelRouter:
                 last_error = exc
                 total_attempts += 1
                 _attach_route_context(exc, attempted_models, model.id, route_reason)
-                route_reason = "quota_fallback"
+                fallback = next((item for item in remaining if item.role == "quota_fallback"), None)
+                if fallback is not None:
+                    remaining.remove(fallback)
+                    remaining.insert(0, fallback)
+                    route_reason = "quota_fallback"
+                else:
+                    # A quality model is reserved for quality-driven escalation.
+                    # Older configurations with multiple primary entries still
+                    # retain their ordered primary fallback behavior.
+                    remaining = [item for item in remaining if item.role == "primary"]
+                    route_reason = "fallback"
             except Exception as exc:
                 last_error = exc
                 total_attempts += 1
@@ -230,17 +263,26 @@ class ModelRouter:
             raise QuotaExhausted("No eligible Gemini models remain")
         raise last_error
 
-    def _run_model(self, model: ModelConfig, attempt: Callable[[ModelConfig], Any]) -> Any:
+    def _run_model(self, model: ModelConfig, attempt: Callable[[ModelConfig], Any], *,
+                   retry_transient: bool = True, stop_on_transient: bool = False,
+                   request_tokens: int = 0) -> Any:
         tries = 0
         while True:
             self.ledger.reserve_scheduled(model.id, model.rpd, model_rpm=model.rpm,
-                                          global_rpm=self.global_rpm, sleep=self.sleep)
+                                          global_rpm=self.global_rpm, tpm=model.tpm,
+                                          tokens=request_tokens, sleep=self.sleep)
             try:
                 return attempt(model)
             except Exception as exc:
                 if _is_quota_error(exc):
                     raise QuotaExhausted(_safe_error(exc)) from exc
-                if not _is_transient_error(exc) or tries >= self.max_transient_retries:
+                if not retry_transient and stop_on_transient and _is_transient_error(exc):
+                    try:
+                        setattr(exc, "stop_routing", True)
+                    except Exception:
+                        pass
+                    raise
+                if not retry_transient or not _is_transient_error(exc) or tries >= self.max_transient_retries:
                     raise
                 tries += 1
                 self.sleep(min(60.0, 2 ** tries))
@@ -268,7 +310,7 @@ def _is_quota_error(exc: Exception) -> bool:
 
 def _is_transient_error(exc: Exception) -> bool:
     text = str(exc).lower()
-    return any(term in text for term in ("503", "502", "504", "unavailable", "timeout", "deadline exceeded", "temporarily"))
+    return any(term in text for term in ("503", "502", "504", "unavailable", "timeout", "timed out", "deadline exceeded", "temporarily"))
 
 
 def validate_model_ids(client: Any, models: list[ModelConfig]) -> None:

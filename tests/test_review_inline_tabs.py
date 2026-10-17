@@ -12,9 +12,9 @@ from unittest.mock import patch
 from streamlit.testing.v1 import AppTest
 
 from tests.ui_fixture_factory import write_ui_fixture
-from ui_data import load_catalog
+from ui_data import load_catalog, verify_selected_source
 from recipe_quality import Suggestion
-from app_pages.common import save_draft
+from app_pages.common import buffer_for, save_draft
 from review_store import ReviewConflict, ReviewStore
 
 
@@ -252,7 +252,7 @@ class ReviewInlineTabTests(unittest.TestCase):
             fixture, app = self._launch(str(tmp))
             app = next(item for item in app.selectbox if item.label == "Jump to recipe").set_value(
                 "Cranberry & Caramel Date Bars").run(timeout=10)
-            reject = next(button for button in app.button if button.label == "Reject")
+            reject = next(button for button in app.button if button.label == "Reject; keep issue open")
             reject.click().run(timeout=10)
             view = next(item for item in load_catalog(Path(fixture["output"]))
                         if item.candidate.name == "Cranberry & Caramel Date Bars")
@@ -262,6 +262,342 @@ class ReviewInlineTabTests(unittest.TestCase):
         rejected = next(item for item in view.candidate.suggestions
                         if item.suggestion_id == "cranberry-quantity")
         self.assertEqual(rejected.review_status, "rejected")
+
+    def test_approval_blocker_review_action_opens_issues(self):
+        tmp = self._temp_dir()
+        fixture = write_ui_fixture(tmp)
+        env = patch.dict(os.environ, {
+            "RECIPE_IMPORTER_OUTPUT_DIR": str(fixture["output"]),
+            "RECIPE_IMPORTER_SOURCE_DIR": str(tmp / "sources"),
+        }, clear=False)
+        env.start()
+        self.addCleanup(env.stop)
+        app = AppTest.from_file(str(APP_PATH)).run(timeout=10)
+        app = next(item for item in app.selectbox if item.label == "Jump to recipe").set_value(
+            "Cranberry & Caramel Date Bars").run(timeout=10)
+        self.assertTrue(any("critical source issue unresolved" in item.value for item in app.warning))
+        blocker_review = next(item for item in app.button if item.label == "Review")
+        blocker_review.click().run(timeout=10)
+        self.assertTrue(any("The quantity is unclear in the source" in item.value for item in app.warning))
+
+    def test_stale_suggestion_blocker_opens_instruction_tab_without_widget_state_error(self):
+        tmp = self._temp_dir()
+        fixture = write_ui_fixture(tmp)
+        output = Path(fixture["output"])
+        source_root = tmp / "sources"
+        env = patch.dict(os.environ, {
+            "RECIPE_IMPORTER_OUTPUT_DIR": str(output),
+            "RECIPE_IMPORTER_SOURCE_DIR": str(source_root),
+        }, clear=False)
+        env.start()
+        self.addCleanup(env.stop)
+
+        view = next(item for item in load_catalog(output, source_root)
+                    if item.candidate.name == "Cranberry & Caramel Date Bars")
+        view = verify_selected_source(view)
+        save_draft(view, buffer_for(view))
+        view = next(item for item in load_catalog(output, source_root)
+                    if item.candidate.name == "Cranberry & Caramel Date Bars")
+        view = verify_selected_source(view)
+        target = next(item for item in view.revision_target_bindings
+                      if item.get("field") == "instructions")
+        from suggestion_service import SuggestionService
+        service = SuggestionService(output, proposer=lambda snapshot, kind: [{
+            "field_path": "instructions[0]", "target_id": target["target_id"],
+            "proposed_value": "Stir the dates gently.", "classification": "inferred",
+            "rationale": "A plausible refinement.", "uncertainty": "The source wording is brief.",
+        }])
+        request = service.request({
+            "candidate_id": view.candidate_id, "source_hash": view.source_hash,
+            "extraction_id": view.extraction_id, "revision": view.revision,
+            "content_digest": view.content_digest, "candidate": view.candidate,
+            "source_verified": True,
+            "revision_target_bindings": view.revision_target_bindings,
+        }, consent=True, operation_id="stale-tab-jump")
+        service.process(request["request_id"])
+
+        app = AppTest.from_file(str(APP_PATH)).run(timeout=10)
+        app = next(item for item in app.selectbox if item.label == "Jump to recipe").set_value(
+            "Cranberry & Caramel Date Bars").run(timeout=10)
+        candidate_id = app.session_state["review_selection"]
+        app.session_state[f"recipe_sections:{candidate_id}"] = "Instructions"
+        app.run(timeout=10)
+        next(item for item in app.text_area if item.label == "Step 1").set_value(
+            "Stir the dates carefully.")
+        next(item for item in app.button if item.label == "Save draft").click().run(timeout=10)
+        app.run(timeout=10)
+        refreshed = next(item for item in load_catalog(output, source_root)
+                         if item.candidate.name == "Cranberry & Caramel Date Bars")
+        dynamic = next(item for item in refreshed.candidate.suggestions
+                       if getattr(item, "generated", False))
+        self.assertEqual(dynamic.dynamic_status, "stale")
+        blocker = next(item for item in app.button
+                       if item.label == "Review" and "stale" in item.key)
+        blocker.click().run(timeout=10)
+
+        self.assertFalse(app.exception)
+        self.assertEqual(app.session_state[f"recipe_sections:{candidate_id}"], "Instructions")
+        self.assertTrue(any(item.label == "Discard stale suggestion" for item in app.button))
+
+    def test_second_generated_target_can_be_explicitly_rebased_after_first_is_applied(self):
+        tmp = self._temp_dir()
+        fixture = write_ui_fixture(tmp)
+        source_root = tmp / "sources"
+        env = patch.dict(os.environ, {
+            "RECIPE_IMPORTER_OUTPUT_DIR": str(fixture["output"]),
+            "RECIPE_IMPORTER_SOURCE_DIR": str(source_root),
+        }, clear=False)
+        env.start()
+        self.addCleanup(env.stop)
+
+        view = next(item for item in load_catalog(fixture["output"], source_root)
+                    if item.candidate.name == "Cranberry & Caramel Date Bars")
+        view = verify_selected_source(view)
+        save_draft(view, buffer_for(view))
+        view = next(item for item in load_catalog(fixture["output"], source_root)
+                    if item.candidate.name == "Cranberry & Caramel Date Bars")
+        view = verify_selected_source(view)
+        target = next(item for item in view.revision_target_bindings
+                      if item.get("field") == "instructions" and item.get("position") == 0)
+
+        from suggestion_service import SuggestionService
+        proposals = [
+            {"field_path": "instructions[0]", "target_id": target["target_id"],
+             "proposed_value": "Stir the dates gently.", "classification": "inferred",
+             "rationale": "A possible clarification.", "uncertainty": "The scan is brief."},
+            {"field_path": "instructions[0]", "target_id": target["target_id"],
+             "proposed_value": "Stir the dates until evenly coated.", "classification": "inferred",
+             "rationale": "An alternative completion.", "uncertainty": "The scan is brief."},
+        ]
+        service = SuggestionService(fixture["output"], proposer=lambda _snapshot, _kind: proposals)
+        request = service.request({
+            "candidate_id": view.candidate_id, "source_hash": view.source_hash,
+            "extraction_id": view.extraction_id, "revision": view.revision,
+            "content_digest": view.content_digest, "candidate": view.candidate,
+            "source_verified": True,
+            "revision_target_bindings": view.revision_target_bindings,
+        }, consent=True, operation_id="two-target-proposals")
+        service.process(request["request_id"])
+
+        app = AppTest.from_file(str(APP_PATH)).run(timeout=10)
+        app = next(item for item in app.selectbox if item.label == "Jump to recipe").set_value(
+            "Cranberry & Caramel Date Bars").run(timeout=10)
+        candidate_id = app.session_state["review_selection"]
+        app.session_state[f"recipe_sections:{candidate_id}"] = "Instructions"
+        app.run(timeout=10)
+        next(item for item in app.button if item.label == "Accept inferred suggestion").click().run(timeout=10)
+
+        refreshed = next(item for item in load_catalog(fixture["output"], source_root)
+                         if item.candidate_id == candidate_id)
+        dynamic = [item for item in refreshed.candidate.suggestions
+                   if getattr(item, "generated", False)]
+        self.assertEqual(refreshed.revision, view.revision + 1)
+        self.assertEqual(sum(getattr(item, "dynamic_status", "") == "stale" for item in dynamic), 1)
+        stale = next(item for item in dynamic if getattr(item, "dynamic_status", "") == "stale")
+        stale_checkbox = next(item for item in app.checkbox
+                              if item.label == "I compared the current recipe wording with this proposal"
+                              and stale.suggestion_id in item.key)
+        self.assertTrue(any(item.label == "Use with current revision" for item in app.button))
+        self.assertTrue(any(stale.proposed_value in str(item.value) for item in app.markdown))
+
+        stale_checkbox.check().run(timeout=10)
+        next(item for item in app.button if item.label == "Use with current revision").click().run(timeout=10)
+
+        after = next(item for item in load_catalog(fixture["output"], source_root)
+                     if item.candidate_id == candidate_id)
+        self.assertEqual(after.revision, view.revision + 2)
+        self.assertEqual(after.candidate.instructions[0], stale.proposed_value)
+        decision = next(item for item in reversed(ReviewStore(Path(fixture["output"]) / "review_events.jsonl").events)
+                        if item.get("event") == "dynamic_suggestion_decision"
+                        and item.get("proposal_id") == stale.suggestion_id)
+        self.assertEqual(decision.get("revision"), after.revision)
+        self.assertEqual(decision.get("rebase_from_revision"), view.revision)
+        self.assertEqual(decision.get("rebase_to_revision"), view.revision + 1)
+        self.assertEqual(len(after.critical_findings), 1)
+
+    def test_instruction_request_discloses_text_only_and_requires_cloud_consent(self):
+        tmp = self._temp_dir()
+        fixture = write_ui_fixture(tmp)
+        env = patch.dict(os.environ, {
+            "RECIPE_IMPORTER_OUTPUT_DIR": str(fixture["output"]),
+            "RECIPE_IMPORTER_SOURCE_DIR": str(tmp / "sources"),
+            "GEMINI_API_KEY": "",
+        }, clear=False)
+        env.start()
+        self.addCleanup(env.stop)
+        app = AppTest.from_file(str(APP_PATH)).run(timeout=10)
+        app = next(item for item in app.selectbox if item.label == "Jump to recipe").set_value(
+            "Cranberry & Caramel Date Bars").run(timeout=10)
+        candidate_id = app.session_state["review_selection"]
+        app.session_state[f"recipe_sections:{candidate_id}"] = "Instructions"
+        app.run(timeout=10)
+
+        self.assertTrue(any(item.label == "I authorize this cloud request for this recipe" for item in app.checkbox))
+        self.assertTrue(any("scan and image are not sent" in item.value for item in app.caption))
+        request_button = next(item for item in app.button if item.label == "Suggest instructions with AI")
+        self.assertTrue(request_button.disabled)
+        store = ReviewStore(Path(fixture["output"]) / "review_events.jsonl")
+        self.assertFalse(any(item.get("event") == "suggestion_request" for item in store.events))
+
+    def test_fresh_session_discovers_queued_request_and_disables_approval(self):
+        tmp = self._temp_dir()
+        fixture = write_ui_fixture(tmp)
+        source_root = tmp / "sources"
+        env = patch.dict(os.environ, {
+            "RECIPE_IMPORTER_OUTPUT_DIR": str(fixture["output"]),
+            "RECIPE_IMPORTER_SOURCE_DIR": str(source_root),
+            "GEMINI_API_KEY": "",
+        }, clear=False)
+        env.start()
+        self.addCleanup(env.stop)
+        view = next(item for item in load_catalog(Path(fixture["output"]), source_root)
+                    if item.candidate.name == "Fried Rice")
+        self.assertTrue(view.source_verified)
+        save_draft(view, buffer_for(view))
+        view = next(item for item in load_catalog(Path(fixture["output"]), source_root)
+                    if item.candidate.name == "Fried Rice")
+
+        # Warm the page's durable-request cache with a negative result before a
+        # request is created, then model the local request callback invalidating it.
+        app = AppTest.from_file(str(APP_PATH)).run(timeout=10)
+        app = next(item for item in app.selectbox if item.label == "Jump to recipe").set_value(
+            "Fried Rice").run(timeout=10)
+        candidate_id = app.session_state["review_selection"]
+        cache_key = f"suggestion_request_snapshot:{candidate_id}"
+        self.assertIn(cache_key, app.session_state)
+        self.assertIsNone(app.session_state[cache_key]["request"])
+
+        from suggestion_service import SuggestionService
+        request = SuggestionService(fixture["output"]).request(
+            {"candidate_id": view.candidate_id, "source_hash": view.source_hash,
+             "extraction_id": view.extraction_id, "revision": view.revision,
+             "content_digest": view.content_digest, "candidate": view.candidate,
+             "source_verified": True, "revision_target_bindings": ()},
+            consent=True, operation_id="queued-before-new-session")
+        self.assertEqual(request["status"], "queued")
+
+        # This is the same invalidation done by the request UI after persistence.
+        del app.session_state[cache_key]
+        app.run(timeout=10)
+        approve = next(item for item in app.button if item.label == "Approve & next")
+        self.assertTrue(approve.disabled)
+        self.assertTrue(any("AI suggestion request in progress" in item.value
+                            for item in app.warning) or any(
+                                "AI suggestion request in progress" in item.value for item in app.info))
+        self.assertTrue(any(item.label == "Resume queued request" for item in app.button))
+        self.assertTrue(any(item.label == "Cancel request" for item in app.button))
+
+        next(item for item in app.button if item.label == "Cancel request").click().run(timeout=10)
+        approve = next(item for item in app.button if item.label == "Approve & next")
+        self.assertFalse(approve.disabled)
+
+    def test_idle_negative_request_cache_does_not_construct_the_service(self):
+        tmp = self._temp_dir()
+        fixture = write_ui_fixture(tmp)
+        env = patch.dict(os.environ, {
+            "RECIPE_IMPORTER_OUTPUT_DIR": str(fixture["output"]),
+            "RECIPE_IMPORTER_SOURCE_DIR": str(tmp / "sources"),
+        }, clear=False)
+        env.start()
+        self.addCleanup(env.stop)
+        with patch("app_pages.review.suggestion_service") as service_factory, patch(
+                "app_pages.review._poll_suggestion_job_status") as poll_fragment:
+            app = AppTest.from_file(str(APP_PATH)).run(timeout=10)
+            candidate_id = app.session_state["review_selection"]
+            self.assertIn(f"suggestion_request_snapshot:{candidate_id}", app.session_state)
+            self.assertEqual(service_factory.call_count, 0)
+            self.assertEqual(poll_fragment.call_count, 0)
+            app.run(timeout=10)
+            self.assertEqual(service_factory.call_count, 0)
+            self.assertEqual(poll_fragment.call_count, 0)
+
+    def test_fresh_consent_can_request_again_after_completed_empty_result(self):
+        tmp = self._temp_dir()
+        fixture = write_ui_fixture(tmp)
+        source_root = tmp / "sources"
+        env = patch.dict(os.environ, {
+            "RECIPE_IMPORTER_OUTPUT_DIR": str(fixture["output"]),
+            "RECIPE_IMPORTER_SOURCE_DIR": str(source_root),
+            "RECIPE_IMPORTER_FIXTURE_MODE": "false",
+            "GEMINI_API_KEY": "test-only-key",
+        }, clear=False)
+        env.start()
+        self.addCleanup(env.stop)
+
+        from suggestion_service import SuggestionService
+        service = SuggestionService(fixture["output"], proposer=lambda *_: [])
+        view = next(item for item in load_catalog(fixture["output"], source_root)
+                    if item.candidate.name == "Fried Rice")
+        view = verify_selected_source(view)
+        save_draft(view, buffer_for(view))
+        view = next(item for item in load_catalog(fixture["output"], source_root)
+                    if item.candidate.name == "Fried Rice")
+        view = verify_selected_source(view)
+        completed = service.request(view, consent=True, operation_id="completed-empty-seed")
+        service.process(completed["request_id"])
+        self.assertEqual(service.status(completed["request_id"])["status"], "completed")
+
+        submitted = []
+
+        def submit(current_view, *, operation_id):
+            request = service.request(current_view, consent=True, operation_id=operation_id)
+            submitted.append((operation_id, request["request_id"]))
+            service.process(request["request_id"])
+            return request
+
+        with patch("app_pages.common.enqueue_suggestion_request", side_effect=submit), patch(
+                "app_pages.review.enqueue_suggestion_request", side_effect=submit):
+            app = AppTest.from_file(str(APP_PATH)).run(timeout=10)
+            app = next(item for item in app.selectbox if item.label == "Jump to recipe").set_value(
+                "Fried Rice").run(timeout=10)
+            candidate_id = app.session_state["review_selection"]
+            app.session_state[f"recipe_sections:{candidate_id}"] = "Instructions"
+            app.run(timeout=10)
+            nonce_key = f"suggestion_consent_nonce:{candidate_id}"
+            first_nonce = app.session_state[nonce_key]
+
+            consent = next(item for item in app.checkbox
+                           if item.key == f"suggestion_consent:{candidate_id}:{view.revision}:{first_nonce}")
+            consent.check().run(timeout=10)
+            request_button = next(item for item in app.button
+                                  if item.label == "Suggest instructions with AI")
+            self.assertFalse(request_button.disabled)
+            request_button.click().run(timeout=10)
+            second_nonce = app.session_state[nonce_key]
+            self.assertNotEqual(first_nonce, second_nonce)
+            self.assertEqual(service.status(submitted[0][1])["status"], "completed")
+
+            next_consent = next(item for item in app.checkbox
+                                if item.key == f"suggestion_consent:{candidate_id}:{view.revision}:{second_nonce}")
+            next_consent.check().run(timeout=10)
+            next(item for item in app.button if item.label == "Suggest instructions with AI").click().run(timeout=10)
+
+        self.assertEqual(len(submitted), 2)
+        self.assertNotEqual(submitted[0][0], submitted[1][0])
+        self.assertNotEqual(submitted[0][1], submitted[1][1])
+        self.assertEqual(service.status(submitted[1][1])["status"], "completed")
+
+    def test_using_inferred_proposal_does_not_clear_matching_critical_finding(self):
+        tmp = self._temp_dir()
+        fixture = write_ui_fixture(tmp)
+        env = patch.dict(os.environ, {
+            "RECIPE_IMPORTER_OUTPUT_DIR": str(fixture["output"]),
+            "RECIPE_IMPORTER_SOURCE_DIR": str(tmp / "sources"),
+        }, clear=False)
+        env.start()
+        self.addCleanup(env.stop)
+        app = AppTest.from_file(str(APP_PATH)).run(timeout=10)
+        app = next(item for item in app.selectbox if item.label == "Jump to recipe").set_value(
+            "Cranberry & Caramel Date Bars").run(timeout=10)
+        next(button for button in app.button if button.label == "Accept inferred suggestion").click().run(timeout=10)
+
+        store = ReviewStore(Path(fixture["output"]) / "review_events.jsonl")
+        resolutions = [item for item in store.events if item.get("event") == "review_issue_resolution"]
+        self.assertTrue(any(item.get("issue_id") == "cranberry-quantity" for item in resolutions))
+        self.assertFalse(any(item.get("target_kind") == "finding" for item in resolutions))
+        refreshed = next(item for item in load_catalog(Path(fixture["output"]), tmp / "sources")
+                         if item.candidate.name == "Cranberry & Caramel Date Bars")
+        self.assertEqual(len(refreshed.critical_findings), 1)
 
     def test_instruction_suggestion_applies_to_its_immutable_step_and_keeps_proposal(self):
         with self.subTest("isolated fixture"):
@@ -283,14 +619,14 @@ class ReviewInlineTabTests(unittest.TestCase):
                 "2 cups dates, chopped")
             app.session_state[f"recipe_sections:{candidate_id}"] = "Instructions"
             app.run(timeout=10)
-            next(button for button in app.button if button.label == "Edit suggestion").click().run(timeout=10)
-            next(item for item in app.text_area if item.label == "Edit suggestion").set_value(
+            next(button for button in app.button if button.label == "Edit and use").click().run(timeout=10)
+            next(item for item in app.text_area if item.label == "Edit and use").set_value(
                 "Bake for 25 minutes.").run(timeout=10)
             app.session_state[f"recipe_sections:{candidate_id}"] = "Ingredients"
             app.run(timeout=10)
             app.session_state[f"recipe_sections:{candidate_id}"] = "Instructions"
             app.run(timeout=10)
-            self.assertEqual(next(item for item in app.text_area if item.label == "Edit suggestion").value,
+            self.assertEqual(next(item for item in app.text_area if item.label == "Edit and use").value,
                              "Bake for 25 minutes.")
             next(button for button in app.button if button.label == "Use edited version").click().run(timeout=10)
             visible_step = next(item for item in app.text_area if item.label == "Step 2")
@@ -334,7 +670,7 @@ class ReviewInlineTabTests(unittest.TestCase):
             candidate_id = app.session_state["review_selection"]
             app.session_state[f"recipe_sections:{candidate_id}"] = "Instructions"
             app.run(timeout=10)
-            next(button for button in app.button if button.label == "Use suggestion").click().run(timeout=10)
+            next(button for button in app.button if button.label == "Accept inferred suggestion").click().run(timeout=10)
             events = [json.loads(line) for line in
                       (Path(fixture["output"]) / "review_events.jsonl").read_text(encoding="utf-8").splitlines()]
 
@@ -361,9 +697,8 @@ class ReviewInlineTabTests(unittest.TestCase):
             app.run(timeout=10)
 
         self.assertFalse(app.exception)
-        self.assertTrue(any("No exact original row is available" in item.value for item in app.caption))
-        apply_button = next(button for button in app.button if button.label == "Use suggestion")
-        self.assertTrue(apply_button.disabled)
+        self.assertTrue(any("original target is unavailable" in item.value for item in app.caption))
+        self.assertFalse(any(button.label == "Accept inferred suggestion" for button in app.button))
 
 
 if __name__ == "__main__":

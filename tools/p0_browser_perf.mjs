@@ -188,10 +188,14 @@ try {
       await waitFor(cdp, `![...document.querySelectorAll('textarea')].some(e=>(e.getAttribute('aria-label')||[...(e.labels||[])].map(x=>x.innerText).join(' ')).trim()==='Bulk instructions')`, 'bulk editor cancel', 15000);
     } else if (action === 'navigate') {
       const before = await evaluate(cdp, `document.querySelector('input[aria-label="Recipe title"]')?.value||''`);
-      const buttonLabel = direction === 'previous' ? 'Previous recipe' : 'Skip for now';
+      let buttonLabel = 'Skip for now';
       if (direction === 'previous') {
-        const options = await buttonPoint(cdp, 'Options expand_more'); await click(cdp, options);
-        await waitFor(cdp, `[...document.querySelectorAll('button')].some(e=>(e.innerText||'').trim()==='Previous recipe'&&e.getClientRects().length>0)`, 'Previous recipe option', 10000);
+        const hasBack = await evaluate(cdp, `[...document.querySelectorAll('button')].some(e=>(e.innerText||'').trim()==='Back'&&e.getClientRects().length>0)`);
+        buttonLabel = hasBack ? 'Back' : 'Previous recipe';
+        if (!hasBack) {
+          const options = await buttonPoint(cdp, 'Options expand_more'); await click(cdp, options);
+          await waitFor(cdp, `[...document.querySelectorAll('button')].some(e=>(e.innerText||'').trim()==='Previous recipe'&&e.getClientRects().length>0)`, 'Previous recipe option', 10000);
+        }
       }
       const point = await buttonPoint(cdp, buttonLabel);
       const started = Date.now(); await click(cdp, point);

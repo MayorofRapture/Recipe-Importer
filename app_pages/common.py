@@ -43,6 +43,31 @@ def catalog() -> list[RecipeView]:
         ) from exc
 
 
+@st.cache_resource(show_spinner=False)
+def _suggestion_service_for_output(output_path: str):
+    """Share one durable suggestion worker per local output directory."""
+    from suggestion_service import SuggestionService
+    return SuggestionService(output_path)
+
+
+def suggestion_service():
+    """Return the configured service without creating provider work."""
+    output, _ = paths()
+    return _suggestion_service_for_output(str(output))
+
+
+def enqueue_suggestion_request(view: RecipeView, *, operation_id: str):
+    """Persist an explicitly authorized request, then hand it to a background worker."""
+    from runtime_safety import FixtureModeError, fixture_mode
+    if fixture_mode():
+        raise FixtureModeError("Fixture mode disables live Gemini suggestion requests.")
+    service = suggestion_service()
+    request = service.request(view, suggestion_type="instructions", consent=True,
+                              operation_id=operation_id)
+    service.start_background(request["request_id"])
+    return request
+
+
 def retry_service():
     """Build the local retry boundary, using only synthetic extraction in fixture mode."""
     output, source_root = paths()

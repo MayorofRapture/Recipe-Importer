@@ -124,7 +124,7 @@ class ReviewBufferTests(unittest.TestCase):
             selector = next(item for item in app.selectbox if item.label == "Jump to recipe")
             selector.set_value("Cranberry & Caramel Date Bars").run(timeout=10)
 
-            keys = [item.key for item in app.button if item.label == "Edit suggestion"]
+            keys = [item.key for item in app.button if item.label == "Edit and use"]
             self.assertEqual(len(keys), 3)
             self.assertEqual(len(set(keys)), 3)
             self.assertFalse(app.exception)
@@ -265,17 +265,38 @@ class ReviewBufferTests(unittest.TestCase):
             next(item for item in app.selectbox if item.label == "Jump to recipe").set_value("Two Proposal Sample").run(timeout=10)
             candidate_id = app.session_state["review_selection"]
 
-            next(item for item in app.button if item.key == f"approve_s:{candidate_id}:quantity-proposal").click().run(timeout=10)
-            next(item for item in app.button if item.key == f"approve_s:{candidate_id}:yield-proposal").click().run(timeout=10)
+            quantity = next(item for item in app.button
+                            if item.key.startswith("use:inline:")
+                            and item.key.endswith(":quantity-proposal"))
+            quantity.click().run(timeout=10)
+            yield_proposal = next(item for item in app.button
+                                  if item.key.startswith("decline:issues:")
+                                  and item.key.endswith(":yield-proposal"))
+            yield_proposal.click().run(timeout=10)
 
             approve = next(item for item in app.button if item.key == f"approve:{candidate_id}")
-            self.assertFalse(approve.disabled, [item.value for item in app.caption])
+            self.assertFalse(approve.disabled, ([item.value for item in app.caption],
+                                                [item.value for item in app.error]))
             approve.click().run(timeout=10)
 
             views = load_catalog(Path(fixture["output"]), Path(tmp, "sources"))
             view = next(item for item in views if item.candidate_id == candidate_id)
+            events = [json.loads(line) for line in
+                      (Path(fixture["output"]) / "review_events.jsonl").read_text(encoding="utf-8").splitlines()]
             self.assertEqual(view.revision, 1)
             self.assertEqual(view.status, "Ready to import")
+        revisions = [item for item in events if item.get("event") == "review_revision"
+                     and item.get("candidate_id") == candidate_id]
+        approvals = [item for item in events if item.get("event") == "review_approval"
+                     and item.get("candidate_id") == candidate_id]
+        resolutions = [item for item in events if item.get("event") == "review_issue_resolution"
+                       and item.get("candidate_id") == candidate_id]
+        self.assertEqual(len(revisions), 1)
+        self.assertEqual(len(approvals), 1)
+        self.assertEqual(approvals[0]["revision"], revisions[0]["revision"])
+        self.assertEqual({item["revision"] for item in resolutions}, {1})
+        self.assertEqual({item["disposition"] for item in resolutions},
+                         {"accepted", "not_recipe_content"})
 
     def test_approval_does_not_let_queue_flush_write_after_the_approved_revision(self):
         with tempfile.TemporaryDirectory() as tmp:

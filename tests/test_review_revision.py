@@ -262,7 +262,7 @@ class ReviewRevisionTests(unittest.TestCase):
                 app = AppTest.from_file(str(APP_PATH)).run(timeout=10)
                 selector = next(item for item in app.selectbox if item.label == "Jump to recipe")
                 app = selector.set_value("Cranberry & Caramel Date Bars").run(timeout=10)
-                suggestion_actions = [button.label for button in app.button if button.label == "Use suggestion"]
+                suggestion_actions = [button.label for button in app.button if button.label == "Accept inferred suggestion"]
 
         self.assertEqual(len(suggestion_actions), 3)
 
@@ -313,7 +313,7 @@ class ReviewRevisionTests(unittest.TestCase):
                 app = AppTest.from_file(str(APP_PATH)).run(timeout=10)
                 app = next(item for item in app.selectbox if item.label == "Jump to recipe").set_value(
                     "Cranberry & Caramel Date Bars").run(timeout=10)
-                next(button for button in app.button if button.label == "Use suggestion").click().run(timeout=10)
+                next(button for button in app.button if button.label == "Accept inferred suggestion").click().run(timeout=10)
             events = [json.loads(line) for line in (output / "review_events.jsonl").read_text(encoding="utf-8").splitlines()]
 
         self.assertFalse(app.exception)
@@ -335,7 +335,7 @@ class ReviewRevisionTests(unittest.TestCase):
                     "Cranberry & Caramel Date Bars").run(timeout=10)
                 next(item for item in app.text_input if item.label == "Ingredient 2").set_value(
                     "fresh cranberries").run(timeout=10)
-                next(button for button in app.button if button.label == "Use suggestion").click().run(timeout=10)
+                next(button for button in app.button if button.label == "Accept inferred suggestion").click().run(timeout=10)
             events = [json.loads(line) for line in (output / "review_events.jsonl").read_text(encoding="utf-8").splitlines()]
 
         revision = next(item for item in events if item.get("event") == "review_revision"

@@ -8,7 +8,7 @@ from pydantic import BaseModel, Field
 
 DiagnosticKind = Literal["missing_from_source", "unreadable", "cropped", "ambiguous", "not_extracted"]
 Severity = Literal["critical", "optional"]
-ReviewStatus = Literal["pending", "approved", "edited", "rejected"]
+ReviewStatus = Literal["pending", "approved", "edited", "rejected", "declined"]
 
 
 class Diagnostic(BaseModel):
@@ -29,6 +29,12 @@ class Suggestion(BaseModel):
     uncertainty: str = ""
     diagnostic_id: str = ""
     review_status: ReviewStatus = "pending"
+    generated: bool = False
+    classification: str = ""
+    request_id: str = ""
+    target_id: str = ""
+    insertion_location: dict = Field(default_factory=dict)
+    dynamic_status: str = ""
 
 
 class RecipeCandidate(BaseModel):

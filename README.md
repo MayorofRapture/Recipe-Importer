@@ -63,6 +63,12 @@ unverified proposal and source issue, then approve a specific saved revision. Sa
 approval, and import are separate actions. Pending proposals and unapproved retry
 results cannot be imported.
 
+In Instructions, use **Suggest instructions with AI** when extraction omitted steps, or **Suggest improvements to existing instructions** to review current steps for possible improvements. Each request requires a fresh confirmation and sends only the recipe title, ingredients, and current instructions as text to Gemini; it does not send the scan. The durable job runs in the background, and its result stays labeled inferred and unverified until you accept or edit it. Review the current wording, proposed wording, difference, and uncertainty together beside the relevant step. Declining an optional generated completion leaves the recipe unchanged; critical source findings still need their own explicit source verification or human-approved inferred completion. If a proposal is stale, compare it with the current wording and explicitly apply it only when its target still exists, or discard it before requesting again with fresh consent.
+
+The Review panel summarizes suggestion decisions and shows each approval blocker beside a direct Review action. This keeps the next correction close to the reason approval is unavailable. Applied proposals remain distinguishable from accepted edits and declined suggestions, while rejection leaves the source issue visible until a separate follow-up is recorded. If the recipe changes while a generated proposal is pending, compare its original wording with the current wording; explicitly apply it to the current revision when its target still exists, or discard it and request a new proposal with fresh consent.
+
+Use **Back** to revisit the prior recipe, **Skip for now** to move it to the persistent Skipped recipes list, and **Return to** to reopen that exact recipe. If its status no longer matches saved queue filters, Review adjusts the filters and explains the change. A queued AI request remains visible after reopening the app; resume or cancel it explicitly. If a worker may have stopped during a provider call, the app does not retry automatically because the provider outcome is unknown. Start another request only with fresh consent.
+
 If a source preview is unavailable, re-upload the exact original file in Upload.
 The app verifies its content hash before reconnecting it to existing work; a
 same-named file with different bytes cannot restore or approve that recipe.
