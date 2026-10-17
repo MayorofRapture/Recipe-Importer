@@ -1,0 +1,356 @@
+from __future__ import annotations
+
+import tempfile
+import unittest
+import subprocess
+import sys
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+from unittest.mock import patch
+
+from import_recipes import file_digest
+from recipe_quality import RecipeCandidate, schema_recipe
+from review_store import ReviewStore, extraction_identity
+from tests.ui_fixture_factory import write_ui_fixture
+from ui_data import load_catalog
+from ui_import_service import ImportService
+
+
+class FakeMealie:
+    def __init__(self, *, create_error=None, tag_error=None):
+        self.create_error = create_error
+        self.tag_error = tag_error
+        self.created = []
+        self.tags = []
+
+    def create_recipe(self, recipe):
+        self.created.append(schema_recipe(recipe))
+        if self.create_error:
+            raise self.create_error
+        return f"recipe-{len(self.created)}"
+
+    def ensure_tag(self, name):
+        if self.tag_error:
+            raise self.tag_error
+        return {"name": name, "slug": name.casefold().replace(" ", "-")}
+
+    def add_tag(self, slug, tag):
+        if self.tag_error:
+            raise self.tag_error
+        self.tags.append((slug, tag["name"]))
+        return "tagged"
+
+    def get_recipe(self, slug):
+        return {"id": "recipe-id", "slug": slug, "name": "Fried Rice"}
+
+
+def _approved_fried_rice(root: Path) -> tuple[Path, str, str]:
+    fixture = write_ui_fixture(root)
+    output = Path(fixture["output"])
+    source = Path(fixture["source"])
+    digest = file_digest(source)
+    catalog = load_catalog(output, Path(fixture["source"]).parent)
+    view = next(item for item in catalog if item.candidate.name == "Fried Rice")
+    reviews = ReviewStore(output / "review_events.jsonl")
+    recipe = view.candidate.model_copy(deep=True)
+    recipe.ingredients[0] = "3 cups cooked rice"
+    saved = reviews.save_revision(
+        candidate_id=view.candidate_id, source_hash=digest, extraction_id=view.extraction_id,
+        expected_parent=0, operation_id="approved-test-edit",
+        recipe=recipe.model_dump(mode="json"), target_bindings=list(view.target_bindings),
+    )
+    reviews.approve_revision(
+        candidate_id=view.candidate_id, source_hash=digest, extraction_id=view.extraction_id,
+        revision=saved["revision"], operation_id="approved-test-consent", source_path=source,
+    )
+    return output, str(source.parent), view.candidate_id
+
+
+class UiImportServiceTests(unittest.TestCase):
+    def test_preview_freezes_only_selected_exact_approved_content(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output, source_root, candidate_id = _approved_fried_rice(Path(tmp))
+            service = ImportService(output, source_root=Path(source_root))
+
+            plan = service.preview([candidate_id], batch_tag="Weeknight")
+
+        self.assertEqual(len(plan["eligible"]), 1)
+        self.assertEqual(plan["eligible"][0]["candidate_id"], candidate_id)
+        self.assertEqual(plan["eligible"][0]["recipe"]["ingredients"][0], "3 cups cooked rice")
+        self.assertEqual(plan["batch_tag"], "Weeknight")
+
+    def test_preview_excludes_unapproved_selection_with_reason(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = write_ui_fixture(Path(tmp))
+            output = Path(fixture["output"])
+            source_root = Path(fixture["source"]).parent
+            views = load_catalog(output, source_root)
+            unapproved = next(item for item in views if item.revision == 0)
+
+            plan = ImportService(output, source_root=source_root).preview([unapproved.candidate_id])
+
+        self.assertEqual(plan["eligible"], [])
+        self.assertEqual(plan["excluded"][0]["candidate_id"], unapproved.candidate_id)
+        self.assertIn("approved", plan["excluded"][0]["reason"].lower())
+
+    def test_dispatch_uses_exact_edited_snapshot_and_does_not_import_siblings(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output, source_root, candidate_id = _approved_fried_rice(Path(tmp))
+            client = FakeMealie()
+            service = ImportService(output, source_root=Path(source_root), client=client)
+            plan = service.preview([candidate_id], batch_tag="Weeknight")
+
+            outcomes = service.dispatch(plan["plan_id"])
+
+        self.assertEqual(len(client.created), 1)
+        self.assertEqual(client.created[0]["recipeIngredient"][0], "3 cups cooked rice")
+        self.assertEqual(outcomes[0]["creation_status"], "created")
+        self.assertEqual(client.tags, [("recipe-1", "Weeknight")])
+
+    def test_repeated_dispatch_never_posts_a_confirmed_candidate_again(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output, source_root, candidate_id = _approved_fried_rice(Path(tmp))
+            client = FakeMealie()
+            service = ImportService(output, source_root=Path(source_root), client=client)
+            plan = service.preview([candidate_id])
+            first = service.dispatch(plan["plan_id"])
+            again = service.dispatch(plan["plan_id"])
+
+        self.assertEqual(len(client.created), 1)
+        self.assertEqual(first[0]["creation_status"], "created")
+        self.assertIn(again[0]["creation_status"], {"already_created", "protected"})
+
+    def test_create_timeout_is_uncertain_and_never_retried(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output, source_root, candidate_id = _approved_fried_rice(Path(tmp))
+            client = FakeMealie(create_error=TimeoutError("socket timed out"))
+            service = ImportService(output, source_root=Path(source_root), client=client)
+            plan = service.preview([candidate_id])
+            first = service.dispatch(plan["plan_id"])
+            second = service.dispatch(plan["plan_id"])
+
+        self.assertEqual(first[0]["creation_status"], "uncertain")
+        self.assertEqual(second[0]["creation_status"], "uncertain")
+        self.assertEqual(len(client.created), 1)
+
+    def test_server_5xx_is_uncertain_and_definite_rejection_can_be_retried(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output, source_root, candidate_id = _approved_fried_rice(Path(tmp))
+            client = FakeMealie(create_error=RuntimeError("Mealie HTTP 503: private body"))
+            service = ImportService(output, source_root=Path(source_root), client=client)
+            plan = service.preview([candidate_id])
+            first = service.dispatch(plan["plan_id"])
+            client.create_error = RuntimeError("Mealie HTTP 422: private recipe details")
+            rejected = service.dispatch(plan["plan_id"])
+
+        self.assertEqual(first[0]["creation_status"], "uncertain")
+        self.assertEqual(rejected[0]["creation_status"], "uncertain")
+        self.assertEqual(len(client.created), 1)
+
+    def test_definite_create_rejection_is_sanitized_and_retryable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output, source_root, candidate_id = _approved_fried_rice(Path(tmp))
+            client = FakeMealie(create_error=RuntimeError("Mealie HTTP 422: secret recipe payload"))
+            service = ImportService(output, source_root=Path(source_root), client=client)
+            plan = service.preview([candidate_id])
+            first = service.dispatch(plan["plan_id"])
+            client.create_error = None
+            second = service.dispatch(plan["plan_id"])
+
+        self.assertEqual(first[0]["creation_status"], "rejected")
+        self.assertNotIn("secret", str(first))
+        self.assertEqual(second[0]["creation_status"], "created")
+        self.assertEqual(len(client.created), 2)
+
+    def test_stale_approval_after_preflight_is_not_sent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output, source_root, candidate_id = _approved_fried_rice(Path(tmp))
+            client = FakeMealie()
+            service = ImportService(output, source_root=Path(source_root), client=client)
+            plan = service.preview([candidate_id])
+            catalog = load_catalog(output, Path(source_root))
+            view = next(item for item in catalog if item.candidate_id == candidate_id)
+            reviews = ReviewStore(output / "review_events.jsonl")
+            changed = view.candidate.model_copy(deep=True)
+            changed.instructions[0] = "Changed after preflight."
+            reviews.save_revision(
+                candidate_id=candidate_id, source_hash=view.source_hash,
+                extraction_id=view.extraction_id, expected_parent=view.revision,
+                operation_id="edit-after-preflight", recipe=changed.model_dump(mode="json"),
+                target_bindings=list(view.revision_target_bindings),
+            )
+
+            outcomes = service.dispatch(plan["plan_id"])
+
+        self.assertEqual(client.created, [])
+        self.assertEqual(outcomes[0]["creation_status"], "not_sent")
+
+    def test_two_service_instances_claim_candidate_once(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output, source_root, candidate_id = _approved_fried_rice(Path(tmp))
+            client = FakeMealie()
+            first_service = ImportService(output, source_root=Path(source_root), client=client)
+            second_service = ImportService(output, source_root=Path(source_root), client=client)
+            plan = first_service.preview([candidate_id])
+
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                results = list(pool.map(lambda service: service.dispatch(plan["plan_id"]),
+                                        (first_service, second_service)))
+
+        self.assertEqual(len(client.created), 1)
+        statuses = {result[0]["creation_status"] for result in results}
+        self.assertTrue(statuses <= {"created", "in_progress", "already_created", "protected", "uncertain"})
+
+    def test_two_processes_cannot_post_the_same_candidate(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output, source_root, candidate_id = _approved_fried_rice(Path(tmp))
+            plan = ImportService(output, source_root=Path(source_root)).preview([candidate_id])
+            calls = Path(tmp) / "post_calls.txt"
+            script = r'''
+import sys, time
+from pathlib import Path
+from ui_import_service import ImportService
+class Client:
+    def __init__(self, path): self.path = Path(path)
+    def create_recipe(self, recipe):
+        with self.path.open("a", encoding="utf-8") as handle:
+            handle.write(recipe.name + "\n")
+            handle.flush()
+        time.sleep(0.25)
+        return "same-recipe"
+    def ensure_tag(self, name): return {"name": name}
+    def add_tag(self, slug, tag): return "tagged"
+import json
+print(json.dumps(ImportService(Path(sys.argv[1]), source_root=Path(sys.argv[2]),
+              client=Client(sys.argv[3])).dispatch(sys.argv[4])))
+'''
+            args = [sys.executable, "-c", script, str(output), str(source_root),
+                    str(calls), plan["plan_id"]]
+            first = subprocess.Popen(args, cwd=Path.cwd(), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            second = subprocess.Popen(args, cwd=Path.cwd(), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            first_stdout, first_stderr = first.communicate(timeout=20)
+            second_stdout, second_stderr = second.communicate(timeout=20)
+            self.assertEqual(first.returncode, 0, first_stderr)
+            self.assertEqual(second.returncode, 0, second_stderr)
+            self.assertTrue(calls.exists(), (first_stdout, second_stdout))
+            self.assertEqual(len(calls.read_text(encoding="utf-8").splitlines()), 1,
+                             (first_stdout, second_stdout))
+
+    def test_tag_failure_is_repaired_without_recipe_creation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output, source_root, candidate_id = _approved_fried_rice(Path(tmp))
+            client = FakeMealie(tag_error=RuntimeError("tag update failed"))
+            service = ImportService(output, source_root=Path(source_root), client=client)
+            plan = service.preview([candidate_id], batch_tag="Weeknight")
+            first = service.dispatch(plan["plan_id"])
+            client.tag_error = None
+            repaired = service.repair_tag(candidate_id)
+            repaired_again = service.repair_tag(candidate_id)
+
+        self.assertEqual(first[0]["creation_status"], "created")
+        self.assertEqual(first[0]["tag_status"], "failed")
+        self.assertEqual(repaired["tag_status"], "tagged")
+        self.assertEqual(repaired_again["creation_status"], "already_tagged")
+        self.assertEqual(len(client.created), 1)
+
+    def test_failed_created_ledger_write_keeps_started_intent_protected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output, source_root, candidate_id = _approved_fried_rice(Path(tmp))
+            client = FakeMealie()
+            service = ImportService(output, source_root=Path(source_root), client=client)
+            plan = service.preview([candidate_id])
+            with patch("ui_import_service.StateStore.add", side_effect=OSError("ledger unavailable")):
+                outcome = service.dispatch(plan["plan_id"])
+            second = service.dispatch(plan["plan_id"])
+
+        self.assertEqual(outcome[0]["creation_status"], "uncertain")
+        self.assertEqual(second[0]["creation_status"], "uncertain")
+        self.assertEqual(len(client.created), 1)
+
+    def test_reconciliation_lookup_found_links_and_absence_does_not_release_retry(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output, source_root, candidate_id = _approved_fried_rice(Path(tmp))
+            state = __import__("import_recipes").StateStore(output / "import_state.jsonl")
+            state.add(candidate_id, "UNCERTAIN", "", "scan.pdf", "Fried Rice", identity=candidate_id)
+            client = FakeMealie()
+            client.get_recipe = lambda slug: None
+            service = ImportService(output, source_root=Path(source_root), client=client)
+
+            absent = service.reconcile_existing(candidate_id, "missing-slug")
+            client.get_recipe = lambda slug: {"id": "valid-id", "slug": slug, "name": "Fried Rice"}
+            found = service.reconcile_existing(candidate_id, "existing-slug")
+
+        self.assertEqual(absent["creation_status"], "not_proven_absent")
+        self.assertEqual(found["creation_status"], "linked_existing")
+        self.assertEqual(found["slug"], "existing-slug")
+
+    def test_cli_candidate_uses_shared_claim_and_preserves_legacy_complete_flow(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = write_ui_fixture(Path(tmp))
+            output = Path(fixture["output"])
+            source = Path(fixture["source"])
+            digest = file_digest(source)
+            view = next(item for item in load_catalog(output, source.parent)
+                        if item.candidate.name == "Fried Rice")
+            calls = []
+            service = ImportService(output)
+
+            first = service.dispatch_cli_candidate(
+                view.candidate_id, view.candidate, source, digest, view.extraction_id,
+                lambda recipe: calls.append(recipe.name) or "legacy-slug",
+            )
+            second = service.dispatch_cli_candidate(
+                view.candidate_id, view.candidate, source, digest, view.extraction_id,
+                lambda recipe: calls.append(recipe.name) or "duplicate-slug",
+            )
+
+        self.assertEqual(first["status"], "created")
+        self.assertEqual(second["status"], "already_done")
+        self.assertEqual(calls, ["Fried Rice"])
+
+    def test_cli_candidate_requires_exact_modern_approval_payload(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output, source_root, candidate_id = _approved_fried_rice(Path(tmp))
+            view = next(item for item in load_catalog(output, Path(source_root))
+                        if item.candidate_id == candidate_id)
+            changed = view.candidate.model_copy(deep=True)
+            changed.ingredients[0] = "unapproved change"
+            calls = []
+
+            outcome = ImportService(output).dispatch_cli_candidate(
+                candidate_id, changed, view.source_path, view.source_hash, view.extraction_id,
+                lambda recipe: calls.append(recipe.name) or "must-not-create",
+            )
+
+        self.assertEqual(outcome["status"], "not_sent")
+        self.assertEqual(calls, [])
+
+    def test_cli_candidate_imports_matching_modern_approved_revision(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output, source_root, candidate_id = _approved_fried_rice(Path(tmp))
+            view = next(item for item in load_catalog(output, Path(source_root))
+                        if item.candidate_id == candidate_id)
+
+            outcome = ImportService(output).dispatch_cli_candidate(
+                candidate_id, view.candidate, view.source_path, view.source_hash, view.extraction_id,
+                lambda recipe: "approved-slug",
+            )
+
+        self.assertEqual(outcome["status"], "created")
+        self.assertEqual(outcome["slug"], "approved-slug")
+
+    def test_malformed_service_ledger_blocks_preview_without_appending(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = write_ui_fixture(Path(tmp))
+            output = Path(fixture["output"])
+            event_path = output / "ui_import_events.jsonl"
+            event_path.write_text('{"event":"truncated"', encoding="utf-8")
+            before = event_path.read_bytes()
+
+            with self.assertRaisesRegex(RuntimeError, "history is malformed"):
+                ImportService(output, Path(fixture["source"]).parent).preview(["missing"])
+            self.assertEqual(event_path.read_bytes(), before)
+
+
+if __name__ == "__main__":
+    unittest.main()

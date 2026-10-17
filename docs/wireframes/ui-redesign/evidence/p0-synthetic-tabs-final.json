@@ -1,0 +1,195 @@
+{
+  "url": "http://127.0.0.1:8925/review",
+  "action": "tabs",
+  "coldStartupMs": 1840,
+  "sourceGate": {
+    "usable": true,
+    "skeletons": 0,
+    "imageWidth": 1460,
+    "fieldCount": 2,
+    "titleReady": true
+  },
+  "samples": [
+    {
+      "action": "Ingredients->Instructions",
+      "latencyMs": 232,
+      "point": {
+        "x": 803.5,
+        "y": 440.375,
+        "label": "Instructions",
+        "hit": "Instructions",
+        "hitInside": true
+      },
+      "countersBefore": {
+        "counts": {
+          "full_page_executions": 1,
+          "fragment_executions": 1,
+          "catalog_loads": 1,
+          "source_hashes": 1,
+          "ledger_reads": 4,
+          "preview_renders": 1,
+          "durable_writes": 0
+        },
+        "raw": "{\n\"full_page_executions\":1\n\"fragment_executions\":1\n\"catalog_loads\":1\n\"source_hashes\":1\n\"ledger_reads\":4\n\"preview_renders\":1\n\"durable_writes\":0\n\"ledger_read_traces\":[\n0:[\n0:\"script_runner.py:code_to_exec:924\"\n1:\"streamlit_app.py:<module>:45\"\n2:\"page.py:run:511\"\n3:\"review.py:<module>:1119\"\n4:\"review.py:main:321\"\n5:\"common.py:catalog:38\"\n6:\"ui_data.py:load_catalog:104\"\n7:\"review_store.py:__init__:156\"\n8:\"review_store.py:_reload:169\"\n]\n1:[\n0:\"exec_code.py:exec_func_with_error_handling:136\"\n1:\"script_runner.py:code_to_exec:924\"\n2:\"streamlit_app.py:<module>:45\"\n3:\"page.py:run:511\"\n4:\"review.py:<module>:1119\"\n5:\"review.py:main:321\"\n6:\"common.py:catalog:38\"\n7:\"ui_data.py:load_catalog:105\"\n8:\"import_recipes.py:__init__:127\"\n]\n2:[\n0:\"exec_code.py:exec_func_with_error_handling:136\"\n1:\"script_runner.py:code_to_exec:924\"\n2:\"streamlit_app.py:<module>:45\"\n3:\"page.py:run:511\"\n4:\"review.py:<module>:1119\"\n5:\"review.py:main:321\"\n6:\"common.py:catalog:38\"\n7:\"ui_data.py:load_catalog:107\"\n8:\"import_protection.py:protected_candidate_ids:25\"\n]\n3:[\n0:\"exec_code.py:exec_func_with_error_handling:136\"\n1:\"script_runner.py:code_to_exec:924\"\n2:\"streamlit_app.py:<module>:45\"\n3:\"page.py:run:511\"\n4:\"review.py:<module>:1119\"\n5:\"review.py:main:321\"\n6:\"common.py:catalog:38\"\n7:\"ui_data.py:load_catalog:112\"\n8:\"draft_store.py:all_latest:101\"\n]\n]\n}"
+      },
+      "countersAfter": {
+        "counts": {
+          "full_page_executions": 1,
+          "fragment_executions": 2,
+          "catalog_loads": 1,
+          "source_hashes": 1,
+          "ledger_reads": 4,
+          "preview_renders": 1,
+          "durable_writes": 0
+        },
+        "raw": "{\n\"full_page_executions\":1\n\"fragment_executions\":2\n\"catalog_loads\":1\n\"source_hashes\":1\n\"ledger_reads\":4\n\"preview_renders\":1\n\"durable_writes\":0\n\"ledger_read_traces\":[\n0:[\n0:\"script_runner.py:code_to_exec:924\"\n1:\"streamlit_app.py:<module>:45\"\n2:\"page.py:run:511\"\n3:\"review.py:<module>:1119\"\n4:\"review.py:main:321\"\n5:\"common.py:catalog:38\"\n6:\"ui_data.py:load_catalog:104\"\n7:\"review_store.py:__init__:156\"\n8:\"review_store.py:_reload:169\"\n]\n1:[\n0:\"exec_code.py:exec_func_with_error_handling:136\"\n1:\"script_runner.py:code_to_exec:924\"\n2:\"streamlit_app.py:<module>:45\"\n3:\"page.py:run:511\"\n4:\"review.py:<module>:1119\"\n5:\"review.py:main:321\"\n6:\"common.py:catalog:38\"\n7:\"ui_data.py:load_catalog:105\"\n8:\"import_recipes.py:__init__:127\"\n]\n2:[\n0:\"exec_code.py:exec_func_with_error_handling:136\"\n1:\"script_runner.py:code_to_exec:924\"\n2:\"streamlit_app.py:<module>:45\"\n3:\"page.py:run:511\"\n4:\"review.py:<module>:1119\"\n5:\"review.py:main:321\"\n6:\"common.py:catalog:38\"\n7:\"ui_data.py:load_catalog:107\"\n8:\"import_protection.py:protected_candidate_ids:25\"\n]\n3:[\n0:\"exec_code.py:exec_func_with_error_handling:136\"\n1:\"script_runner.py:code_to_exec:924\"\n2:\"streamlit_app.py:<module>:45\"\n3:\"page.py:run:511\"\n4:\"review.py:<module>:1119\"\n5:\"review.py:main:321\"\n6:\"common.py:catalog:38\"\n7:\"ui_data.py:load_catalog:112\"\n8:\"draft_store.py:all_latest:101\"\n]\n]\n}"
+      }
+    },
+    {
+      "action": "Instructions->Ingredients",
+      "latencyMs": 195,
+      "point": {
+        "x": 717.5,
+        "y": 440.375,
+        "label": "Ingredients",
+        "hit": "Ingredients",
+        "hitInside": true
+      },
+      "countersBefore": {
+        "counts": {
+          "full_page_executions": 1,
+          "fragment_executions": 2,
+          "catalog_loads": 1,
+          "source_hashes": 1,
+          "ledger_reads": 4,
+          "preview_renders": 1,
+          "durable_writes": 0
+        },
+        "raw": "{\n\"full_page_executions\":1\n\"fragment_executions\":2\n\"catalog_loads\":1\n\"source_hashes\":1\n\"ledger_reads\":4\n\"preview_renders\":1\n\"durable_writes\":0\n\"ledger_read_traces\":[\n0:[\n0:\"script_runner.py:code_to_exec:924\"\n1:\"streamlit_app.py:<module>:45\"\n2:\"page.py:run:511\"\n3:\"review.py:<module>:1119\"\n4:\"review.py:main:321\"\n5:\"common.py:catalog:38\"\n6:\"ui_data.py:load_catalog:104\"\n7:\"review_store.py:__init__:156\"\n8:\"review_store.py:_reload:169\"\n]\n1:[\n0:\"exec_code.py:exec_func_with_error_handling:136\"\n1:\"script_runner.py:code_to_exec:924\"\n2:\"streamlit_app.py:<module>:45\"\n3:\"page.py:run:511\"\n4:\"review.py:<module>:1119\"\n5:\"review.py:main:321\"\n6:\"common.py:catalog:38\"\n7:\"ui_data.py:load_catalog:105\"\n8:\"import_recipes.py:__init__:127\"\n]\n2:[\n0:\"exec_code.py:exec_func_with_error_handling:136\"\n1:\"script_runner.py:code_to_exec:924\"\n2:\"streamlit_app.py:<module>:45\"\n3:\"page.py:run:511\"\n4:\"review.py:<module>:1119\"\n5:\"review.py:main:321\"\n6:\"common.py:catalog:38\"\n7:\"ui_data.py:load_catalog:107\"\n8:\"import_protection.py:protected_candidate_ids:25\"\n]\n3:[\n0:\"exec_code.py:exec_func_with_error_handling:136\"\n1:\"script_runner.py:code_to_exec:924\"\n2:\"streamlit_app.py:<module>:45\"\n3:\"page.py:run:511\"\n4:\"review.py:<module>:1119\"\n5:\"review.py:main:321\"\n6:\"common.py:catalog:38\"\n7:\"ui_data.py:load_catalog:112\"\n8:\"draft_store.py:all_latest:101\"\n]\n]\n}"
+      },
+      "countersAfter": {
+        "counts": {
+          "full_page_executions": 1,
+          "fragment_executions": 3,
+          "catalog_loads": 1,
+          "source_hashes": 1,
+          "ledger_reads": 4,
+          "preview_renders": 1,
+          "durable_writes": 0
+        },
+        "raw": "{\n\"full_page_executions\":1\n\"fragment_executions\":3\n\"catalog_loads\":1\n\"source_hashes\":1\n\"ledger_reads\":4\n\"preview_renders\":1\n\"durable_writes\":0\n\"ledger_read_traces\":[\n0:[\n0:\"script_runner.py:code_to_exec:924\"\n1:\"streamlit_app.py:<module>:45\"\n2:\"page.py:run:511\"\n3:\"review.py:<module>:1119\"\n4:\"review.py:main:321\"\n5:\"common.py:catalog:38\"\n6:\"ui_data.py:load_catalog:104\"\n7:\"review_store.py:__init__:156\"\n8:\"review_store.py:_reload:169\"\n]\n1:[\n0:\"exec_code.py:exec_func_with_error_handling:136\"\n1:\"script_runner.py:code_to_exec:924\"\n2:\"streamlit_app.py:<module>:45\"\n3:\"page.py:run:511\"\n4:\"review.py:<module>:1119\"\n5:\"review.py:main:321\"\n6:\"common.py:catalog:38\"\n7:\"ui_data.py:load_catalog:105\"\n8:\"import_recipes.py:__init__:127\"\n]\n2:[\n0:\"exec_code.py:exec_func_with_error_handling:136\"\n1:\"script_runner.py:code_to_exec:924\"\n2:\"streamlit_app.py:<module>:45\"\n3:\"page.py:run:511\"\n4:\"review.py:<module>:1119\"\n5:\"review.py:main:321\"\n6:\"common.py:catalog:38\"\n7:\"ui_data.py:load_catalog:107\"\n8:\"import_protection.py:protected_candidate_ids:25\"\n]\n3:[\n0:\"exec_code.py:exec_func_with_error_handling:136\"\n1:\"script_runner.py:code_to_exec:924\"\n2:\"streamlit_app.py:<module>:45\"\n3:\"page.py:run:511\"\n4:\"review.py:<module>:1119\"\n5:\"review.py:main:321\"\n6:\"common.py:catalog:38\"\n7:\"ui_data.py:load_catalog:112\"\n8:\"draft_store.py:all_latest:101\"\n]\n]\n}"
+      }
+    },
+    {
+      "action": "Ingredients->Instructions",
+      "latencyMs": 191,
+      "point": {
+        "x": 803.5,
+        "y": 440.375,
+        "label": "Instructions",
+        "hit": "Instructions",
+        "hitInside": true
+      },
+      "countersBefore": {
+        "counts": {
+          "full_page_executions": 1,
+          "fragment_executions": 3,
+          "catalog_loads": 1,
+          "source_hashes": 1,
+          "ledger_reads": 4,
+          "preview_renders": 1,
+          "durable_writes": 0
+        },
+        "raw": "{\n\"full_page_executions\":1\n\"fragment_executions\":3\n\"catalog_loads\":1\n\"source_hashes\":1\n\"ledger_reads\":4\n\"preview_renders\":1\n\"durable_writes\":0\n\"ledger_read_traces\":[\n0:[\n0:\"script_runner.py:code_to_exec:924\"\n1:\"streamlit_app.py:<module>:45\"\n2:\"page.py:run:511\"\n3:\"review.py:<module>:1119\"\n4:\"review.py:main:321\"\n5:\"common.py:catalog:38\"\n6:\"ui_data.py:load_catalog:104\"\n7:\"review_store.py:__init__:156\"\n8:\"review_store.py:_reload:169\"\n]\n1:[\n0:\"exec_code.py:exec_func_with_error_handling:136\"\n1:\"script_runner.py:code_to_exec:924\"\n2:\"streamlit_app.py:<module>:45\"\n3:\"page.py:run:511\"\n4:\"review.py:<module>:1119\"\n5:\"review.py:main:321\"\n6:\"common.py:catalog:38\"\n7:\"ui_data.py:load_catalog:105\"\n8:\"import_recipes.py:__init__:127\"\n]\n2:[\n0:\"exec_code.py:exec_func_with_error_handling:136\"\n1:\"script_runner.py:code_to_exec:924\"\n2:\"streamlit_app.py:<module>:45\"\n3:\"page.py:run:511\"\n4:\"review.py:<module>:1119\"\n5:\"review.py:main:321\"\n6:\"common.py:catalog:38\"\n7:\"ui_data.py:load_catalog:107\"\n8:\"import_protection.py:protected_candidate_ids:25\"\n]\n3:[\n0:\"exec_code.py:exec_func_with_error_handling:136\"\n1:\"script_runner.py:code_to_exec:924\"\n2:\"streamlit_app.py:<module>:45\"\n3:\"page.py:run:511\"\n4:\"review.py:<module>:1119\"\n5:\"review.py:main:321\"\n6:\"common.py:catalog:38\"\n7:\"ui_data.py:load_catalog:112\"\n8:\"draft_store.py:all_latest:101\"\n]\n]\n}"
+      },
+      "countersAfter": {
+        "counts": {
+          "full_page_executions": 1,
+          "fragment_executions": 4,
+          "catalog_loads": 1,
+          "source_hashes": 1,
+          "ledger_reads": 4,
+          "preview_renders": 1,
+          "durable_writes": 0
+        },
+        "raw": "{\n\"full_page_executions\":1\n\"fragment_executions\":4\n\"catalog_loads\":1\n\"source_hashes\":1\n\"ledger_reads\":4\n\"preview_renders\":1\n\"durable_writes\":0\n\"ledger_read_traces\":[\n0:[\n0:\"script_runner.py:code_to_exec:924\"\n1:\"streamlit_app.py:<module>:45\"\n2:\"page.py:run:511\"\n3:\"review.py:<module>:1119\"\n4:\"review.py:main:321\"\n5:\"common.py:catalog:38\"\n6:\"ui_data.py:load_catalog:104\"\n7:\"review_store.py:__init__:156\"\n8:\"review_store.py:_reload:169\"\n]\n1:[\n0:\"exec_code.py:exec_func_with_error_handling:136\"\n1:\"script_runner.py:code_to_exec:924\"\n2:\"streamlit_app.py:<module>:45\"\n3:\"page.py:run:511\"\n4:\"review.py:<module>:1119\"\n5:\"review.py:main:321\"\n6:\"common.py:catalog:38\"\n7:\"ui_data.py:load_catalog:105\"\n8:\"import_recipes.py:__init__:127\"\n]\n2:[\n0:\"exec_code.py:exec_func_with_error_handling:136\"\n1:\"script_runner.py:code_to_exec:924\"\n2:\"streamlit_app.py:<module>:45\"\n3:\"page.py:run:511\"\n4:\"review.py:<module>:1119\"\n5:\"review.py:main:321\"\n6:\"common.py:catalog:38\"\n7:\"ui_data.py:load_catalog:107\"\n8:\"import_protection.py:protected_candidate_ids:25\"\n]\n3:[\n0:\"exec_code.py:exec_func_with_error_handling:136\"\n1:\"script_runner.py:code_to_exec:924\"\n2:\"streamlit_app.py:<module>:45\"\n3:\"page.py:run:511\"\n4:\"review.py:<module>:1119\"\n5:\"review.py:main:321\"\n6:\"common.py:catalog:38\"\n7:\"ui_data.py:load_catalog:112\"\n8:\"draft_store.py:all_latest:101\"\n]\n]\n}"
+      }
+    },
+    {
+      "action": "Instructions->Ingredients",
+      "latencyMs": 268,
+      "point": {
+        "x": 717.5,
+        "y": 440.375,
+        "label": "Ingredients",
+        "hit": "Ingredients",
+        "hitInside": true
+      },
+      "countersBefore": {
+        "counts": {
+          "full_page_executions": 1,
+          "fragment_executions": 4,
+          "catalog_loads": 1,
+          "source_hashes": 1,
+          "ledger_reads": 4,
+          "preview_renders": 1,
+          "durable_writes": 0
+        },
+        "raw": "{\n\"full_page_executions\":1\n\"fragment_executions\":4\n\"catalog_loads\":1\n\"source_hashes\":1\n\"ledger_reads\":4\n\"preview_renders\":1\n\"durable_writes\":0\n\"ledger_read_traces\":[\n0:[\n0:\"script_runner.py:code_to_exec:924\"\n1:\"streamlit_app.py:<module>:45\"\n2:\"page.py:run:511\"\n3:\"review.py:<module>:1119\"\n4:\"review.py:main:321\"\n5:\"common.py:catalog:38\"\n6:\"ui_data.py:load_catalog:104\"\n7:\"review_store.py:__init__:156\"\n8:\"review_store.py:_reload:169\"\n]\n1:[\n0:\"exec_code.py:exec_func_with_error_handling:136\"\n1:\"script_runner.py:code_to_exec:924\"\n2:\"streamlit_app.py:<module>:45\"\n3:\"page.py:run:511\"\n4:\"review.py:<module>:1119\"\n5:\"review.py:main:321\"\n6:\"common.py:catalog:38\"\n7:\"ui_data.py:load_catalog:105\"\n8:\"import_recipes.py:__init__:127\"\n]\n2:[\n0:\"exec_code.py:exec_func_with_error_handling:136\"\n1:\"script_runner.py:code_to_exec:924\"\n2:\"streamlit_app.py:<module>:45\"\n3:\"page.py:run:511\"\n4:\"review.py:<module>:1119\"\n5:\"review.py:main:321\"\n6:\"common.py:catalog:38\"\n7:\"ui_data.py:load_catalog:107\"\n8:\"import_protection.py:protected_candidate_ids:25\"\n]\n3:[\n0:\"exec_code.py:exec_func_with_error_handling:136\"\n1:\"script_runner.py:code_to_exec:924\"\n2:\"streamlit_app.py:<module>:45\"\n3:\"page.py:run:511\"\n4:\"review.py:<module>:1119\"\n5:\"review.py:main:321\"\n6:\"common.py:catalog:38\"\n7:\"ui_data.py:load_catalog:112\"\n8:\"draft_store.py:all_latest:101\"\n]\n]\n}"
+      },
+      "countersAfter": {
+        "counts": {
+          "full_page_executions": 1,
+          "fragment_executions": 5,
+          "catalog_loads": 1,
+          "source_hashes": 1,
+          "ledger_reads": 4,
+          "preview_renders": 1,
+          "durable_writes": 0
+        },
+        "raw": "{\n\"full_page_executions\":1\n\"fragment_executions\":5\n\"catalog_loads\":1\n\"source_hashes\":1\n\"ledger_reads\":4\n\"preview_renders\":1\n\"durable_writes\":0\n\"ledger_read_traces\":[\n0:[\n0:\"script_runner.py:code_to_exec:924\"\n1:\"streamlit_app.py:<module>:45\"\n2:\"page.py:run:511\"\n3:\"review.py:<module>:1119\"\n4:\"review.py:main:321\"\n5:\"common.py:catalog:38\"\n6:\"ui_data.py:load_catalog:104\"\n7:\"review_store.py:__init__:156\"\n8:\"review_store.py:_reload:169\"\n]\n1:[\n0:\"exec_code.py:exec_func_with_error_handling:136\"\n1:\"script_runner.py:code_to_exec:924\"\n2:\"streamlit_app.py:<module>:45\"\n3:\"page.py:run:511\"\n4:\"review.py:<module>:1119\"\n5:\"review.py:main:321\"\n6:\"common.py:catalog:38\"\n7:\"ui_data.py:load_catalog:105\"\n8:\"import_recipes.py:__init__:127\"\n]\n2:[\n0:\"exec_code.py:exec_func_with_error_handling:136\"\n1:\"script_runner.py:code_to_exec:924\"\n2:\"streamlit_app.py:<module>:45\"\n3:\"page.py:run:511\"\n4:\"review.py:<module>:1119\"\n5:\"review.py:main:321\"\n6:\"common.py:catalog:38\"\n7:\"ui_data.py:load_catalog:107\"\n8:\"import_protection.py:protected_candidate_ids:25\"\n]\n3:[\n0:\"exec_code.py:exec_func_with_error_handling:136\"\n1:\"script_runner.py:code_to_exec:924\"\n2:\"streamlit_app.py:<module>:45\"\n3:\"page.py:run:511\"\n4:\"review.py:<module>:1119\"\n5:\"review.py:main:321\"\n6:\"common.py:catalog:38\"\n7:\"ui_data.py:load_catalog:112\"\n8:\"draft_store.py:all_latest:101\"\n]\n]\n}"
+      }
+    },
+    {
+      "action": "Ingredients->Instructions",
+      "latencyMs": 204,
+      "point": {
+        "x": 803.5,
+        "y": 440.375,
+        "label": "Instructions",
+        "hit": "Instructions",
+        "hitInside": true
+      },
+      "countersBefore": {
+        "counts": {
+          "full_page_executions": 1,
+          "fragment_executions": 5,
+          "catalog_loads": 1,
+          "source_hashes": 1,
+          "ledger_reads": 4,
+          "preview_renders": 1,
+          "durable_writes": 0
+        },
+        "raw": "{\n\"full_page_executions\":1\n\"fragment_executions\":5\n\"catalog_loads\":1\n\"source_hashes\":1\n\"ledger_reads\":4\n\"preview_renders\":1\n\"durable_writes\":0\n\"ledger_read_traces\":[\n0:[\n0:\"script_runner.py:code_to_exec:924\"\n1:\"streamlit_app.py:<module>:45\"\n2:\"page.py:run:511\"\n3:\"review.py:<module>:1119\"\n4:\"review.py:main:321\"\n5:\"common.py:catalog:38\"\n6:\"ui_data.py:load_catalog:104\"\n7:\"review_store.py:__init__:156\"\n8:\"review_store.py:_reload:169\"\n]\n1:[\n0:\"exec_code.py:exec_func_with_error_handling:136\"\n1:\"script_runner.py:code_to_exec:924\"\n2:\"streamlit_app.py:<module>:45\"\n3:\"page.py:run:511\"\n4:\"review.py:<module>:1119\"\n5:\"review.py:main:321\"\n6:\"common.py:catalog:38\"\n7:\"ui_data.py:load_catalog:105\"\n8:\"import_recipes.py:__init__:127\"\n]\n2:[\n0:\"exec_code.py:exec_func_with_error_handling:136\"\n1:\"script_runner.py:code_to_exec:924\"\n2:\"streamlit_app.py:<module>:45\"\n3:\"page.py:run:511\"\n4:\"review.py:<module>:1119\"\n5:\"review.py:main:321\"\n6:\"common.py:catalog:38\"\n7:\"ui_data.py:load_catalog:107\"\n8:\"import_protection.py:protected_candidate_ids:25\"\n]\n3:[\n0:\"exec_code.py:exec_func_with_error_handling:136\"\n1:\"script_runner.py:code_to_exec:924\"\n2:\"streamlit_app.py:<module>:45\"\n3:\"page.py:run:511\"\n4:\"review.py:<module>:1119\"\n5:\"review.py:main:321\"\n6:\"common.py:catalog:38\"\n7:\"ui_data.py:load_catalog:112\"\n8:\"draft_store.py:all_latest:101\"\n]\n]\n}"
+      },
+      "countersAfter": {
+        "counts": {
+          "full_page_executions": 1,
+          "fragment_executions": 6,
+          "catalog_loads": 1,
+          "source_hashes": 1,
+          "ledger_reads": 4,
+          "preview_renders": 1,
+          "durable_writes": 0
+        },
+        "raw": "{\n\"full_page_executions\":1\n\"fragment_executions\":6\n\"catalog_loads\":1\n\"source_hashes\":1\n\"ledger_reads\":4\n\"preview_renders\":1\n\"durable_writes\":0\n\"ledger_read_traces\":[\n0:[\n0:\"script_runner.py:code_to_exec:924\"\n1:\"streamlit_app.py:<module>:45\"\n2:\"page.py:run:511\"\n3:\"review.py:<module>:1119\"\n4:\"review.py:main:321\"\n5:\"common.py:catalog:38\"\n6:\"ui_data.py:load_catalog:104\"\n7:\"review_store.py:__init__:156\"\n8:\"review_store.py:_reload:169\"\n]\n1:[\n0:\"exec_code.py:exec_func_with_error_handling:136\"\n1:\"script_runner.py:code_to_exec:924\"\n2:\"streamlit_app.py:<module>:45\"\n3:\"page.py:run:511\"\n4:\"review.py:<module>:1119\"\n5:\"review.py:main:321\"\n6:\"common.py:catalog:38\"\n7:\"ui_data.py:load_catalog:105\"\n8:\"import_recipes.py:__init__:127\"\n]\n2:[\n0:\"exec_code.py:exec_func_with_error_handling:136\"\n1:\"script_runner.py:code_to_exec:924\"\n2:\"streamlit_app.py:<module>:45\"\n3:\"page.py:run:511\"\n4:\"review.py:<module>:1119\"\n5:\"review.py:main:321\"\n6:\"common.py:catalog:38\"\n7:\"ui_data.py:load_catalog:107\"\n8:\"import_protection.py:protected_candidate_ids:25\"\n]\n3:[\n0:\"exec_code.py:exec_func_with_error_handling:136\"\n1:\"script_runner.py:code_to_exec:924\"\n2:\"streamlit_app.py:<module>:45\"\n3:\"page.py:run:511\"\n4:\"review.py:<module>:1119\"\n5:\"review.py:main:321\"\n6:\"common.py:catalog:38\"\n7:\"ui_data.py:load_catalog:112\"\n8:\"draft_store.py:all_latest:101\"\n]\n]\n}"
+      }
+    }
+  ],
+  "summary": {
+    "count": 5,
+    "medianMs": 204,
+    "p95Ms": 268,
+    "worstMs": 268
+  }
+}

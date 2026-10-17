@@ -3,17 +3,35 @@ from __future__ import annotations
 
 from copy import deepcopy
 from typing import Any, Iterable
+from urllib.parse import quote
 
 import requests
 
 from recipe_quality import RecipeCandidate, schema_recipe
+from runtime_safety import require_live_services
 
 
 class MealieClient:
     def __init__(self, base_url: str, token: str, session: Any = None):
+        if session is None:
+            require_live_services()
         self.base_url = base_url.rstrip("/")
         self.session = session or requests.Session()
         self.headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+
+    def get_recipe(self, slug: str) -> dict | None:
+        """Read an explicitly selected slug; a 404 is not global absence proof."""
+        if not slug.strip():
+            raise ValueError("A recipe slug is required")
+        response = self.session.get(self.base_url + "/api/recipes/" + quote(slug, safe=""),
+                                    headers=self.headers, timeout=(10, 30))
+        if response.status_code == 404:
+            return None
+        response.raise_for_status()
+        recipe = response.json()
+        if not isinstance(recipe, dict) or not recipe.get("id") or recipe.get("slug") != slug:
+            raise ValueError("Mealie lookup did not return the selected recipe identity")
+        return recipe
 
     def create_recipe(self, recipe: RecipeCandidate) -> str:
         response = self.session.post(
@@ -58,7 +76,10 @@ class MealieClient:
             if isinstance(tag, dict):
                 return tag
         if created.status_code == 409:
-            return self.ensure_tag(name)
+            existing = self._find_tag(name)
+            if existing is not None:
+                return existing
+            raise RuntimeError("Mealie tag creation conflicted; retry tag repair after checking the tag list")
         raise RuntimeError(f"Mealie tag creation HTTP {created.status_code}: {created.text[:400]}")
 
     def add_tag(self, slug: str, tag: dict) -> str:

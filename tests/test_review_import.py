@@ -11,6 +11,44 @@ from review_store import ReviewStore
 
 
 class ReviewImportTests(unittest.TestCase):
+    def test_forced_renamed_retry_is_held_when_same_source_has_an_imported_sibling(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "multi-recipe.jpg"
+            source.write_bytes(b"synthetic multi-recipe source")
+            digest = __import__("hashlib").sha256(source.read_bytes()).hexdigest()
+            cache = root / "extracted"
+            cache.mkdir()
+            state = StateStore(root / "import_state.jsonl")
+            reviews = ReviewStore(root / "review_events.jsonl", state_path=state.path)
+            imported_sibling = RecipeCandidate(
+                name="Imported Dish", ingredients=["1 cup rice"], instructions=["Cook rice."],
+            )
+            unresolved_sibling = RecipeCandidate(
+                name="Second Dish", ingredients=["2 cups beans"], instructions=[],
+            )
+            renamed_retry = RecipeCandidate(
+                name="Renamed Second Dish", ingredients=["2 cups beans"], instructions=["Simmer."],
+            )
+            config = {"api_key": "", "mealie_url": "http://mealie",
+                      "mealie_token": "test-token", "model": "primary"}
+            posts = []
+
+            with patch("import_recipes.extract", side_effect=[
+                ExtractionBatch(recipes=[imported_sibling, unresolved_sibling]),
+                ExtractionBatch(recipes=[renamed_retry, imported_sibling]),
+            ]), patch("import_recipes.import_mealie",
+                      side_effect=lambda recipe, *_: posts.append(recipe.name) or "created-slug"):
+                first = process_file(source, digest, config, None, state, cache, False,
+                                     review_store=reviews)
+                second = process_file(source, digest, config, None, state, cache, False,
+                                      force_extract=True, review_store=reviews)
+
+        self.assertEqual(posts, ["Imported Dish"])
+        self.assertEqual([row["status"] for row in first], ["IMPORTED", "INCOMPLETE"])
+        self.assertEqual([row["status"] for row in second], ["NEEDS_REVIEW", "ALREADY_DONE"])
+        self.assertEqual(second[0]["title"], "Renamed Second Dish")
+
     def test_approved_ocr_candidate_can_enter_existing_import_flow(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

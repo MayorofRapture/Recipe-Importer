@@ -3,3 +3,11 @@
 output/
 __pycache__/
 .superpowers/
+.test-tmp/
+.tmp/
+.tmp-r1-authority/
+.tmp-r3/
+.tmp-r5/
+.tmp-test-work/
+.tmp-usage-review/
+.playwright-cli/
