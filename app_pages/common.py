@@ -100,8 +100,18 @@ def buffer_for(view: RecipeView) -> dict[str, Any]:
     return existing
 
 
+def structured_widget_key(view: RecipeView, widget_prefix: str, row_id: str) -> str:
+    """Give each saved revision fresh widget identity without changing target row IDs."""
+    return f"{widget_prefix}:{view.candidate_id}:r{view.revision}:{row_id}"
+
+
 def sync_buffer(view: RecipeView, buffer: dict[str, Any]) -> None:
     """Capture widget values before rendering a mode switch or action."""
+    suggestion_edits = buffer.setdefault("_suggestion_edits", {})
+    for suggestion in view.candidate.suggestions:
+        key = f"suggestion_edit:{view.candidate_id}:{suggestion.suggestion_id}"
+        if key in st.session_state:
+            suggestion_edits[suggestion.suggestion_id] = st.session_state[key]
     for name in ("name", "yield_text", "description"):
         key = f"recipe_{name}:{view.candidate_id}"
         if key in st.session_state:
@@ -122,11 +132,17 @@ def sync_buffer(view: RecipeView, buffer: dict[str, Any]) -> None:
     ):
         values = list(buffer.get(values_key, []))
         row_ids = list(buffer.get(ids_key, []))
+        changed = False
         for index, row_id in enumerate(row_ids[:len(values)]):
-            key = f"{widget_prefix}:{view.candidate_id}:{row_id}"
+            key = structured_widget_key(view, widget_prefix, row_id)
             if key in st.session_state:
-                values[index] = st.session_state[key]
+                value = st.session_state[key]
+                changed = changed or value != values[index]
+                values[index] = value
         buffer[values_key] = values
+        if changed:
+            separator = "\n" if field == "ingredients" else "\n\n"
+            buffer[f"raw_{field}"] = separator.join(str(item) for item in values if str(item).strip())
 
 
 def switch_buffer_mode(buffer: dict[str, Any], mode: str) -> None:
@@ -285,9 +301,8 @@ def refresh_buffer_after_decision(candidate_id: str) -> None:
         getattr(view, "revision_target_bindings", ()))
     buffer["_revision"] = view.revision
     buffer["_saved_signature"] = _buffer_signature(view, buffer)
-    for row_id in (*buffer["ingredient_ids"], *buffer["instruction_ids"]):
-        st.session_state.pop(f"structured_i:{candidate_id}:{row_id}", None)
-        st.session_state.pop(f"structured_s:{candidate_id}:{row_id}", None)
+    # Structured row widget keys are revision-scoped. The new projected
+    # revision therefore cannot rehydrate a prior browser-side widget value.
     st.session_state.pop(f"mode:{candidate_id}", None)
     save_resume_pointer(view, buffer)
 

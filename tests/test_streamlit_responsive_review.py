@@ -73,11 +73,11 @@ class StreamlitResponsiveReviewTests(unittest.TestCase):
                 "RECIPE_IMPORTER_SOURCE_DIR": str(Path(tmp, "sources")),
             }, clear=False):
                 app = AppTest.from_file(str(APP_PATH)).run(timeout=10)
-                editor_mode = next(item for item in app.selectbox if item.label == "Editing")
-                editor_mode.set_value("Bulk edit ingredients").run(timeout=10)
+                candidate_id = app.session_state["review_selection"]
+                app.session_state[f"recipe_sections:{candidate_id}"] = "Ingredients"
+                next(item for item in app.button if item.label == "Bulk edit ingredients").click().run(timeout=10)
                 bulk = next(item for item in app.text_area if item.label == "Bulk ingredients")
                 bulk.set_value("1 cup rice\n1 egg").run(timeout=10)
-                candidate_id = app.session_state["review_selection"]
                 buffer = app.session_state["review_buffers"][candidate_id]
                 self.assertEqual(buffer["structured_ingredients"], ["2 cups rice", "1 egg"])
                 next(item for item in app.button if item.label == "Apply ingredients").click().run(timeout=10)
@@ -94,13 +94,15 @@ class StreamlitResponsiveReviewTests(unittest.TestCase):
             env.start()
             self.addCleanup(env.stop)
             app = AppTest.from_file(str(REVIEW_PATH)).run(timeout=10)
-            next(item for item in app.selectbox if item.label == "Editing").set_value("Bulk edit ingredients").run(timeout=10)
+            candidate_id = app.session_state["review_selection"]
+            app.session_state[f"recipe_sections:{candidate_id}"] = "Ingredients"
+            next(item for item in app.button if item.label == "Bulk edit ingredients").click().run(timeout=10)
             raw = "  1 cup rice  \n\n??"
             next(item for item in app.text_area if item.label == "Bulk ingredients").set_value(raw).run(timeout=10)
-            candidate_id = app.session_state["review_selection"]
             next(item for item in app.button if item.label == "Save draft").click().run(timeout=10)
             next_app = AppTest.from_file(str(REVIEW_PATH)).run(timeout=10)
-            next(item for item in next_app.selectbox if item.label == "Editing").set_value("Bulk edit ingredients").run(timeout=10)
+            next_app.session_state[f"recipe_sections:{candidate_id}"] = "Ingredients"
+            next(item for item in next_app.button if item.label == "Bulk edit ingredients").click().run(timeout=10)
             self.assertEqual(next(item for item in next_app.text_area if item.label == "Bulk ingredients").value, raw)
             self.assertEqual(next_app.session_state["review_selection"], candidate_id)
 

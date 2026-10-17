@@ -1,8 +1,4 @@
-"""Measure warm synthetic catalog loading without touching user data.
-
-Registrations are prepopulated as valid JSONL events so measurements exclude
-per-candidate cold fsync cost and focus on normal read/projection behavior.
-"""
+"""Measure cold and warm synthetic catalog loading without touching user data."""
 from __future__ import annotations
 
 import argparse
@@ -15,29 +11,45 @@ import sys
 import tempfile
 import time
 import uuid
+from io import BytesIO
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from batch_store import BatchStore
 from import_recipes import file_digest
+from PIL import Image
 from recipe_quality import ExtractionBatch, RecipeCandidate
 from review_store import ReviewStore, extraction_identity
 from ui_data import load_catalog
 
 
-def _prepopulate(root: Path, count: int, source_count: int) -> tuple[list[tuple[str, str, str, RecipeCandidate]], int]:
+def _prepopulate(root: Path, count: int, source_count: int,
+                 *, prepopulate_registrations: bool = True) -> tuple[list[tuple[str, str, str, RecipeCandidate]], int]:
     sources = root / "sources"
     extracted = root / "extracted"
     sources.mkdir()
     extracted.mkdir()
+    batch_store = BatchStore(root)
+    batch_record = batch_store.create("Synthetic catalog benchmark")
     quotient, remainder = divmod(count, source_count)
     registrations = []
     events = []
     candidate_index = 0
     for source_index in range(source_count):
-        source_path = sources / f"source-{source_index:04d}.txt"
-        source_path.write_text(f"Synthetic evidence for source {source_index}", encoding="utf-8")
+        source_path = sources / f"source-{source_index:04d}.jpg"
+        image = Image.new("RGB", (2, 2), (source_index % 256, (source_index // 256) % 256, 127))
+        image_bytes = BytesIO()
+        image.save(image_bytes, format="JPEG")
+        jpeg = image_bytes.getvalue()
+        comment = f"synthetic-source-{source_index}".encode("ascii")
+        comment_marker = b"\xff\xfe" + (len(comment) + 2).to_bytes(2, "big") + comment
+        source_path.write_bytes(jpeg[:-2] + comment_marker + jpeg[-2:])
+        staged = batch_store.stage(batch_record["batch_id"], source_path.name, source_path.read_bytes())
+        if staged.get("status") != "staged":
+            raise RuntimeError(f"could not prepare synthetic source: {staged}")
         source_hash = file_digest(source_path)
+        assert staged["digest"] == source_hash
         source_candidates = quotient + (1 if source_index < remainder else 0)
         recipes = [RecipeCandidate(
             name=f"Synthetic source {source_index} recipe {offset}",
@@ -71,9 +83,10 @@ def _prepopulate(root: Path, count: int, source_count: int) -> tuple[list[tuple[
             })
             registrations.append((candidate_id, source_hash, extraction_id, recipe))
             candidate_index += 1
-    ledger = root / "review_events.jsonl"
-    ledger.write_text("".join(json.dumps(event, ensure_ascii=False) + "\n" for event in events),
-                      encoding="utf-8")
+    if prepopulate_registrations:
+        ledger = root / "review_events.jsonl"
+        ledger.write_text("".join(json.dumps(event, ensure_ascii=False) + "\n" for event in events),
+                          encoding="utf-8")
     return registrations, candidate_index
 
 
@@ -85,8 +98,22 @@ def _percentile95(samples: list[float]) -> float:
 def measure(count: int, source_count: int, repeats: int) -> dict:
     if source_count > count:
         raise ValueError("source count cannot exceed candidate count")
-    with tempfile.TemporaryDirectory(prefix="recipe-catalog-benchmark-") as directory:
+    temp_root = Path(__file__).resolve().parents[1] / ".test-tmp"
+    temp_root.mkdir(exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="recipe-catalog-benchmark-", dir=temp_root) as directory:
         root = Path(directory)
+        cold_root = root / "cold"
+        cold_root.mkdir()
+        _prepopulate(cold_root, count, source_count, prepopulate_registrations=False)
+        assert not (cold_root / "review_events.jsonl").exists(), "cold fixture already has registrations"
+        cold_started = time.perf_counter()
+        cold = load_catalog(cold_root)
+        cold_registration_seconds = time.perf_counter() - cold_started
+        cold_ledger = cold_root / "review_events.jsonl"
+        cold_events = [line for line in cold_ledger.read_text(encoding="utf-8").splitlines() if line.strip()]
+        assert len(cold) == count
+        assert len(cold_events) == count, "cold load did not durably register every candidate"
+
         registrations, prepared = _prepopulate(root, count, source_count)
         ledger_path = root / "review_events.jsonl"
         ledger_size = ledger_path.stat().st_size
@@ -103,7 +130,7 @@ def measure(count: int, source_count: int, repeats: int) -> dict:
             samples.append(time.perf_counter() - started)
 
         candidate_id, source_hash, extraction_id, candidate = registrations[0]
-        source_path = root / "sources" / f"source-0000.txt"
+        source_path = root / "sources" / f"source-0000.jpg"
         reviews = ReviewStore(ledger_path)
         reviews.save_revision(
             candidate_id=candidate_id, source_hash=source_hash, extraction_id=extraction_id,
@@ -123,6 +150,8 @@ def measure(count: int, source_count: int, repeats: int) -> dict:
 
         return {
             "sources": source_count, "candidates": count, "prepopulated_registrations": prepared,
+            "cold_load_and_registration_seconds": cold_registration_seconds,
+            "cold_registration_events": len(cold_events),
             "warmup_seconds": warmup_seconds,
             "warm_p50_seconds": statistics.median(samples),
             "warm_p95_seconds": _percentile95(samples),
@@ -141,5 +170,5 @@ if __name__ == "__main__":
     if args.candidates < 1 or args.sources < 1 or args.repeats < 1:
         parser.error("candidates, sources and repeats must be positive")
     print(json.dumps({"python": platform.python_version(), "platform": platform.platform(),
-                      "method": "warm catalog loads with prepopulated registrations; approval appended externally",
+                      "method": "cold multi-source load and durable registration, then warm catalog loads with prepopulated registrations; approval appended externally",
                       "measurement": measure(args.candidates, args.sources, args.repeats)}, indent=2))

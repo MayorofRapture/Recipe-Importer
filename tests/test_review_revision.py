@@ -200,6 +200,9 @@ class ReviewRevisionTests(unittest.TestCase):
                 app = AppTest.from_file(str(APP_PATH)).run(timeout=10)
                 for label in ("Ingredient 1", "Ingredient 2"):
                     app = next(item for item in app.text_input if item.label == label).set_value("").run(timeout=10)
+                candidate_id = app.session_state["review_selection"]
+                app.session_state[f"recipe_sections:{candidate_id}"] = "Instructions"
+                app.run(timeout=10)
                 for label in ("Step 1", "Step 2"):
                     app = next(item for item in app.text_area if item.label == label).set_value("").run(timeout=10)
                 approve = next(button for button in app.button if "Approve & next" in button.label)

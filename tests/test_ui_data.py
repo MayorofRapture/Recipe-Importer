@@ -1,4 +1,5 @@
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -6,11 +7,39 @@ from unittest.mock import patch
 
 from tests.ui_fixture_factory import write_ui_fixture
 from batch_store import BatchStore
+from import_recipes import file_digest
+from recipe_quality import ExtractionBatch, RecipeCandidate
 from review_store import ReviewStore
 from ui_data import load_catalog, next_unresolved, render_source_page
 
 
 class UiDataTests(unittest.TestCase):
+    def test_cold_catalog_registers_all_sources_in_one_durable_batch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            output = root / "output"
+            extracted = output / "extracted"
+            sources = root / "sources"
+            extracted.mkdir(parents=True)
+            sources.mkdir()
+            for index in range(2):
+                source = sources / f"source-{index}.jpg"
+                source.write_bytes(f"synthetic source {index}".encode())
+                batch = ExtractionBatch(recipes=[RecipeCandidate(
+                    name=f"Recipe {index}", ingredients=["1 cup rice"], instructions=["Cook rice."],
+                )])
+                digest = file_digest(source)
+                (extracted / f"{digest}.json").write_text(json.dumps({
+                    "schema_version": 2, "source_hash": digest,
+                    "batch": batch.model_dump(mode="json"),
+                }), encoding="utf-8")
+
+            with patch("review_store.os.fsync", wraps=os.fsync) as sync:
+                views = load_catalog(output, sources)
+
+        self.assertEqual(len(views), 2)
+        self.assertEqual(sync.call_count, 1)
+
     def test_catalog_projects_review_imported_and_pending_states(self):
         with tempfile.TemporaryDirectory() as tmp:
             fixture = write_ui_fixture(Path(tmp))

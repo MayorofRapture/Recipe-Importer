@@ -9,7 +9,7 @@ import hashlib
 import uuid
 from collections import Counter
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -190,18 +190,23 @@ class ReviewStore:
                     ))
 
     def _append(self, event: dict, *, locked: bool = False) -> None:
+        self._append_many([event], locked=locked)
+
+    def _append_many(self, events: list[dict], *, locked: bool = False) -> None:
+        if not events:
+            return
         if not locked:
             with _state_lock(self.path):
                 self._reload()
-                self._append(event, locked=True)
+                self._append_many(events, locked=True)
                 self._reload()
             return
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self.path.open("a", encoding="utf-8") as fh:
-            fh.write(json.dumps(event, ensure_ascii=False) + "\n")
+            fh.write("".join(json.dumps(event, ensure_ascii=False) + "\n" for event in events))
             fh.flush()
             os.fsync(fh.fileno())
-        self.events.append(event)
+        self.events.extend(events)
 
     def _readback(self, event: dict) -> dict:
         readback = next((item for item in self.events if item.get("event_id") == event["event_id"]), None)
@@ -281,21 +286,47 @@ class ReviewStore:
                 return prior
         return None
 
+    def register_candidate_batches(
+        self, batches: list[tuple[str, str, str, list[RecipeCandidate]]],
+    ) -> list[list[dict]]:
+        """Register multiple source batches under one fresh lock and durable append."""
+        if not batches:
+            return []
+        exact = [self._exact_registration_batch(source_hash, extraction_id, candidates)
+                 for _, source_hash, extraction_id, candidates in batches]
+        if all(items is not None for items in exact):
+            return exact
+        with _state_lock(self.path):
+            self._reload()
+            pending_events: list[dict] = []
+            output = [self.register_candidates(
+                source, source_hash, extraction_id, candidates,
+                _lock_held=True, _pending_events=pending_events,
+            ) for source, source_hash, extraction_id, candidates in batches]
+            self._append_many(pending_events, locked=True)
+            for event in pending_events:
+                self.registrations.setdefault(event["candidate_id"], []).append(event)
+            return output
+
     def register_candidates(self, source: str, source_hash: str, extraction_id: str,
-                            candidates: list[RecipeCandidate]) -> list[dict]:
-        exact = self._exact_registration_batch(source_hash, extraction_id, candidates)
+                            candidates: list[RecipeCandidate], *, _lock_held: bool = False,
+                            _pending_events: list[dict] | None = None) -> list[dict]:
+        exact = (None if _lock_held else
+                 self._exact_registration_batch(source_hash, extraction_id, candidates))
         if exact is not None:
             # Catalog reads commonly revisit every source in an already
             # registered library. Registrations are immutable, so reuse this
             # loaded snapshot; any missing identity still takes the locked,
             # fresh-read mutation path below.
             return exact
-        with _state_lock(self.path):
-            self._reload()
+        with (nullcontext() if _lock_held else _state_lock(self.path)):
+            if not _lock_held:
+                self._reload()
             prior_source_registration = any(
                 event.get("source_hash") == source_hash
                 for events in self.registrations.values() for event in events
-            )
+            ) or any(event.get("source_hash") == source_hash
+                     for event in (_pending_events or []))
             source_import_protected = self._source_has_protected_import_history(source_hash)
             fingerprints = [hashlib.sha256(_canonical(item.model_dump(mode="json")).encode()).hexdigest()
                             for item in candidates]
@@ -322,8 +353,15 @@ class ReviewStore:
                         exact_index.setdefault(event["fingerprint"], []).append(event)
                     if event.get("identity_status") == "registered":
                         prior_index.setdefault(event["fingerprint"], []).append(event)
+            for event in (_pending_events or []):
+                if event.get("source_hash") != source_hash:
+                    continue
+                if event.get("extraction_id") == extraction_id:
+                    exact_index.setdefault(event["fingerprint"], []).append(event)
+                if event.get("identity_status") == "registered":
+                    prior_index.setdefault(event["fingerprint"], []).append(event)
             legacy_index: dict[str, list[str]] = {}
-            for event in self.events:
+            for event in [*self.events, *(_pending_events or [])]:
                 identity = str(event.get("candidate_id", ""))
                 same_source = identity.startswith(source_hash + ":") or any(
                     item.get("source_hash") == source_hash
@@ -334,6 +372,7 @@ class ReviewStore:
                     legacy_index.setdefault(_canonical(event.get("candidate", {})), []).append(identity)
             occurrences: dict[str, int] = {}
             output = []
+            pending_events = []
             for candidate, fingerprint in zip(candidates, fingerprints):
                 occurrence = occurrences.get(fingerprint, 0)
                 occurrences[fingerprint] = occurrence + 1
@@ -430,17 +469,23 @@ class ReviewStore:
                               "candidate": candidate.model_dump(mode="json"),
                               "target_bindings": bindings})
                 # Registration retries are keyed by immutable extraction/fingerprint.
-                existing = next((e for e in self.events if e.get("event") == event["event"]
+                existing = next((e for e in [*self.events, *(_pending_events or [])]
+                                 if e.get("event") == event["event"]
                                  and e.get("operation_id") == event["operation_id"]), None)
                 if existing:
                     output.append(existing)
                     continue
-                self._append(event, locked=True)
-                self.registrations.setdefault(candidate_id, []).append(event)
+                pending_events.append(event)
                 exact_index.setdefault(fingerprint, []).append(event)
                 if identity_status == "registered":
                     prior_index.setdefault(fingerprint, []).append(event)
                 output.append(event)
+            if _pending_events is None:
+                self._append_many(pending_events, locked=True)
+                for event in pending_events:
+                    self.registrations.setdefault(event["candidate_id"], []).append(event)
+            else:
+                _pending_events.extend(pending_events)
             return output
 
     def _exact_registration_batch(self, source_hash: str, extraction_id: str,

@@ -24,16 +24,18 @@ class StreamlitStructuredReviewTests(unittest.TestCase):
         self.addCleanup(self.env.stop)
         return AppTest.from_file(str(APP_PATH)).run(timeout=10)
 
-    def test_new_recipe_opens_in_structured_edit_mode_with_row_controls(self):
+    def test_recipe_editor_has_direct_section_tabs_and_row_controls(self):
         with tempfile.TemporaryDirectory() as tmp:
             app = self._app(tmp)
-
-        mode = next(item for item in app.selectbox if item.label == "Editing")
-        self.assertEqual(mode.value, "Precise edit")
-        labels = [button.label for button in app.button]
-        self.assertIn("Add ingredient", labels)
-        self.assertIn("Add step", labels)
-        self.assertTrue(any(item.label == "Actions" for item in app.menu_button))
+            self.assertEqual([item.label for item in app.get("tab")], ["Ingredients", "Instructions"])
+            labels = [button.label for button in app.button]
+            self.assertIn("Add ingredient", labels)
+            candidate_id = app.session_state["review_selection"]
+            app.session_state[f"recipe_sections:{candidate_id}"] = "Instructions"
+            app.run(timeout=10)
+            labels = [button.label for button in app.button]
+            self.assertIn("Add step", labels)
+            self.assertTrue(any(item.label == "Actions" for item in app.menu_button))
 
     def test_suggestion_is_inline_and_approval_gate_remains_separate(self):
         with tempfile.TemporaryDirectory() as tmp:

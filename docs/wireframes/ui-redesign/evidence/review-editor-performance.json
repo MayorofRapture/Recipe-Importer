@@ -1,0 +1,68 @@
+{
+  "title": "Review editor performance evidence",
+  "measured_on": "2026-10-16",
+  "environment": {
+    "os": "Windows 11",
+    "host_scope": "Local development workspace; CPU model and storage device were not recorded.",
+    "services": "Synthetic fixture only; no production scans, Mealie, or Gemini services."
+  },
+  "fixtures": {
+    "catalog_benchmark": {
+      "sources": 100,
+      "candidates": 1000,
+      "source_format": "Synthetic staged JPEGs with extraction caches."
+    },
+    "browser": {
+      "sources": 100,
+      "candidates": 1000,
+      "source_format": "Synthetic staged PDFs with extraction caches.",
+      "registration_ledger": "Empty before the valid cold browser measurement; 1000 unique registrations afterward."
+    }
+  },
+  "measurements": {
+    "historical_browser_baseline": {
+      "revision": "4601e79",
+      "cold_registration_window_seconds": 69.98,
+      "cold_registration_window_note": "First-to-last registration timestamps; a lower bound on first display, not an end-to-end settled-page timing.",
+      "warm_settled_page_seconds": 2.983,
+      "bulk_instructions_populated_editor_seconds": 0.586
+    },
+    "catalog_cold_registration_seconds": {
+      "per_source_durable_batches": 9.281,
+      "cross_source_single_durable_batch": 1.131,
+      "note": "Synthetic benchmark asserted that the review ledger was absent before cold load and contained all 1000 registrations afterward."
+    },
+    "browser_after_catalog_batch_before_editor_fragment": {
+      "cold_navigation_to_usable_editor_ms": 4015,
+      "gate": "Source image wider than 100px, populated recipe title, two editor tabs, visible nonempty active ingredient or step field, and no skeletons."
+    },
+    "editor_interaction_before_fragment_ms": {
+      "instructions_tab_settle": 1118,
+      "bulk_button_to_populated_editor_and_preview": 1842,
+      "instructions_click_to_bulk_ready_total": 2962,
+      "sample_count": 1
+    },
+    "editor_interaction_after_fragment_ms": {
+      "instructions_tab_settle": 280,
+      "bulk_button_to_populated_editor_and_preview": 266,
+      "instructions_click_to_bulk_ready_total": 548,
+      "sample_count": 1
+    },
+    "final_warm_navigation_after_fragment_ms": {
+      "samples": [3733, 4478, 3782],
+      "median": 3782,
+      "range": [3733, 4478],
+      "sample_count": 3,
+      "gate": "Same source, title, visible populated active editor field, tab, and skeleton checks as the earlier browser measurement."
+    }
+  },
+  "caveats": [
+    "The historical 69.98-second registration window is not directly comparable to browser navigation-to-settled measurements.",
+    "Editor interaction before/after values are single browser runs; treat them as directional measurements.",
+    "The final three warm navigation samples ran after focused UI tests completed. An earlier 5931 ms sample overlapped those tests and is excluded."
+  ],
+  "instrumentation": [
+    "tools/benchmark_catalog.py",
+    "tools/browser_cdp.mjs"
+  ]
+}

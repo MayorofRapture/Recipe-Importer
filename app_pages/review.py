@@ -18,6 +18,7 @@ from app_pages.common import (
     review_store,
     save_resume_pointer,
     save_draft,
+    structured_widget_key,
     sync_buffer,
 )
 from ui_data import render_source_page
@@ -79,6 +80,36 @@ def _resolve_suggestion(view, suggestion, disposition: str, final_value: str | N
                     operation_id=f"ui-finding:{view.candidate_id}:{revision}:{index}:{digest}",
                 )
                 st.session_state.review_refresh_candidate = view.candidate_id
+
+
+def _apply_proposal(view, suggestion, disposition: str, final_value: str | None, buffer) -> None:
+    if disposition in {"accepted", "edited"}:
+        binding = next((item for item in view.target_bindings
+                        if item.get("issue_id") == suggestion.suggestion_id), None)
+        if binding is None:
+            raise ValueError("The proposal has no registered target.")
+        target_id = binding.get("source_target_id")
+        target_kind = binding.get("source_target_kind")
+        field = binding.get("field")
+        if target_kind == "row" and field in {"ingredients", "instructions"}:
+            ids_key = "ingredient_ids" if field == "ingredients" else "instruction_ids"
+            values_key = "structured_ingredients" if field == "ingredients" else "structured_instructions"
+            row_ids = buffer.get(ids_key, [])
+            if not target_id or target_id not in row_ids:
+                raise ValueError("The original recipe row is no longer present; this proposal cannot be applied by position.")
+            buffer[values_key][row_ids.index(target_id)] = str(final_value or "")
+            _update_raw_section(buffer, field)
+        elif target_kind == "field" and field in {"ingredients", "instructions"}:
+            from quick_edit import parse_ingredients, parse_instructions
+            parsed = parse_ingredients(str(final_value or "")) if field == "ingredients" else parse_instructions(str(final_value or ""))
+            buffer[f"structured_{field}"] = list(parsed.items)
+            buffer["ingredient_ids" if field == "ingredients" else "instruction_ids"] = [
+                str(uuid.uuid4()) for _ in parsed.items
+            ]
+            _update_raw_section(buffer, field)
+        else:
+            raise ValueError("The proposal has no exact ingredient or instruction target.")
+    _resolve_suggestion(view, suggestion, disposition, final_value, buffer)
 
 
 def _resolve_finding(view, buffer, finding, index: int) -> None:
@@ -353,13 +384,13 @@ def main() -> None:
     if workspace_view == "Source":
         _render_source(view)
     elif workspace_view == "Recipe":
-        _render_editor(view, buffer)
+        _render_editor_fragment(view, buffer)
     else:
         source, editor = st.columns([0.9, 1.1], gap="medium")
         with source:
             _render_source(view)
         with editor:
-            _render_editor(view, buffer)
+            _render_editor_fragment(view, buffer)
     _render_findings(view, buffer)
     _render_retry_panel(view, views)
 
@@ -739,6 +770,14 @@ def _render_source(view) -> None:
                 st.write(note)
 
 
+@st.fragment
+def _render_editor_fragment(view, buffer) -> None:
+    # Tab and row widgets rerun this fragment only, so capture both sections
+    # before Streamlit cleans up the inactive tab's widget state.
+    sync_buffer(view, buffer)
+    _render_editor(view, buffer)
+
+
 def _render_editor(view, buffer) -> None:
     with st.container(border=True):
         st.markdown("**Recipe**")
@@ -752,23 +791,43 @@ def _render_editor(view, buffer) -> None:
             st.text_area("Description", value=str(buffer.get("description", "")), height=84,
                          key=f"recipe_description:{view.candidate_id}",
                          on_change=_metadata_changed, args=(view.candidate_id,))
-        if st.session_state.pop("review_reset_editor_mode", None) == view.candidate_id:
-            st.session_state[f"editor_mode:{view.candidate_id}"] = "Precise edit"
-        st.selectbox("Editing", ["Precise edit", "Bulk edit ingredients", "Bulk edit instructions"],
-                     key=f"editor_mode:{view.candidate_id}", label_visibility="collapsed")
-        mode = st.session_state[f"editor_mode:{view.candidate_id}"]
-        if mode == "Bulk edit ingredients":
-            _render_bulk_editor(view, buffer, "ingredients")
-        elif mode == "Bulk edit instructions":
-            _render_bulk_editor(view, buffer, "instructions")
-        else:
-            _render_structured_editor(view, buffer)
+        tab_key = f"recipe_sections:{view.candidate_id}"
+        st.session_state.setdefault(tab_key, st.session_state.get(
+            f"recipe_section_saved:{view.candidate_id}", "Ingredients"))
+        tabs = st.tabs(["Ingredients", "Instructions"], key=tab_key,
+                       on_change=_remember_recipe_section, args=(view.candidate_id,))
+        buffer.setdefault("structured_ingredients", list(view.candidate.ingredients))
+        buffer.setdefault("structured_instructions", list(view.candidate.instructions))
+        buffer.setdefault("ingredient_ids", [str(uuid.uuid4()) for _ in buffer["structured_ingredients"]])
+        buffer.setdefault("instruction_ids", [str(uuid.uuid4()) for _ in buffer["structured_instructions"]])
+        if tabs[0].open:
+            _render_structured_section(view, buffer, "ingredients")
+        if tabs[1].open:
+            _render_structured_section(view, buffer, "instructions")
+        approval_reason = _approval_block_reason(view, buffer)
+        if st.button("Approve & next", key=f"approve:{view.candidate_id}", disabled=bool(approval_reason),
+                     type="primary", width="stretch"):
+            _approve(view, buffer)
+        if approval_reason:
+            st.caption(approval_reason)
+
+
+def _remember_recipe_section(candidate_id: str) -> None:
+    st.session_state[f"recipe_section_saved:{candidate_id}"] = st.session_state.get(
+        f"recipe_sections:{candidate_id}", "Ingredients")
+
+
+def _update_raw_section(buffer, field: str) -> None:
+    separator = "\n" if field == "ingredients" else "\n\n"
+    values = buffer["structured_ingredients" if field == "ingredients" else "structured_instructions"]
+    buffer[f"raw_{field}"] = separator.join(str(item) for item in values if str(item).strip())
 
 
 def _render_bulk_editor(view, buffer, field: str) -> None:
     key = f"bulk_{field}:{view.candidate_id}"
     raw = buffer.get("raw_ingredients" if field == "ingredients" else "raw_instructions", "")
     if key not in st.session_state:
+        buffer.setdefault(f"_bulk_original_{field}", raw)
         st.session_state[key] = raw
     st.caption("One ingredient per line." if field == "ingredients" else "Blank lines separate steps. Review the proposed boundaries before applying.")
     edited = st.text_area(f"Bulk {field}", key=key, height=280)
@@ -777,6 +836,7 @@ def _render_bulk_editor(view, buffer, field: str) -> None:
     st.caption(f"Preview: {len(prior)} → {len(parsed)} {field} · {max(0, len(prior)-len(parsed))} removed")
     buttons = st.columns(2)
     if buttons[0].button(f"Apply {field}", key=f"apply_bulk_{field}:{view.candidate_id}"):
+        _snapshot_undo(buffer)
         if field == "ingredients":
             buffer["structured_ingredients"] = parsed
             buffer["ingredient_ids"] = [str(uuid.uuid4()) for _ in parsed]
@@ -785,13 +845,13 @@ def _render_bulk_editor(view, buffer, field: str) -> None:
             buffer["structured_instructions"] = parsed
             buffer["instruction_ids"] = [str(uuid.uuid4()) for _ in parsed]
             buffer["raw_instructions"] = edited
+        buffer.pop(f"_bulk_original_{field}", None)
+        buffer[f"_bulk_open_{field}"] = False
         st.session_state.pop(key, None)
-        st.session_state.review_reset_editor_mode = view.candidate_id
-        st.rerun()
     if buttons[1].button("Cancel bulk edit", key=f"cancel_bulk_{field}:{view.candidate_id}"):
+        buffer[f"raw_{field}"] = buffer.pop(f"_bulk_original_{field}", raw)
+        buffer[f"_bulk_open_{field}"] = False
         st.session_state.pop(key, None)
-        st.session_state.review_reset_editor_mode = view.candidate_id
-        st.rerun()
 
 
 def _metadata_changed(candidate_id: str) -> None:
@@ -818,8 +878,7 @@ def _queue_choice_changed() -> None:
 
 
 def _render_actions(view, buffer) -> str:
-    approval_reason = _approval_block_reason(view, buffer)
-    cols = st.columns([1, 1.2, 1.4, 2], vertical_alignment="center")
+    cols = st.columns([1, 1.2, 1.4], vertical_alignment="center")
     with cols[0]:
         with st.popover("Options"):
             workspace_view = st.radio("Workspace view", ["Side by side", "Source", "Recipe"],
@@ -833,54 +892,58 @@ def _render_actions(view, buffer) -> str:
     with cols[2]:
         if st.button("Skip for now", key=f"skip:{view.candidate_id}", disabled=view.protected, width="stretch"):
             _advance_queue(1)
-    with cols[3]:
-        if st.button("Approve & next", key=f"approve:{view.candidate_id}", disabled=bool(approval_reason),
-                     type="primary", width="stretch"):
-            _approve(view, buffer)
-    if approval_reason:
-        st.caption(approval_reason)
     state = st.session_state.get("review_save_state")
     if state:
         st.caption(state)
     return workspace_view
 
 
-def _render_structured_editor(view, buffer) -> None:
-    buffer.setdefault("structured_ingredients", list(view.candidate.ingredients))
-    buffer.setdefault("structured_instructions", list(view.candidate.instructions))
-    buffer.setdefault("ingredient_ids", [str(uuid.uuid4()) for _ in buffer["structured_ingredients"]])
-    buffer.setdefault("instruction_ids", [str(uuid.uuid4()) for _ in buffer["structured_instructions"]])
-    for field, label, ids_key, value_key, kind in (
-        ("ingredients", "Ingredients", "ingredient_ids", "structured_ingredients", "ingredient"),
-        ("instructions", "Instructions", "instruction_ids", "structured_instructions", "step"),
-    ):
-        st.markdown(f"**{label}**")
-        for index, value in enumerate(list(buffer[value_key])):
-            row_id = buffer[ids_key][index]
-            cols = st.columns([0.4, 6, 1.4], vertical_alignment="center")
-            with cols[0]:
-                st.caption(str(index + 1))
-            with cols[1]:
-                if kind == "ingredient":
-                    buffer[value_key][index] = st.text_input(
-                        f"Ingredient {index + 1}", value=value, key=f"structured_i:{view.candidate_id}:{row_id}")
-                else:
-                    buffer[value_key][index] = st.text_area(
-                        f"Step {index + 1}", value=value, key=f"structured_s:{view.candidate_id}:{row_id}", height=88)
-            with cols[2]:
-                action = st.menu_button("Actions", ["Insert below", "Move up", "Move down", "Merge with next", "Remove"],
-                                        key=f"actions_{kind}:{view.candidate_id}:{row_id}",
-                                        help=f"{label} {index + 1} actions",
-                                        format_func=lambda value: value)
-            if action:
-                _mutate_row(view, buffer, value_key, ids_key, index, action)
-                return
-        if st.button(f"Add {kind}", key=f"add_{kind}:{view.candidate_id}"):
-            _snapshot_undo(buffer)
-            buffer[value_key].append("")
-            buffer[ids_key].append(str(uuid.uuid4()))
-            st.rerun()
-    _render_suggestions(view, buffer)
+def _render_structured_section(view, buffer, field: str) -> None:
+    labels = {"ingredients": ("Ingredients", "ingredient", "ingredient_ids", "structured_ingredients", "structured_i"),
+              "instructions": ("Instructions", "step", "instruction_ids", "structured_instructions", "structured_s")}
+    label, kind, ids_key, value_key, widget_prefix = labels[field]
+    st.markdown(f"**{label}**")
+    _render_suggestions(view, buffer, field)
+    for index, value in enumerate(list(buffer[value_key])):
+        row_id = buffer[ids_key][index]
+        cols = st.columns([0.4, 6, 1.4], vertical_alignment="center")
+        with cols[0]:
+            st.caption(str(index + 1))
+        with cols[1]:
+            if field == "ingredients":
+                buffer[value_key][index] = st.text_input(
+                    f"Ingredient {index + 1}", value=value,
+                    key=structured_widget_key(view, widget_prefix, row_id))
+            else:
+                buffer[value_key][index] = st.text_area(
+                    f"Step {index + 1}", value=value,
+                    key=structured_widget_key(view, widget_prefix, row_id), height=88)
+        with cols[2]:
+            action = st.menu_button("Actions", ["Insert below", "Move up", "Move down", "Merge with next", "Remove"],
+                                    key=f"actions_{kind}:{view.candidate_id}:{row_id}",
+                                    help=f"{label} {index + 1} actions",
+                                    format_func=lambda value: value)
+        if action:
+            _mutate_row(view, buffer, value_key, ids_key, index, action)
+            return
+        _render_suggestions(view, buffer, field, row_id)
+    if st.button(f"Add {kind}", key=f"add_{kind}:{view.candidate_id}"):
+        _snapshot_undo(buffer)
+        buffer[value_key].append("")
+        buffer[ids_key].append(str(uuid.uuid4()))
+        _update_raw_section(buffer, field)
+        st.rerun()
+    bulk_open_key = f"_bulk_open_{field}"
+    if not buffer.get(bulk_open_key, False):
+        if st.button(f"Bulk edit {field}", key=f"open_bulk_{field}:{view.candidate_id}"):
+            buffer[bulk_open_key] = True
+    if buffer.get(bulk_open_key, False):
+        bulk_editor = st.empty()
+        with bulk_editor.container(border=True):
+            _render_bulk_editor(view, buffer, field)
+        if not buffer.get(bulk_open_key, False):
+            bulk_editor.empty()
+            st.button(f"Bulk edit {field}", key=f"open_bulk_{field}:{view.candidate_id}")
 
 
 def _snapshot_undo(buffer) -> None:
@@ -913,9 +976,58 @@ def _mutate_row(view, buffer, values_key: str, ids_key: str, index: int, action:
     st.rerun()
 
 
-def _render_suggestions(view, buffer) -> None:
-    # All proposals live together in the complete Issues inventory below the editor.
-    return
+def _render_suggestions(view, buffer, field: str, row_id: str | None = None) -> None:
+    for suggestion in view.pending_suggestions:
+        path = suggestion.field_path
+        if path != field and not path.startswith(field + "["):
+            continue
+        binding = next((item for item in view.target_bindings
+                        if item.get("issue_id") == suggestion.suggestion_id), None)
+        target_id = binding.get("source_target_id") if binding else None
+        target_kind = binding.get("source_target_kind") if binding else None
+        row_ids = buffer.get("ingredient_ids" if field == "ingredients" else "instruction_ids", [])
+        exact_row = (target_kind == "row" and target_id in row_ids)
+        whole_field = path == field and target_kind == "field" and bool(target_id)
+        if row_id is not None:
+            if not exact_row or target_id != row_id:
+                continue
+        elif exact_row:
+            continue
+        can_apply = exact_row or whole_field
+        with st.container(border=True):
+            st.markdown(f"**Unverified proposal · {path}**")
+            if not can_apply:
+                st.caption("No exact original row is available. Review the scan; this proposal cannot be applied by position.")
+            st.write(suggestion.proposed_value)
+            st.caption(f"Why: {suggestion.rationale} · Uncertainty: {suggestion.uncertainty or 'Not stated'} · Confidence: {suggestion.confidence}")
+            editing_key = f"suggestion_editing:{view.candidate_id}:{suggestion.suggestion_id}"
+            if st.session_state.get(editing_key):
+                value_key = f"suggestion_edit:{view.candidate_id}:{suggestion.suggestion_id}"
+                st.session_state.setdefault(
+                    value_key,
+                    buffer.get("_suggestion_edits", {}).get(suggestion.suggestion_id, suggestion.proposed_value),
+                )
+                edited = st.text_area("Edit suggestion", key=value_key, height=88)
+                actions = st.columns(2)
+                if actions[0].button("Use edited version", key=f"edit_s:{view.candidate_id}:{suggestion.suggestion_id}",
+                                     disabled=not can_apply or not edited.strip()):
+                    _run_issue_action(lambda: _apply_proposal(view, suggestion, "edited", edited, buffer))
+                if actions[1].button("Cancel edit", key=f"cancel_edit_s:{view.candidate_id}:{suggestion.suggestion_id}"):
+                    st.session_state.pop(editing_key, None)
+                    st.session_state.pop(value_key, None)
+                    st.rerun()
+            else:
+                actions = st.columns(3)
+                if actions[0].button("Use suggestion", key=f"approve_s:{view.candidate_id}:{suggestion.suggestion_id}",
+                                     disabled=not can_apply):
+                    _run_issue_action(lambda: _apply_proposal(view, suggestion, "accepted", suggestion.proposed_value, buffer))
+                if actions[1].button("Edit suggestion", key=f"start_edit_s:{view.candidate_id}:{suggestion.suggestion_id}"):
+                    st.session_state[editing_key] = True
+                    st.session_state[f"suggestion_edit:{view.candidate_id}:{suggestion.suggestion_id}"] = suggestion.proposed_value
+                    buffer.setdefault("_suggestion_edits", {})[suggestion.suggestion_id] = suggestion.proposed_value
+                    st.rerun()
+                if actions[2].button("Reject", key=f"reject_s:{view.candidate_id}:{suggestion.suggestion_id}"):
+                    _run_issue_action(lambda: _apply_proposal(view, suggestion, "rejected", None, buffer))
 
 
 def _render_findings(view, buffer) -> None:
@@ -934,17 +1046,35 @@ def _render_findings(view, buffer) -> None:
                 if st.button("I corrected this from the source", key=f"resolve_finding:{view.candidate_id}:{index}"):
                     _run_issue_action(lambda: _resolve_finding(view, buffer, finding, index))
         for suggestion in view.pending_suggestions:
+            if suggestion.field_path in {"ingredients", "instructions"} or suggestion.field_path.startswith(("ingredients[", "instructions[")):
+                continue
             with st.container(border=True):
                 st.markdown(f"**Unverified proposal · {suggestion.field_path}**")
                 st.write(suggestion.proposed_value)
                 st.caption(f"Why: {suggestion.rationale} · Uncertainty: {suggestion.uncertainty or 'Not stated'} · Confidence: {suggestion.confidence}")
-                edited = st.text_input("Value to approve or edit", value=suggestion.proposed_value,
-                                       key=f"suggestion:{view.candidate_id}:{suggestion.suggestion_id}")
-                actions = st.columns(2)
-                if actions[0].button("Use suggestion", key=f"approve_s:{view.candidate_id}:{suggestion.suggestion_id}"):
-                    _run_issue_action(lambda: _resolve_suggestion(view, suggestion, "accepted", suggestion.proposed_value, buffer))
-                if actions[1].button("Approve edited value", key=f"edit_s:{view.candidate_id}:{suggestion.suggestion_id}"):
-                    _run_issue_action(lambda: _resolve_suggestion(view, suggestion, "edited", edited, buffer))
+                editing_key = f"editing_scalar_suggestion:{view.candidate_id}:{suggestion.suggestion_id}"
+                value_key = f"suggestion:{view.candidate_id}:{suggestion.suggestion_id}"
+                if st.session_state.get(editing_key):
+                    st.session_state.setdefault(value_key, suggestion.proposed_value)
+                    edited = st.text_area("Edit suggestion", key=value_key, height=88)
+                    actions = st.columns(3)
+                    if actions[0].button("Use suggestion", key=f"approve_s:{view.candidate_id}:{suggestion.suggestion_id}"):
+                        _run_issue_action(lambda: _resolve_suggestion(view, suggestion, "accepted", suggestion.proposed_value, buffer))
+                    if actions[1].button("Use edited version", key=f"edit_s:{view.candidate_id}:{suggestion.suggestion_id}",
+                                         disabled=not edited.strip()):
+                        _run_issue_action(lambda: _resolve_suggestion(view, suggestion, "edited", edited, buffer))
+                    if actions[2].button("Reject", key=f"reject_s:{view.candidate_id}:{suggestion.suggestion_id}"):
+                        _run_issue_action(lambda: _resolve_suggestion(view, suggestion, "rejected", None, buffer))
+                else:
+                    actions = st.columns(3)
+                    if actions[0].button("Use suggestion", key=f"approve_s:{view.candidate_id}:{suggestion.suggestion_id}"):
+                        _run_issue_action(lambda: _resolve_suggestion(view, suggestion, "accepted", suggestion.proposed_value, buffer))
+                    if actions[1].button("Edit suggestion", key=f"start_edit_s:{view.candidate_id}:{suggestion.suggestion_id}"):
+                        st.session_state[editing_key] = True
+                        st.session_state[value_key] = suggestion.proposed_value
+                        st.rerun()
+                    if actions[2].button("Reject", key=f"reject_s:{view.candidate_id}:{suggestion.suggestion_id}"):
+                        _run_issue_action(lambda: _resolve_suggestion(view, suggestion, "rejected", None, buffer))
                 current_value = _current_value_for_path(view.candidate, suggestion.field_path)
                 if current_value is not None:
                     if st.button("Keep verified current value", key=f"keep_current:{view.candidate_id}:{suggestion.suggestion_id}"):

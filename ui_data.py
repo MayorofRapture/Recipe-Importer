@@ -110,11 +110,14 @@ def load_catalog(output_dir: Path, source_root: Path | None = None) -> list[Reci
             values.sort(key=lambda value: value.timestamp)
     views: list[RecipeView] = []
 
-    for source_hash, batch in caches:
+    registration_batches = [
+        ("", source_hash, extraction_identity(source_hash, batch.model_dump(mode="json")), batch.recipes)
+        for source_hash, batch in caches
+    ]
+    registered_batches = reviews.register_candidate_batches(registration_batches)
+
+    for (source_hash, batch), registrations in zip(caches, registered_batches):
         extraction_id = extraction_identity(source_hash, batch.model_dump(mode="json"))
-        registrations = reviews.register_candidates(
-            "", source_hash, extraction_id, batch.recipes,
-        )
         title_counts = {}
         for item in batch.recipes:
             title_counts[item.name.casefold().strip()] = title_counts.get(item.name.casefold().strip(), 0) + 1

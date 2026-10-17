@@ -101,7 +101,7 @@ class ReviewBufferTests(unittest.TestCase):
             selector = next(item for item in app.selectbox if item.label == "Jump to recipe")
             selector.set_value("Cranberry & Caramel Date Bars").run(timeout=10)
 
-            keys = [item.key for item in app.text_input if item.label == "Value to approve or edit"]
+            keys = [item.key for item in app.button if item.label == "Edit suggestion"]
             self.assertEqual(len(keys), 3)
             self.assertEqual(len(set(keys)), 3)
             self.assertFalse(app.exception)

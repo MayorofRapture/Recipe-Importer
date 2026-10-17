@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import hashlib
 import csv
+import os
 import subprocess
 import sys
 import tempfile
@@ -47,6 +48,24 @@ try:
     print(json.dumps(['saved', event['revision']]), flush=True)
 except ReviewConflict:
     print(json.dumps(['conflict', 0]), flush=True)
+"""
+
+_REGISTRATION_WORKER = """
+import json
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path.cwd()))
+from recipe_quality import RecipeCandidate
+from review_store import ReviewStore
+path = Path(sys.argv[1])
+store = ReviewStore(path)
+print('READY', flush=True)
+sys.stdin.readline()
+items = store.register_candidates(
+    'scan.jpg', 'source-hash', 'extract-1',
+    [RecipeCandidate(name='Rice', ingredients=['1 cup rice'], instructions=['Cook.'])],
+)
+print(json.dumps(items[0]['candidate_id']), flush=True)
 """
 
 
@@ -146,6 +165,79 @@ class ReviewAuthorityTests(unittest.TestCase):
                          ["needs_reconciliation", "needs_reconciliation"])
         self.assertEqual([item["candidate_id"] for item in identical],
                          [item["candidate_id"] for item in identical_again])
+
+    def test_candidate_registration_batch_uses_one_durable_sync_and_retries_without_append(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "review_events.jsonl"
+            store = ReviewStore(path)
+            candidates = [RecipeCandidate(
+                name=f"Recipe {index}", ingredients=["1 cup rice"], instructions=["Cook rice."],
+            ) for index in range(3)]
+
+            with patch("review_store.os.fsync", wraps=os.fsync) as sync:
+                first = store.register_candidates("scan.jpg", SOURCE_HASH, "batch-extract", candidates)
+                self.assertEqual(sync.call_count, 1)
+                before_retry = path.read_bytes()
+                again = ReviewStore(path).register_candidates(
+                    "scan.jpg", SOURCE_HASH, "batch-extract", candidates,
+                )
+                after_retry = path.read_bytes()
+
+        events = [json.loads(line) for line in before_retry.splitlines()]
+        self.assertEqual(len(events), 3)
+        self.assertTrue(all(event["event"] == "candidate_registration" for event in events))
+        self.assertEqual([item["candidate_id"] for item in first],
+                         [item["candidate_id"] for item in again])
+        self.assertEqual(after_retry, before_retry)
+
+    def test_two_processes_registering_same_candidates_append_one_shared_identity(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = str(Path(tmp) / "review_events.jsonl")
+            processes = [subprocess.Popen(
+                [sys.executable, "-c", _REGISTRATION_WORKER, path], cwd=Path.cwd(),
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            ) for _ in range(2)]
+            try:
+                ready = [process.stdout.readline().strip() for process in processes]
+                self.assertEqual(ready, ["READY", "READY"])
+                for process in processes:
+                    process.stdin.write("go\n")
+                    process.stdin.close()
+                outputs = [process.communicate(timeout=15) for process in processes]
+                self.assertEqual([process.returncode for process in processes], [0, 0],
+                                 [error for _, error in outputs])
+                candidate_ids = [json.loads(stdout.strip().splitlines()[-1])
+                                 for stdout, _ in outputs]
+                events = [json.loads(line) for line in Path(path).read_text(encoding="utf-8").splitlines()]
+            finally:
+                for process in processes:
+                    if process.poll() is None:
+                        process.kill()
+                        process.wait(timeout=5)
+
+        registrations = [item for item in events if item.get("event") == "candidate_registration"]
+        self.assertEqual(candidate_ids[0], candidate_ids[1])
+        self.assertEqual(len(registrations), 1)
+
+    def test_registration_reuses_batch_when_fsync_acknowledgement_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "review_events.jsonl"
+            candidates = [RecipeCandidate(
+                name=f"Recipe {index}", ingredients=["1 cup rice"], instructions=["Cook rice."],
+            ) for index in range(2)]
+            store = ReviewStore(path)
+            with patch("review_store.os.fsync", side_effect=OSError("simulated sync failure")):
+                with self.assertRaisesRegex(OSError, "simulated sync failure"):
+                    store.register_candidates("scan.jpg", SOURCE_HASH, "batch-extract", candidates)
+
+            first = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+            retry = ReviewStore(path).register_candidates("scan.jpg", SOURCE_HASH, "batch-extract", candidates)
+            after_retry_count = len(path.read_text(encoding="utf-8").splitlines())
+
+        self.assertEqual(len(first), 2)
+        self.assertEqual([item["candidate_id"] for item in first],
+                         [item["candidate_id"] for item in retry])
+        self.assertEqual(after_retry_count, 2)
 
     def test_unmatched_candidate_is_held_when_legacy_import_history_exists_for_source(self):
         with tempfile.TemporaryDirectory() as tmp:
