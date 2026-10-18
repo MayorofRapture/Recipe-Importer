@@ -90,6 +90,35 @@ class UiHistoryTests(unittest.TestCase):
         self.assertEqual(client.tags, [("existing-slug", "Original Tag")])
         self.assertEqual(client.created, [])
 
+    def test_conflicting_durable_creation_identities_block_tag_repair(self):
+        class FakeMealie:
+            def __init__(self): self.tag_calls = 0
+            def ensure_tag(self, name):
+                self.tag_calls += 1
+                return {"name": name}
+            def add_tag(self, _slug, _tag):
+                self.tag_calls += 1
+                return "tagged"
+            def create_recipe(self, _recipe):
+                raise AssertionError("tag repair cannot create recipes")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "output"
+            output.mkdir()
+            events = output / "ui_import_events.jsonl"
+            events.write_text("\n".join(json.dumps({
+                "event": "creation_confirmed", "candidate_id": "conflicting-id",
+                "attempt_id": f"attempt-{index}", "slug": slug,
+                "batch_tag": "Original Tag", "title": "Old Recipe",
+            }) for index, slug in enumerate(("recipe-one", "recipe-two"))) + "\n",
+                encoding="utf-8")
+            client = FakeMealie()
+            result = ImportService(output, client=client).repair_tag("conflicting-id")
+
+        self.assertEqual(result["creation_status"], "not_available")
+        self.assertIn("conflicting", result["reason"])
+        self.assertEqual(client.tag_calls, 0)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -490,6 +490,13 @@ class ImportService:
                         row["attempt_status"] = "orphaned"
                         row["provider_response_evidence"] = ""
                         row["attempt_snapshot"] = event.get("recipe_snapshot")
+                        row["historical_content_unavailable"] = (
+                            event.get("plan_id") == "cli" and event.get("schema_version") == 1
+                            and not event.get("authorization_mode")
+                            and all(event.get(key) in (None, "") for key in (
+                                "attempt_evidence_version", "content_sha256", "recipe_snapshot", "outbound_payload",
+                            ))
+                        )
                 for provenance_key in ("approval_method", "approval_rationale", "no_instructions_reason"):
                     if event.get(provenance_key):
                         row[provenance_key] = str(event[provenance_key])
@@ -561,19 +568,53 @@ class ImportService:
             state = StateStore(self.state_path)
             record = self._state_for(state, candidate_id)
             candidate_events = self._candidate_events(events, candidate_id)
-            created = next((item for item in reversed(candidate_events)
-                            if item.get("event") in {"creation_confirmed", "reconciled_existing"}), None)
+            confirmations = [item for item in candidate_events
+                             if item.get("event") in {"creation_confirmed", "reconciled_existing"}]
+            identities = {(str(item.get("slug", "")), str(item.get("batch_tag", "")))
+                          for item in confirmations}
+            if len(identities) > 1:
+                return self._outcome(candidate_id, "", "not_available",
+                                     reason="Durable creation history contains conflicting recipe or tag identities.")
+            created = confirmations[-1] if confirmations else None
+            for confirmation in confirmations:
+                if confirmation.get("event") == "reconciled_existing":
+                    try:
+                        verified, _ = self._uncertain_attempt(
+                            events, candidate_id, str(confirmation.get("attempt_id", "")))
+                    except Exception:
+                        verified = None
+                    if (verified is None or not confirmation.get("reviewer_confirmed")
+                            or not str(confirmation.get("reviewer_evidence", "")).strip()
+                            or (confirmation.get("historical_content_unavailable")
+                                and not confirmation.get("historical_content_ack"))):
+                        return self._outcome(candidate_id, "", "not_available",
+                                             reason="The reconciliation record lacks verifiable reviewer and attempt evidence.")
+                elif confirmation.get("event") == "creation_confirmed":
+                    attempt = str(confirmation.get("attempt_id", ""))
+                    intents = [item for item in candidate_events
+                               if item.get("event") == "intent_started" and item.get("attempt_id") == attempt]
+                    if (not attempt or len(intents) != 1
+                            or any(intents[0].get(key) != confirmation.get(key)
+                                   for key in ("candidate_id", "source_hash", "extraction_id", "title", "batch_tag"))):
+                        return self._outcome(candidate_id, "", "not_available",
+                                             reason="The creation record does not match one durable import intent.")
             slug = str((created or {}).get("slug") or (record or {}).get("slug", ""))
             tag = str((created or {}).get("batch_tag")
                       or (record or {}).get("batch_tag") or (record or {}).get("tag_name", ""))
             title = str((created or {}).get("title") or (record or {}).get("title", ""))
-            if not slug or not tag or not record or record.get("status") != "IMPORTED":
+            if (not slug or not tag or (not created and
+                    (not record or record.get("status") != "IMPORTED"))):
                 return self._outcome(candidate_id, title, "not_available",
                                      reason="No confirmed imported recipe with a pending batch tag was found.")
+            if record and (record.get("status") != "IMPORTED"
+                           or str(record.get("slug", "")) != slug
+                           or (record.get("batch_tag") or record.get("tag_name")) not in (None, "", tag)):
+                return self._outcome(candidate_id, title, "not_available", slug=slug,
+                                     reason="Compatibility history conflicts with the durable recipe or tag identity.")
             if expected_tag and tag != str(expected_tag).strip():
                 return self._outcome(candidate_id, title, "not_available", slug=slug,
                                      reason="The imported recipe's recorded batch tag does not match the selected tag scope.")
-            if self._latest_tag_status(candidate_events) == "tagged" or record.get("tag_status") == "tagged":
+            if self._latest_tag_status(candidate_events) == "tagged" or (record or {}).get("tag_status") == "tagged":
                 return self._outcome(candidate_id, title, "already_tagged", tag_status="tagged", slug=slug)
             attempt_id = str(uuid.uuid4())
         result = self._apply_tag(candidate_id, title, slug, tag, attempt_id)
@@ -667,6 +708,7 @@ class ImportService:
                            reviewer_confirmed: bool = False, evidence: str = "",
                            material_difference_ack: bool = False,
                            unavailable_field_ack: bool = False,
+                           historical_content_ack: bool = False,
                            observed_recipe_digest: str = "") -> dict:
         """Inspect one uncertain attempt, then link only after explicit evidence and comparison."""
         self._require_client()
@@ -675,9 +717,10 @@ class ImportService:
             return self._outcome(candidate_id, "", "not_verified", reason="A Mealie slug is required.")
         with _state_lock(self.review_path):
             events = self._read_events()
-            projection, reason = self._uncertain_attempt(events, candidate_id, attempt_id)
-            if projection is None:
-                return self._outcome(candidate_id, "", "not_verified", reason=reason)
+        projection, reason = self._uncertain_attempt(events, candidate_id, attempt_id)
+        if projection is None:
+            return self._outcome(candidate_id, "", "not_verified", reason=reason)
+        with _state_lock(self.review_path):
             attempt_id = projection["attempt_id"]
             existing_link = next((item for item in projection["events"]
                                   if item.get("event") == "reconciled_existing"), None)
@@ -713,10 +756,14 @@ class ImportService:
             return self._outcome(candidate_id, projection["title"], "confirmation_required",
                                  reason="Compare both recipes and confirm the identity with reviewer evidence.",
                                  attempt_id=attempt_id, comparison=comparison,
-                                 comparison_digest=comparison_digest, slug=slug)
-        if not str(evidence).strip():
+                                 comparison_digest=comparison_digest, slug=slug,
+                                 historical_content_unavailable=projection.get("historical_content_unavailable", False))
+        if ((projection.get("historical_content_unavailable") and len(str(evidence).strip()) < 40)
+                or (not projection.get("historical_content_unavailable") and not str(evidence).strip())):
             return self._outcome(candidate_id, projection["title"], "not_verified",
-                                 reason="Reviewer evidence is required to link this existing recipe.",
+                                 reason=("Provide specific reviewer evidence beyond a title match or general familiarity."
+                                         if projection.get("historical_content_unavailable") else
+                                         "Reviewer evidence is required to link this existing recipe."),
                                  attempt_id=attempt_id, comparison=comparison,
                                  comparison_digest=comparison_digest, slug=slug)
         if observed_recipe_digest != comparison_digest:
@@ -734,6 +781,12 @@ class ImportService:
                                  reason="Mealie did not return every compared field; explicitly acknowledge the unavailable evidence.",
                                  attempt_id=attempt_id, comparison=comparison,
                                  comparison_digest=comparison_digest, slug=slug)
+        if projection.get("historical_content_unavailable") and not historical_content_ack:
+            return self._outcome(candidate_id, projection["title"], "not_verified",
+                                 reason="Acknowledge that immutable content evidence from this historical attempt is unavailable.",
+                                 attempt_id=attempt_id, comparison=comparison,
+                                 comparison_digest=comparison_digest, slug=slug,
+                                 historical_content_unavailable=True)
 
         with _state_lock(self.review_path):
             latest_events = self._read_events()
@@ -750,6 +803,7 @@ class ImportService:
                 "event": "reconciled_existing", "schema_version": 1,
                 "event_id": str(uuid.uuid4()), "attempt_id": attempt_id,
                 "candidate_id": candidate_id, "slug": slug,
+                "mealie_recipe_id": str(mealie_recipe["id"]),
                 "title": projection["title"], "source_hash": projection["source_hash"],
                 "source_path": projection["source_path"],
                 "extraction_id": projection["extraction_id"],
@@ -761,6 +815,8 @@ class ImportService:
                 "reviewer_evidence": str(evidence).strip()[:1000],
                 "material_difference_ack": bool(material_difference_ack),
                 "unavailable_field_ack": bool(unavailable_field_ack),
+                "historical_content_unavailable": bool(projection.get("historical_content_unavailable")),
+                "historical_content_ack": bool(historical_content_ack),
                 "created_at": _now(),
             })
         try:
@@ -821,11 +877,17 @@ class ImportService:
         try:
             state = StateStore(self.state_path)
             old = self._state_for(state, candidate_id) or {}
+            if not old:
+                old = next((item for item in reversed(self._candidate_events(
+                    self._read_events(), candidate_id))
+                    if item.get("event") in {"creation_confirmed", "reconciled_existing"}
+                    and item.get("slug") == slug), {})
             state.add(
-                candidate_id, "IMPORTED", slug, str(old.get("file", "")), title,
+                candidate_id, "IMPORTED", slug, str(old.get("file", old.get("source_path", ""))), title,
                 identity=candidate_id, source_hash=str(old.get("source_hash", "")),
                 extraction_id=str(old.get("extraction_id", "")),
-                review_revision=old.get("review_revision"), content_sha256=str(old.get("content_sha256", "")),
+                review_revision=old.get("review_revision", old.get("revision")),
+                content_sha256=str(old.get("content_sha256", "")),
                 import_operation_id=str(old.get("import_operation_id", "")),
                 creation_status=str(old.get("creation_status", "confirmed")),
                 tag_status=("tagged" if status in {"tagged", "already_tagged"}
@@ -982,24 +1044,32 @@ class ImportService:
             str(item.get("attempt_id", "")) for item in candidate_events
             if item.get("event") == "intent_started" and item.get("attempt_id")
         ))
+        unresolved = []
+        for value in attempt_ids:
+            attempt_events = [item for item in candidate_events
+                              if str(item.get("attempt_id", "")) == value]
+            terminal = [item for item in attempt_events if item.get("event") in {
+                "create_uncertain", "create_rejected", "creation_confirmed",
+            }]
+            links = [item for item in attempt_events if item.get("event") == "reconciled_existing"]
+            if not terminal and not links:
+                unresolved.append(value)
+            elif (len(terminal) == 1 and terminal[0].get("event") == "create_uncertain"
+                  and not links):
+                unresolved.append(value)
         if attempt_id:
             if attempt_id not in attempt_ids:
                 return None, "The selected uncertain attempt is missing from durable import history."
+            selected_links = [item for item in candidate_events
+                              if item.get("event") == "reconciled_existing"
+                              and str(item.get("attempt_id", "")) == attempt_id]
+            if len(unresolved) > 1 or (unresolved and attempt_id not in unresolved):
+                return None, ("Import history contains multiple or conflicting unresolved intents. "
+                              "Review the durable event history before continuing.")
+            if len(selected_links) > 1:
+                return None, "The selected attempt has duplicate reconciliation history and is protected."
             selected = attempt_id
         else:
-            unresolved = []
-            for value in attempt_ids:
-                attempt_events = [item for item in candidate_events
-                                  if str(item.get("attempt_id", "")) == value]
-                terminal = [item for item in attempt_events if item.get("event") in {
-                    "create_uncertain", "create_rejected", "creation_confirmed",
-                }]
-                links = [item for item in attempt_events if item.get("event") == "reconciled_existing"]
-                if not terminal and not links:
-                    unresolved.append(value)
-                elif (len(terminal) == 1 and terminal[0].get("event") == "create_uncertain"
-                      and not links):
-                    unresolved.append(value)
             if len(unresolved) != 1:
                 return None, ("Import history does not identify exactly one unresolved intent or uncertain attempt. "
                               "Review the durable event history before continuing.")
@@ -1027,6 +1097,60 @@ class ImportService:
                               "uncertain" if outcome.get("event") == "create_uncertain" else
                               "reconciled" if links else "uncertain")
         legacy_mode = intent.get("authorization_mode") == "legacy_auto_import"
+        historical_mode = (
+            intent.get("event") == "intent_started" and intent.get("plan_id") == "cli"
+            and intent.get("schema_version") == 1
+            and not intent.get("authorization_mode")
+            and all(intent.get(key) in (None, "") for key in (
+                "attempt_evidence_version", "content_sha256", "recipe_snapshot", "outbound_payload",
+            ))
+        )
+        if historical_mode:
+            required = ("attempt_id", "candidate_id", "source_hash", "extraction_id", "revision", "title")
+            if any(intent.get(key) in (None, "") for key in required):
+                return None, "The historical CLI attempt lacks durable candidate/source identity and remains protected."
+            if (not re.fullmatch(r"[0-9a-f]{64}", str(intent.get("source_hash", "")))
+                    or not re.fullmatch(r"[0-9a-f]{64}", str(intent.get("extraction_id", "")))):
+                return None, "The historical attempt has invalid source/extraction identity and remains protected."
+            try:
+                review_events = [json.loads(line) for line in self.review_path.read_text(encoding="utf-8").splitlines()
+                                 if line.strip()] if self.review_path.exists() else []
+                registrations = [item for item in review_events
+                                 if item.get("event") == "candidate_registration"
+                                 and item.get("candidate_id") == candidate_id
+                                 and item.get("source_hash") == intent.get("source_hash")
+                                 and item.get("extraction_id") == intent.get("extraction_id")]
+                revision = int(intent["revision"])
+                candidate_snapshot = registrations[0].get("candidate") if len(registrations) == 1 else None
+            except Exception:
+                return None, "Historical candidate/source identity could not be verified; the attempt remains protected."
+            if (len(registrations) != 1 or registrations[0].get("identity_status") != "registered"
+                    or not isinstance(candidate_snapshot, dict)):
+                return None, "The historical attempt does not have one verified candidate/source identity and remains protected."
+            try:
+                state_record = self._state_for(StateStore(self.state_path), candidate_id)
+            except Exception:
+                return None, "Compatibility import history is malformed; the historical attempt remains protected."
+            if state_record and ((str(state_record.get("status", "")).upper() == "IMPORTED" and not links)
+                                 or (links and state_record.get("slug") not in (None, "", links[0].get("slug")))):
+                return None, "Compatibility history conflicts with the unresolved historical attempt; review local history."
+            snapshot = candidate_snapshot
+            if snapshot.get("name") != str(intent.get("title", "")):
+                return None, "The historical title conflicts with the registered source candidate and remains protected."
+            return {
+                "attempt_id": selected, "events": attempt_events,
+                "source_hash": str(intent["source_hash"]),
+                "extraction_id": str(intent["extraction_id"]), "revision": revision,
+                "content_sha256": "", "title": str(intent["title"]),
+                "source_path": str(intent.get("source_path", "")),
+                "batch_tag": str(intent.get("batch_tag", "")),
+                "created_at": str(intent.get("created_at", "")),
+                "outcome_status": outcome_status,
+                "provider_response_evidence": self._provider_evidence(outcome) if outcome else "",
+                "recipe_snapshot": snapshot,
+                "authorization_mode": "historical_cli_incomplete_evidence",
+                "historical_content_unavailable": True,
+            }, ""
         required = ("attempt_id", "candidate_id", "source_hash", "extraction_id",
                     "content_sha256", "title") + (() if legacy_mode else ("revision",))
         if any(intent.get(key) in (None, "") for key in required):

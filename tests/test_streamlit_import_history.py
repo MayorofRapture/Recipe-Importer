@@ -160,6 +160,55 @@ class StreamlitImportHistoryTests(unittest.TestCase):
             self.assertTrue(linked["material_difference_ack"])
             self.assertTrue(linked["unavailable_field_ack"])
 
+    def test_historical_intent_ui_discloses_missing_content_and_requires_acknowledgment(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            fixture = write_ui_fixture(root)
+            output = Path(fixture["output"])
+            view = next(item for item in load_catalog(output, root / "sources")
+                        if item.candidate.name == "Fried Rice")
+            attempt_id = "historical-cli-ui-attempt"
+            intent = {
+                "event": "intent_started", "schema_version": 1,
+                "attempt_id": attempt_id, "plan_id": "cli",
+                "candidate_id": view.candidate_id, "source_hash": view.source_hash,
+                "extraction_id": view.extraction_id, "revision": view.revision,
+                "title": view.candidate.name, "source_path": str(fixture["source"]),
+                "batch_tag": "Historical batch",
+            }
+            with (output / "ui_import_events.jsonl").open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(intent) + "\n")
+                handle.write(json.dumps({"event": "create_uncertain", "attempt_id": attempt_id,
+                                         "candidate_id": view.candidate_id}) + "\n")
+            (output / "fixture_mealie.json").write_text(json.dumps({
+                "recipes": {"historical-existing": {
+                    "id": "historical-mealie-id", "slug": "historical-existing",
+                    "name": view.candidate.name, "tags": [],
+                    "payload": schema_recipe(view.candidate),
+                }}, "tags": {},
+            }), encoding="utf-8")
+
+            with patch.dict(os.environ, {
+                "RECIPE_IMPORTER_OUTPUT_DIR": str(output),
+                "RECIPE_IMPORTER_SOURCE_DIR": str(root / "sources"),
+                "RECIPE_IMPORTER_FIXTURE_MODE": "1",
+            }):
+                app = AppTest.from_file(str(PAGE)).run(timeout=15)
+                app.text_input(key=f"slug:{view.candidate_id}").set_value("historical-existing").run(timeout=15)
+                next(button for button in app.button if button.label == "Inspect existing recipe").click().run(timeout=15)
+                self.assertFalse(app.exception)
+                self.assertTrue(any("did not preserve the submitted recipe snapshot or immutable content digest" in item.value
+                                    for item in app.warning), repr(([getattr(x, "value", "") for x in app.warning],
+                                                                    [getattr(x, "value", "") for x in app.caption])))
+                confirm = next(button for button in app.button if button.label == "Confirm this existing recipe")
+                self.assertTrue(confirm.disabled)
+                self.assertTrue(any(item.label == "I understand the original submitted content evidence is unavailable."
+                                    for item in app.checkbox))
+
+            events = [json.loads(line) for line in
+                      (output / "ui_import_events.jsonl").read_text(encoding="utf-8").splitlines()]
+        self.assertFalse(any(item.get("event") == "reconciled_existing" for item in events))
+
     def test_tag_repair_outcome_survives_rerender_until_dismissed(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

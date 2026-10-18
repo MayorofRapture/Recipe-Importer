@@ -258,10 +258,16 @@ else:
                         and inspection.get("slug", slug.strip()) == slug.strip()):
                     if inspection.get("creation_status") == "confirmation_required":
                         comparison = inspection["comparison"]
-                        st.markdown("**Compare the approved recipe with the returned Mealie recipe**")
+                        historical_missing = bool(inspection.get("historical_content_unavailable"))
+                        st.markdown("**Compare the available source candidate with the returned Mealie recipe**"
+                                    if historical_missing else
+                                    "**Compare the approved recipe with the returned Mealie recipe**")
+                        if historical_missing:
+                            st.warning("This historical CLI attempt did not preserve the submitted recipe snapshot or immutable content digest. The source candidate below is context only; it cannot prove what Mealie received.")
                         left, right = st.columns(2)
                         with left:
-                            st.markdown("**Approved revision**")
+                            st.markdown("**Historical source candidate (not the submitted snapshot)**"
+                                        if historical_missing else "**Approved revision**")
                             st.write(comparison["local"]["title"] or "Untitled recipe")
                             st.markdown("Ingredients")
                             st.write(comparison["local"]["ingredients"] or ["No ingredients recorded"])
@@ -296,7 +302,9 @@ else:
                         evidence = st.text_area(
                             "Evidence for linking this Mealie recipe to the uncertain import",
                             key=f"reconcile_evidence:{identity}:{item.get('attempt_id', '')}",
-                            help="Record what you compared. A matching title alone is not identity evidence.")
+                            help=("Record concrete source, timing, and recipe details that identify this specific entry."
+                                  if historical_missing else
+                                  "Record what you compared. A matching title alone is not identity evidence."))
                         material_ack = False
                         if comparison["material_differences"]:
                             material_ack = st.checkbox(
@@ -307,10 +315,17 @@ else:
                             unavailable_ack = st.checkbox(
                                 "I understand the listed fields were not returned by Mealie and cannot be compared.",
                                 key=f"reconcile_unavailable_ack:{identity}:{item.get('attempt_id', '')}")
+                        historical_ack = False
+                        if historical_missing:
+                            historical_ack = st.checkbox(
+                                "I understand the original submitted content evidence is unavailable.",
+                                key=f"reconcile_historical_ack:{identity}:{item.get('attempt_id', '')}")
                         if st.button("Confirm this existing recipe", key=f"confirm_reconcile:{identity}",
                                      disabled=not evidence.strip() or (
+                                         historical_missing and len(evidence.strip()) < 40) or (
                                          bool(comparison["material_differences"]) and not material_ack) or (
-                                         bool(comparison["unavailable_fields"]) and not unavailable_ack)):
+                                         bool(comparison["unavailable_fields"]) and not unavailable_ack) or (
+                                         historical_missing and not historical_ack)):
                             action_id = uuid.uuid4().hex
                             active_service = service
                             try:
@@ -325,6 +340,7 @@ else:
                                     reviewer_confirmed=True, evidence=evidence,
                                     material_difference_ack=material_ack,
                                     unavailable_field_ack=unavailable_ack,
+                                    historical_content_ack=historical_ack,
                                     observed_recipe_digest=inspection["comparison_digest"])
                                 st.session_state[inspection_key] = _persist_reconciliation_result(
                                     active_service, result, candidate_id=identity,

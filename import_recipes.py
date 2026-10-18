@@ -1291,7 +1291,7 @@ def repair_import_tags(work: Path, batch_tag: str, client) -> list[dict]:
     if not tag:
         raise ValueError("--repair-failed-tags requires --batch-tag")
     state = StateStore(Path(work) / "import_state.jsonl")
-    recoverable = []
+    recoverable = {}
     for key, record in state.records.items():
         identity = str(record.get("identity") or record.get("key") or key).strip()
         existing_tag = str(record.get("batch_tag") or record.get("tag_name") or "").strip()
@@ -1299,10 +1299,16 @@ def repair_import_tags(work: Path, batch_tag: str, client) -> list[dict]:
         slug = str(record.get("slug", "")).strip()
         if (identity and slug and str(record.get("status", "")).upper() == "IMPORTED"
                 and existing_tag == tag and status in {"pending", "failed", "unknown"}):
-            recoverable.append((identity, record))
+            recoverable[identity] = record
     service = ImportService(Path(work), client=client)
+    for record in service.history():
+        identity = str(record.get("candidate_id", "")).strip()
+        if (identity and str(record.get("batch_tag", "")).strip() == tag
+                and str(record.get("tag_status", "")).casefold() in {"pending", "failed", "unknown"}
+                and record.get("slug")):
+            recoverable.setdefault(identity, record)
     rows = []
-    for identity, record in recoverable:
+    for identity, record in recoverable.items():
         result = service.repair_tag(identity, expected_tag=tag)
         rows.append({
             "candidate_id": identity,
@@ -1598,16 +1604,15 @@ def main() -> int:
                 work, source_root=source_root if source_root.is_dir() else None,
                 client=MealieClient(url, token),
             )
+            history_by_id = {str(item.get("candidate_id", "")): item for item in service.history()}
             plan = service.preview(candidate_ids, args.batch_tag)
             eligible = plan["eligible"]
             if not eligible:
                 print("No selected candidate has a currently approved, import-eligible revision.", file=sys.stderr)
-                for item in plan.get("excluded", []):
-                    print(f"{item['candidate_id']}: {item['reason']}", file=sys.stderr)
-                return 1
-            print("Approved revisions selected:")
-            for item in eligible:
-                print(f"{item['candidate_id']} · revision {item['revision']} · {item['title']}")
+            else:
+                print("Approved revisions selected:")
+                for item in eligible:
+                    print(f"{item['candidate_id']} · revision {item['revision']} · {item['title']}")
             for item in plan.get("excluded", []):
                 print(f"Excluded {item['candidate_id']}: {item['reason']}", file=sys.stderr)
             outcomes = service.dispatch(plan["plan_id"])
@@ -1617,22 +1622,51 @@ def main() -> int:
             "candidate_id": item.get("candidate_id", ""), "title": item.get("title", ""),
             "creation_status": item.get("creation_status", ""), "slug": item.get("slug", ""),
             "tag_status": item.get("tag_status", ""), "note": item.get("reason", ""),
+            "outcome_status": "tag_incomplete" if item.get("creation_status") in {
+                "created", "already_created", "linked_existing",
+            } and item.get("tag_status") in {"pending", "failed", "unknown"} else
+                "created" if item.get("creation_status") == "created" else
+                "already_protected" if item.get("creation_status") in {"already_created", "protected"} else
+                str(item.get("creation_status", "uncertain")),
         } for item in outcomes]
+        outcome_ids = {str(row["candidate_id"]) for row in rows}
+        for item in plan.get("excluded", []):
+            candidate_id = str(item.get("candidate_id", ""))
+            if candidate_id in outcome_ids:
+                continue
+            reason = str(item.get("reason", "Candidate was excluded by import eligibility checks."))
+            protected = any(word in reason.casefold() for word in ("protected", "already imported", "already created"))
+            prior = history_by_id.get(candidate_id, {})
+            prior_status = str(prior.get("creation_status", "")).casefold()
+            creation_status = ("uncertain" if prior_status == "uncertain" else
+                               "already_imported" if prior_status in {"created", "linked_existing"} else
+                               "excluded")
+            outcome_status = ("uncertain" if creation_status == "uncertain" else
+                              "already_imported" if creation_status == "already_imported" else
+                              "already_protected" if protected else
+                              "excluded")
+            rows.append({
+                "candidate_id": candidate_id, "title": str(prior.get("title", "")),
+                "creation_status": creation_status, "slug": str(prior.get("slug", "")),
+                "tag_status": str(prior.get("tag_status", "not_attempted")), "note": reason,
+                "outcome_status": outcome_status,
+            })
         report = work / "last_run_report.csv"
         with report.open("w", encoding="utf-8-sig", newline="") as fh:
             writer = csv.DictWriter(fh, fieldnames=[
                 "candidate_id", "title", "creation_status", "slug", "tag_status", "note",
+                "outcome_status",
             ], extrasaction="ignore")
             writer.writeheader()
             writer.writerows(rows)
         counts: dict[str, int] = {}
         for row in rows:
-            status = str(row["creation_status"])
+            status = str(row["outcome_status"])
             counts[status] = counts.get(status, 0) + 1
         print("Approved import summary:", counts)
         print(f"Report: {report}")
-        return 1 if any(row["creation_status"] in {"not_sent", "uncertain", "rejected"}
-                        for row in rows) else 0
+        incomplete = {"tag_incomplete", "excluded", "already_protected", "not_sent", "uncertain", "rejected", "failed"}
+        return 1 if any(row["outcome_status"] in incomplete for row in rows) else 0
     mode = ("extract-only" if args.extract_only else
             "legacy-auto-import" if args.legacy_auto_import else
             "approved-revision import" if args.import_approved else

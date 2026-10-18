@@ -9,7 +9,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import patch
 
-from import_recipes import file_digest
+from import_recipes import file_digest, repair_import_tags
 from recipe_quality import ExtractionBatch, RecipeCandidate, Suggestion, schema_recipe
 from review_store import ReviewStore, _recipe_digest, extraction_identity
 from tests.ui_fixture_factory import write_ui_fixture
@@ -736,6 +736,101 @@ print(json.dumps(ImportService(Path(sys.argv[1]), source_root=Path(sys.argv[2]),
         self.assertEqual(linked[0]["attempt_id"], intent["attempt_id"])
         self.assertIn("approved review revision", linked[0]["reviewer_evidence"])
 
+    def test_reconciled_recipe_remains_tag_recoverable_when_compatibility_write_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output, source_root, candidate_id = _approved_fried_rice(Path(tmp))
+            client = FakeMealie(create_error=TimeoutError("synthetic timeout"))
+            service = ImportService(output, source_root=Path(source_root), client=client)
+            plan = service.preview([candidate_id], batch_tag="Original batch")
+            service.dispatch(plan["plan_id"])
+            intent = next(item for item in service._read_events() if item.get("event") == "intent_started")
+            snapshot = intent["recipe_snapshot"]
+            client.get_recipe = lambda slug: {
+                "id": "existing-id", "slug": slug, "name": snapshot["name"],
+                "recipeIngredient": snapshot["ingredients"],
+                "recipeInstructions": snapshot["instructions"],
+                "recipeYield": snapshot.get("yield_text", ""),
+                "description": snapshot.get("description", ""), "notes": snapshot.get("notes", []),
+            }
+            inspected = service.reconcile_existing(candidate_id, "existing-slug", intent["attempt_id"])
+            with patch("ui_import_service.StateStore.add", side_effect=OSError("ledger unavailable")):
+                linked = service.reconcile_existing(
+                    candidate_id, "existing-slug", intent["attempt_id"], reviewer_confirmed=True,
+                    evidence="Compared the specific Mealie recipe with the approved review.",
+                    unavailable_field_ack=True, observed_recipe_digest=inspected["comparison_digest"],
+                )
+            restarted = ImportService(output, source_root=Path(source_root), client=client)
+            row = next(item for item in restarted.history() if item["candidate_id"] == candidate_id)
+            repaired = repair_import_tags(output, "Original batch", client)[0]
+            repeated = ImportService(output, client=client).repair_tag(candidate_id)
+            events = restarted._read_events()
+
+        self.assertEqual(linked["creation_status"], "linked_existing", linked.get("reason"))
+        self.assertEqual(row["tag_status"], "pending")
+        self.assertEqual(repaired["tag_status"], "tagged")
+        self.assertEqual(repeated["creation_status"], "already_tagged")
+        self.assertEqual(repeated["tag_status"], "tagged")
+        self.assertEqual(len(client.created), 1)
+        self.assertEqual(len([item for item in events if item.get("event") == "reconciled_existing"]), 1)
+
+    def test_historical_cli_attempt_without_snapshot_requires_human_reconciliation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = write_ui_fixture(Path(tmp))
+            output, source = Path(fixture["output"]), Path(fixture["source"])
+            view = next(item for item in load_catalog(output, source.parent)
+                        if item.candidate.name == "Fried Rice")
+            events_path = output / "ui_import_events.jsonl"
+            attempt_id = "historical-cli-attempt"
+            historical_intent = {
+                "event": "intent_started", "schema_version": 1,
+                "attempt_id": attempt_id, "plan_id": "cli",
+                "candidate_id": view.candidate_id, "source_hash": view.source_hash,
+                "extraction_id": view.extraction_id, "revision": view.revision,
+                "title": view.candidate.name, "source_path": str(source),
+                "batch_tag": "Historical batch", "created_at": "2024-01-01T00:00:00+00:00",
+            }
+            with events_path.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(historical_intent) + "\n")
+                fh.write(json.dumps({"event": "create_uncertain", "attempt_id": attempt_id,
+                                     "candidate_id": view.candidate_id, "created_at": "2024-01-01T00:00:01+00:00"}) + "\n")
+            client = FakeMealie()
+            client.get_recipe = lambda slug: {
+                "id": "historical-mealie-id", "slug": slug, "name": "Fried Rice",
+                "recipeIngredient": ["3 cups cooked rice", "1 egg"],
+                "recipeInstructions": ["Cook rice.", "Fold in egg."],
+            }
+            service = ImportService(output, source_root=source.parent, client=client)
+            inspected = service.reconcile_existing(view.candidate_id, "old-slug", attempt_id)
+            evidence_missing = service.reconcile_existing(
+                view.candidate_id, "old-slug", attempt_id, reviewer_confirmed=True,
+                evidence="The title is familiar.", unavailable_field_ack=True,
+                observed_recipe_digest=inspected.get("comparison_digest", ""),
+            )
+            linked = service.reconcile_existing(
+                view.candidate_id, "old-slug", attempt_id, reviewer_confirmed=True,
+                evidence="Matched the source filename, date, and ingredient list in my archived cooking notes.",
+                material_difference_ack=True, unavailable_field_ack=True, historical_content_ack=True,
+                observed_recipe_digest=inspected.get("comparison_digest", ""),
+            )
+            repeated = ImportService(output, client=client).reconcile_existing(
+                view.candidate_id, "different-slug", attempt_id, reviewer_confirmed=True,
+                evidence="Repeated verification.", historical_content_ack=True,
+                unavailable_field_ack=True,
+                observed_recipe_digest=inspected.get("comparison_digest", ""),
+            )
+            final_events = [json.loads(line) for line in events_path.read_text(encoding="utf-8").splitlines()]
+
+        self.assertEqual(inspected["creation_status"], "confirmation_required", inspected.get("reason"))
+        self.assertTrue(inspected["comparison"]["unavailable_fields"])
+        self.assertEqual(evidence_missing["creation_status"], "not_verified")
+        self.assertEqual(linked["creation_status"], "linked_existing", linked.get("reason"))
+        self.assertEqual(repeated["creation_status"], "already_linked")
+        reconciliations = [item for item in final_events if item.get("event") == "reconciled_existing"]
+        self.assertEqual(len(reconciliations), 1)
+        self.assertEqual(reconciliations[0]["attempt_id"], attempt_id)
+        self.assertEqual(reconciliations[0]["mealie_recipe_id"], "historical-mealie-id")
+        self.assertTrue(reconciliations[0]["historical_content_ack"])
+
     def test_orphaned_create_intent_is_inspectable_and_reconcilable_without_retry(self):
         with tempfile.TemporaryDirectory() as tmp:
             output, source_root, candidate_id = _approved_fried_rice(Path(tmp))
@@ -923,6 +1018,21 @@ print(json.dumps(ImportService(Path(sys.argv[1]), source_root=Path(sys.argv[2]),
         self.assertEqual(result["creation_status"], "not_verified")
         self.assertIn("duplicate", result["reason"])
         self.assertEqual(len(client.created), 1)
+
+    def test_explicit_attempt_selection_still_blocks_multiple_unresolved_intents(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "output"
+            output.mkdir()
+            service = ImportService(output)
+            events = [{
+                "event": "intent_started", "attempt_id": f"unresolved-{index}",
+                "candidate_id": "ambiguous-candidate",
+            } for index in range(2)]
+
+            projection, reason = service._uncertain_attempt(events, "ambiguous-candidate", "unresolved-0")
+
+        self.assertIsNone(projection)
+        self.assertIn("multiple", reason)
 
     def test_cli_candidate_uses_shared_claim_and_preserves_legacy_complete_flow(self):
         with tempfile.TemporaryDirectory() as tmp:
