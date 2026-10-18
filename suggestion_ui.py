@@ -89,16 +89,17 @@ def suggestion_summary(suggestions: Iterable[Any]) -> str:
 
 
 def approval_blockers(view: Any, candidate: Any | None = None, *,
-                      suggestion_request_status: str | None = None) -> list[ApprovalBlocker]:
+                      suggestion_request_status: str | None = None,
+                      no_instructions_confirmed: bool = False) -> list[ApprovalBlocker]:
     """Return the concrete reasons approval is blocked in the order to resolve them."""
     candidate = candidate or view.candidate
     blockers: list[ApprovalBlocker] = []
     if view.protected:
-        blockers.append(ApprovalBlocker("protected", "Resolve Mealie reconciliation", "recipe-identity"))
+        blockers.append(ApprovalBlocker("protected", "Resolve Mealie reconciliation", "protected-outcome"))
     if view.identity_status != "registered":
         blockers.append(ApprovalBlocker("identity", "Recipe identity requires reconciliation", "recipe-identity"))
     if not view.source_available:
-        blockers.append(ApprovalBlocker("source", "Original source unavailable", "source-preview"))
+        blockers.append(ApprovalBlocker("source", "Original source unavailable", "source-recovery"))
     if view.legacy_draft_conflict:
         blockers.append(ApprovalBlocker("draft", "Save the current revision before approval", "recipe-editor"))
     if suggestion_request_status in {"queued", "running"}:
@@ -109,11 +110,13 @@ def approval_blockers(view: Any, candidate: Any | None = None, *,
         missing.append("recipe title")
     if not any(str(item).strip() for item in candidate.ingredients):
         missing.append("ingredients")
-    if not any(str(item).strip() for item in candidate.instructions):
+    if not any(str(item).strip() for item in candidate.instructions) and not no_instructions_confirmed:
         missing.append("recipe instructions")
+    destinations = {"recipe title": "recipe-title", "ingredients": "recipe-ingredients",
+                    "recipe instructions": "recipe-instructions"}
     for field in missing:
         label = "Missing " + field
-        blockers.append(ApprovalBlocker("incomplete", label, "recipe-editor"))
+        blockers.append(ApprovalBlocker("incomplete", label, destinations[field]))
     critical_count = len(view.critical_findings)
     if critical_count:
         suffix = "s" if critical_count != 1 else ""
@@ -180,20 +183,21 @@ def render_suggestion_summary(st: Any, suggestions: Iterable[Any]) -> None:
     st.caption(suggestion_summary(suggestions))
 
 
-def render_approval_blockers(st: Any, blockers: list[ApprovalBlocker], on_jump: Callable[[str], None] | None = None) -> None:
+def render_approval_blockers(st: Any, blockers: list[ApprovalBlocker],
+                             on_jump: Callable[[str, str], None] | None = None) -> None:
     """Show actual blockers with an optional direct jump control for each one."""
     for index, blocker in enumerate(blockers):
         if blocker.anchor == "recipe-identity":
             st.warning(blocker.label, icon=":material/error:")
             if on_jump and st.button("Resolve identity", key=f"approval_blocker:{blocker.code}:{index}",
                                      help="Open the source-backed identity comparison"):
-                on_jump(blocker.anchor)
+                on_jump(blocker.anchor, blocker.code)
             continue
         columns = st.columns([5, 1], vertical_alignment="center")
         columns[0].warning(blocker.label, icon=":material/error:")
         if on_jump and columns[1].button("Review", key=f"approval_blocker:{blocker.code}:{index}",
                                          help=f"Go to {blocker.label.casefold()}"):
-            on_jump(blocker.anchor)
+            on_jump(blocker.anchor, blocker.code)
 
 
 @dataclass(frozen=True)

@@ -17,6 +17,8 @@ from ui_import_service import ImportService
 
 
 class FakeMealie:
+    supports_empty_instructions = True
+
     def __init__(self, *, create_error=None, tag_error=None):
         self.create_error = create_error
         self.tag_error = tag_error
@@ -67,6 +69,104 @@ def _approved_fried_rice(root: Path) -> tuple[Path, str, str]:
 
 
 class UiImportServiceTests(unittest.TestCase):
+    def test_mealie_empty_instructions_rejection_is_not_reposted_for_same_revision(self):
+        with tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parents[1] /
+                                         ".superpowers/sdd/2026-10-18-manual-review-missing-instructions-navigation/tmp") as tmp:
+            fixture = write_ui_fixture(Path(tmp))
+            output = Path(fixture["output"])
+            source = Path(fixture["source"])
+            view = next(item for item in load_catalog(output, source.parent)
+                        if item.candidate.name == "Fried Rice")
+            recipe = view.candidate.model_copy(deep=True)
+            recipe.instructions = []
+            reviews = ReviewStore(output / "review_events.jsonl")
+            saved = reviews.save_revision(
+                candidate_id=view.candidate_id, source_hash=view.source_hash,
+                extraction_id=view.extraction_id, expected_parent=0,
+                operation_id="save-empty-directions-rejection-test",
+                recipe=recipe.model_dump(mode="json"), target_bindings=list(view.target_bindings),
+            )
+            reviews.record_no_instructions_decision(
+                candidate_id=view.candidate_id, source_hash=view.source_hash,
+                extraction_id=view.extraction_id, revision=saved["revision"],
+                reason="Dry ingredient blend", operation_id="reject-test-no-instructions",
+            )
+            reviews.approve_revision(
+                candidate_id=view.candidate_id, source_hash=view.source_hash,
+                extraction_id=view.extraction_id, revision=saved["revision"],
+                operation_id="reject-test-approval", source_path=source,
+            )
+
+            class Response:
+                status_code = 422
+
+            class Http422(RuntimeError):
+                response = Response()
+
+            client = FakeMealie(create_error=Http422("unsupported empty instructions"))
+            service = ImportService(output, source_root=source.parent, client=client)
+            plan = service.preview([view.candidate_id])
+            first = service.dispatch(plan["plan_id"])
+            again = service.dispatch(plan["plan_id"])
+            refreshed = service.preview([view.candidate_id])
+
+            self.assertEqual(first[0]["creation_status"], "rejected")
+            self.assertEqual(again[0]["creation_status"], "not_sent")
+            self.assertIn("empty-instructions", again[0]["reason"])
+            self.assertEqual(len(client.created), 1)
+            self.assertEqual(refreshed["eligible"], [])
+            self.assertIn("empty-instructions", refreshed["excluded"][0]["reason"])
+
+    def test_manual_approval_of_source_unavailable_seasoning_reaches_mock_mealie_unchanged(self):
+        with tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parents[1] /
+                                         ".superpowers/sdd/2026-10-18-manual-review-missing-instructions-navigation/tmp") as tmp:
+            fixture = write_ui_fixture(Path(tmp))
+            output = Path(fixture["output"])
+            source = Path(fixture["source"])
+            source_hash = file_digest(source)
+            view = next(item for item in load_catalog(output, source.parent)
+                        if item.candidate.name == "Fried Rice")
+            recipe = view.candidate.model_copy(deep=True)
+            recipe.name = "Mediterranean Blend"
+            recipe.ingredients = ["1 tsp oregano", "1 tsp thyme"]
+            recipe.instructions = []
+            reviews = ReviewStore(output / "review_events.jsonl")
+            saved = reviews.save_revision(
+                candidate_id=view.candidate_id, source_hash=source_hash,
+                extraction_id=view.extraction_id, expected_parent=0,
+                operation_id="save-no-direction-seasoning",
+                recipe=recipe.model_dump(mode="json"), target_bindings=[],
+            )
+            reviews.record_no_instructions_decision(
+                candidate_id=view.candidate_id, source_hash=source_hash,
+                extraction_id=view.extraction_id, revision=saved["revision"],
+                reason="Dry ingredient blend", operation_id="decision-no-directions",
+            )
+            source.unlink()
+            reviews.approve_revision(
+                candidate_id=view.candidate_id, source_hash=source_hash,
+                extraction_id=view.extraction_id, revision=saved["revision"],
+                operation_id="manual-approval-no-source", source_path=source,
+                approval_method="manual_source_unavailable", reviewer_acknowledged=True,
+                review_rationale="Reviewed the current recipe without the original scan.",
+            )
+            unsupported = ImportService(output, source_root=source.parent).preview([view.candidate_id])
+            service = ImportService(output, source_root=source.parent, client=FakeMealie())
+            plan = service.preview([view.candidate_id])
+            outcomes = service.dispatch(plan["plan_id"])
+
+            self.assertEqual(len(plan["eligible"]), 1)
+            self.assertEqual(unsupported["eligible"], [])
+            self.assertIn("disabled", unsupported["excluded"][0]["reason"])
+            self.assertEqual(plan["eligible"][0]["approval_method"], "manual_source_unavailable")
+            self.assertEqual(plan["eligible"][0]["no_instructions_reason"], "Dry ingredient blend")
+            self.assertEqual(plan["eligible"][0]["recipe"]["instructions"], [])
+            self.assertEqual(service.client.created[0]["recipeInstructions"], [])
+            self.assertEqual(outcomes[0]["creation_status"], "created")
+            history = service.history()[0]
+            self.assertEqual(history["approval_method"], "manual_source_unavailable")
+            self.assertEqual(history["no_instructions_reason"], "Dry ingredient blend")
+
     def test_preview_freezes_only_selected_exact_approved_content(self):
         with tempfile.TemporaryDirectory() as tmp:
             output, source_root, candidate_id = _approved_fried_rice(Path(tmp))

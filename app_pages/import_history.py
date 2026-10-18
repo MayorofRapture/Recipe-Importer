@@ -74,7 +74,14 @@ if plan and st.session_state.get("import_plan_signature") == signature:
         st.markdown(f"**{len(eligible)} recipes will be sent to Mealie**")
         st.caption(f"Tag: {plan.get('batch_tag') or 'No additional tag'}. Only these exact approved revisions are included.")
         for item in eligible:
-            st.write(f"{item['title']} · approved revision {item['revision']}")
+            method = ("manually approved without the original source"
+                      if item.get("approval_method") == "manual_source_unavailable"
+                      else "source-verified approval")
+            st.write(f"{item['title']} · revision {item['revision']} · {method}")
+            if item.get("approval_rationale"):
+                st.caption(f"Review note: {item['approval_rationale']}")
+            if item.get("no_instructions_reason"):
+                st.caption(f"No-instructions decision: {item['no_instructions_reason']}")
         for item in plan.get("excluded", []):
             st.warning(item.get("reason", "This recipe is no longer eligible."))
         if st.button(f"Import {len(eligible)} {'recipe' if len(eligible) == 1 else 'recipes'}", type="primary", disabled=not eligible):
@@ -117,6 +124,12 @@ else:
                             else human_source_name(item.get("source", "")))
             collection = f" · {history_view.batch_name}" if history_view else ""
             st.caption(f"{source_label}{collection} · {item.get('timestamp', '')}")
+            if item.get("approval_method") == "manual_source_unavailable":
+                st.caption("Approved manually without verification against the original source.")
+                if item.get("approval_rationale"):
+                    st.caption(f"Review note: {item['approval_rationale']}")
+            if item.get("no_instructions_reason"):
+                st.caption(f"No preparation instructions required: {item['no_instructions_reason']}")
             if item.get("slug"):
                 st.write(f"Mealie recipe: {item['slug']}")
             if tag_failed and st.button("Retry tag only", key=f"repair:{identity}"):

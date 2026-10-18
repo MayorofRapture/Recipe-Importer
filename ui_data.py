@@ -55,6 +55,9 @@ class RecipeView:
     batch_tag: str = ""
     latest_suggestion_request: dict[str, Any] | None = None
     source_candidate: RecipeCandidate | None = None
+    approval_method: str = ""
+    approval_rationale: str = ""
+    no_instructions_reason: str = ""
 
     @property
     def quality_findings(self):
@@ -131,6 +134,12 @@ def load_catalog(output_dir: Path, source_root: Path | None = None, *,
 
     def source_path_for(identity: str, record: dict[str, Any] | None, expected_hash: str,
                         source_hint: str = "") -> tuple[str, bool]:
+        relinked = next((item for item in reversed(reviews.source_relinks.get(identity, []))
+                         if item.get("source_hash") == expected_hash
+                         and item.get("authority_version") == 1
+                         and source_matches(str(item.get("source_path", "")), expected_hash)), None)
+        if relinked:
+            return str(relinked["source_path"]), True
         if verify_sources:
             path = _source_for(
                 identity, record, source_by_identity, source_root,
@@ -240,7 +249,8 @@ def load_catalog(output_dir: Path, source_root: Path | None = None, *,
                             else legacy_review.approved)
             status = normalize_status(
                 raw_status,
-                candidate_complete=is_complete(reviewed),
+                candidate_complete=is_complete(reviewed, no_instructions_confirmed=bool(
+                    effective and effective.no_instructions_reason)),
                 requires_review=reviewed.requires_review,
                 has_pending_suggestions=bool(reviewed.suggestions and any(
                     item.review_status == "pending" for item in reviewed.suggestions
@@ -295,6 +305,9 @@ def load_catalog(output_dir: Path, source_root: Path | None = None, *,
                     identity, source_hash, extraction_id),
                 source_candidate=RecipeCandidate.model_validate(
                     registration.get("candidate", candidate.model_dump(mode="json"))),
+                approval_method=effective.approval_method if effective else "",
+                approval_rationale=effective.approval_rationale if effective else "",
+                no_instructions_reason=effective.no_instructions_reason if effective else "",
             ))
 
     # Explicitly declared new retry candidates stay in their attempt cache. They
@@ -348,7 +361,8 @@ def load_catalog(output_dir: Path, source_root: Path | None = None, *,
         approved = bool(effective.import_ready if effective.revision else legacy_review.approved)
         status = normalize_status(
             str((record or {}).get("status", "")),
-            candidate_complete=is_complete(reviewed),
+            candidate_complete=is_complete(reviewed, no_instructions_confirmed=bool(
+                effective.no_instructions_reason)),
             requires_review=reviewed.requires_review,
             has_pending_suggestions=any(item.review_status == "pending" for item in reviewed.suggestions),
             has_critical_findings=any(item.severity == "critical" for item in reviewed.missing_information),
@@ -391,6 +405,9 @@ def load_catalog(output_dir: Path, source_root: Path | None = None, *,
                 candidate_id, source_hash, extraction_id),
             source_candidate=RecipeCandidate.model_validate(
                 registration.get("candidate", attempt_candidate.candidate.model_dump(mode="json"))),
+            approval_method=effective.approval_method,
+            approval_rationale=effective.approval_rationale,
+            no_instructions_reason=effective.no_instructions_reason,
         ))
         visible.add(key)
     return views

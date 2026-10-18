@@ -70,6 +70,113 @@ print(json.dumps(items[0]['candidate_id']), flush=True)
 
 
 class ReviewAuthorityTests(unittest.TestCase):
+    def test_recovered_source_must_match_original_hash_before_linking(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ReviewStore(Path(tmp) / "review_events.jsonl")
+            candidate = RecipeCandidate(name="Rice", ingredients=["rice"], instructions=["Cook."])
+            registration = store.register_candidates("lost-scan.jpg", SOURCE_HASH, "extract-1", [candidate])[0]
+            path = Path(tmp) / "recovered.jpg"
+            path.write_bytes(b"unrelated scan")
+            with self.assertRaisesRegex(ReviewConflict, "do not match"):
+                store.record_source_relink(
+                    candidate_id=registration["candidate_id"], source_hash=SOURCE_HASH,
+                    extraction_id="extract-1", source_path=path, operation_id="wrong-source",
+                )
+            path.write_bytes(SOURCE_BYTES)
+            event = store.record_source_relink(
+                candidate_id=registration["candidate_id"], source_hash=SOURCE_HASH,
+                extraction_id="extract-1", source_path=path, operation_id="exact-source",
+            )
+            self.assertEqual(event["source_sha256"], SOURCE_HASH)
+            self.assertEqual(event["source_path"], str(path.resolve()))
+
+    def test_manual_approval_projection_rejects_missing_acknowledgment_provenance(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "review_events.jsonl"
+            store = ReviewStore(path)
+            candidate = RecipeCandidate(name="Rice", ingredients=["rice"], instructions=["Cook."])
+            registration = store.register_candidates("lost.jpg", SOURCE_HASH, "extract-1", [candidate])[0]
+            saved = store.save_revision(
+                candidate_id=registration["candidate_id"], source_hash=SOURCE_HASH,
+                extraction_id="extract-1", expected_parent=0, operation_id="ack-save",
+                recipe=candidate.model_dump(mode="json"), target_bindings=[],
+            )
+            source = _source_path(tmp)
+            source.unlink()
+            store.approve_revision(
+                candidate_id=registration["candidate_id"], source_hash=SOURCE_HASH,
+                extraction_id="extract-1", revision=saved["revision"], operation_id="ack-approve",
+                source_path=source, approval_method="manual_source_unavailable",
+                reviewer_acknowledged=True, review_rationale="Reviewed the current recipe.",
+            )
+            events = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+            approval = next(item for item in events if item.get("event") == "review_approval")
+            approval["reviewer_acknowledgment"] = ""
+            path.write_text("".join(json.dumps(item) + "\n" for item in events), encoding="utf-8")
+            projected = ReviewStore(path).project(registration["candidate_id"], SOURCE_HASH,
+                                                   "extract-1", candidate)
+
+            self.assertFalse(projected.approved)
+            self.assertFalse(projected.import_ready)
+
+    def test_manual_source_approval_and_no_instruction_decision_are_exact_revision_bound(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ReviewStore(Path(tmp) / "review_events.jsonl")
+            candidate = RecipeCandidate(name="Mediterranean Blend", ingredients=["1 tsp oregano"])
+            registration = store.register_candidates("lost-scan.jpg", SOURCE_HASH, "extract-1", [candidate])[0]
+            candidate_id = registration["candidate_id"]
+            saved = store.save_revision(
+                candidate_id=candidate_id, source_hash=SOURCE_HASH, extraction_id="extract-1",
+                expected_parent=0, operation_id="save-seasoning",
+                recipe=candidate.model_dump(mode="json"), target_bindings=[],
+            )
+            with self.assertRaisesRegex(ReviewConflict, "reason"):
+                store.record_no_instructions_decision(
+                    candidate_id=candidate_id, source_hash=SOURCE_HASH, extraction_id="extract-1",
+                    revision=saved["revision"], reason=" ", operation_id="no-directions",
+                )
+            decision = store.record_no_instructions_decision(
+                candidate_id=candidate_id, source_hash=SOURCE_HASH, extraction_id="extract-1",
+                revision=saved["revision"], reason="Dry ingredient blend", operation_id="no-directions",
+            )
+            with self.assertRaisesRegex(ReviewConflict, "acknowledgment"):
+                store.approve_revision(
+                    candidate_id=candidate_id, source_hash=SOURCE_HASH, extraction_id="extract-1",
+                    revision=saved["revision"], operation_id="manual-approval-missing-ack",
+                    source_path=Path(tmp) / "source-no-longer-present.jpg",
+                    approval_method="manual_source_unavailable", reviewer_acknowledged=False,
+                    review_rationale="Reviewed current recipe.",
+                )
+            approval = store.approve_revision(
+                candidate_id=candidate_id, source_hash=SOURCE_HASH, extraction_id="extract-1",
+                revision=saved["revision"], operation_id="manual-approval",
+                source_path=Path(tmp) / "source-no-longer-present.jpg",
+                approval_method="manual_source_unavailable", reviewer_acknowledged=True,
+                review_rationale="Reviewed current recipe; original scan is unavailable.",
+            )
+            effective = store.project(candidate_id, SOURCE_HASH, "extract-1", candidate)
+
+            self.assertEqual(decision["content_sha256"], saved["content_sha256"])
+            self.assertEqual(approval["source_hash"], SOURCE_HASH)
+            self.assertEqual(approval["approval_method"], "manual_source_unavailable")
+            self.assertIn("original source is unavailable", approval["reviewer_acknowledgment"])
+            self.assertEqual(effective.approval_method, "manual_source_unavailable")
+            self.assertEqual(effective.no_instructions_reason, "Dry ingredient blend")
+            self.assertTrue(effective.import_ready, repr(effective))
+
+            changed = candidate.model_copy(deep=True)
+            changed.ingredients[0] = "2 tsp oregano"
+            changed.instructions = ["Mix and use."]
+            next_revision = store.save_revision(
+                candidate_id=candidate_id, source_hash=SOURCE_HASH, extraction_id="extract-1",
+                expected_parent=saved["revision"], operation_id="changed-seasoning",
+                recipe=changed.model_dump(mode="json"), target_bindings=[],
+            )
+            stale = store.project(candidate_id, SOURCE_HASH, "extract-1", changed)
+            self.assertEqual(next_revision["revision"], 2)
+            self.assertFalse(stale.import_ready)
+            self.assertFalse(stale.no_instructions_reason)
+
     def test_registration_snapshot_refreshes_when_another_writer_registered_first(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "review_events.jsonl"

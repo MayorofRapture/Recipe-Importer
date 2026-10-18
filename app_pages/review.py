@@ -220,7 +220,9 @@ def _approval_block_reason(view, buffer) -> str | None:
 def _approval_blockers(view, candidate=None):
     request = _suggestion_request_snapshot(view)
     return approval_blockers(
-        view, candidate, suggestion_request_status=request.get("status") if request else None)
+        view, candidate, suggestion_request_status=request.get("status") if request else None,
+        no_instructions_confirmed=bool(view.no_instructions_reason and candidate is not None
+                                       and candidate.model_dump(mode="json") == view.candidate.model_dump(mode="json")))
 
 
 def _suggestion_request_snapshot(view):
@@ -254,17 +256,88 @@ def _invalidate_suggestion_request_snapshot(candidate_id: str) -> None:
     st.session_state.pop(f"suggestion_request_snapshot:{candidate_id}", None)
 
 
-def _jump_to_blocker(anchor: str, candidate_id: str) -> None:
-    st.session_state.review_jump_to = anchor
-    st.session_state.review_show_issues = True
+def _jump_to_blocker(anchor: str, candidate_id: str, blocker_code: str = "") -> None:
+    st.session_state.review_pending_blocker_jump = {
+        "candidate_id": candidate_id, "anchor": anchor, "blocker_code": blocker_code,
+    }
+    st.rerun(scope="app")
+
+
+def _apply_pending_blocker_jump(views) -> None:
+    """Route before widgets render, retaining the selected candidate and its draft."""
+    jump = st.session_state.pop("review_pending_blocker_jump", None)
+    if not isinstance(jump, dict):
+        return
+    candidate_id = str(jump.get("candidate_id", ""))
+    anchor = str(jump.get("anchor", ""))
+    blocker_code = str(jump.get("blocker_code", ""))
+    target = next((view for view in views if view.candidate_id == candidate_id), None)
+    if target is None:
+        st.session_state.review_transition_error = "That review item is no longer available in the current library."
+        return
+    current_id = st.session_state.get("review_active_selection", st.session_state.get("review_selection"))
+    if current_id and current_id != candidate_id and not _flush_candidate(current_id, views):
+        st.session_state.review_selection = current_id
+        return
+
+    queue_page = _queue_page(views)
+    if candidate_id not in queue_page["all_ids"]:
+        st.session_state.review_blocker_return_context = _navigation_context()
+        for key, value in (("review_queue", "All recipes"), ("review_search", ""),
+                           ("review_source", "All source files"), ("review_status", "Any status")):
+            st.session_state[key] = value
+            st.session_state.setdefault("review_filter_snapshot", {})[key] = value
+        queue_page = _queue_page(views)
+    target_index = queue_page["all_ids"].index(candidate_id)
+    st.session_state.review_page = target_index // 25 + 1
+    st.session_state.review_selection = candidate_id
+
     if anchor == "recipe-identity":
         st.session_state.review_identity_target = candidate_id
-    if anchor in {"suggestions", "suggestion-request"}:
-        # Tabs register their session-state key when the editor fragment is
-        # rendered. Defer changing it until the next app run, before that
-        # fragment creates the widget.
-        st.session_state[f"review_pending_section:{candidate_id}"] = "Instructions"
-    st.rerun()
+    if anchor == "protected-outcome":
+        st.session_state.review_protected_target = candidate_id
+        st.session_state.review_workspace_view = "Recipe"
+    if anchor in {"critical-findings", "suggestions", "suggestion-request"}:
+        st.session_state.review_show_issues = True
+        if anchor == "suggestions":
+            st.session_state.review_workspace_view = "Recipe"
+        if anchor == "critical-findings" and target.critical_findings:
+            finding = target.critical_findings[0]
+            st.session_state.review_finding_target = (candidate_id, finding.field_path)
+        if anchor == "suggestions":
+            expected_status = {"stale": "stale", "target_missing": "target_missing",
+                               "suggestions": "pending"}.get(blocker_code)
+            unresolved = next((item for item in target.candidate.suggestions
+                               if (getattr(item, "dynamic_status", None)
+                                   or getattr(item, "review_status", "pending")) == expected_status), None)
+            if unresolved:
+                st.session_state.review_suggestion_target = (candidate_id, unresolved.suggestion_id)
+                field_path = str(unresolved.field_path).casefold()
+                section = ("Ingredients" if field_path.startswith("ingredients") else
+                           "Instructions" if field_path.startswith("instructions") else None)
+                if section:
+                    st.session_state[f"review_pending_section:{candidate_id}"] = section
+    if anchor == "source-recovery":
+        st.session_state.review_workspace_view = "Source"
+    elif anchor in {"recipe-title", "recipe-ingredients", "recipe-instructions", "recipe-editor"}:
+        st.session_state.review_workspace_view = "Recipe"
+        if anchor == "recipe-title":
+            st.session_state.review_focus_field = "title"
+        else:
+            st.session_state[f"review_pending_section:{candidate_id}"] = (
+                "Ingredients" if anchor == "recipe-ingredients" else
+                "Instructions" if anchor == "recipe-instructions" else "Ingredients")
+
+
+def _restore_blocker_queue() -> None:
+    context = st.session_state.pop("review_blocker_return_context", None)
+    if not isinstance(context, dict):
+        return
+    for key, value in context.items():
+        if value is not None:
+            st.session_state[key] = value
+    st.session_state.review_page = context.get("review_page", 1) or 1
+    st.rerun(scope="app")
 
 
 def _queue_state() -> QueueState:
@@ -429,8 +502,15 @@ def _save(view, buffer, advance: bool) -> None:
         _advance_queue(1)
 
 
-def _approve(view, buffer) -> None:
+def _approve(view, buffer, *, approval_method: str = "source_verified",
+             reviewer_acknowledged: bool = False, review_rationale: str = "") -> None:
     candidate, _ = candidate_from_buffer(view, buffer)
+    no_instructions_confirmed = bool(
+        view.no_instructions_reason
+        and candidate.model_dump(mode="json") == view.candidate.model_dump(mode="json"))
+    if not is_complete(candidate, no_instructions_confirmed=no_instructions_confirmed):
+        st.error("Add instructions or record why no preparation instructions are needed before approval.")
+        return
     if any(item.severity == "critical" for item in candidate.missing_information):
         st.error("Resolve the critical source warning before approving this recipe.")
         return
@@ -445,8 +525,12 @@ def _approve(view, buffer) -> None:
         store.approve_revision(
             candidate_id=view.candidate_id, source_hash=view.source_hash,
             extraction_id=view.extraction_id, revision=saved.revision,
-            operation_id=f"ui-approve:{view.candidate_id}:{view.extraction_id}:{saved.revision}",
+            operation_id=(f"ui-approve:{view.candidate_id}:{view.extraction_id}:"
+                          f"{saved.revision}:{approval_method}"),
             source_path=view.source_path,
+            approval_method=approval_method,
+            reviewer_acknowledged=reviewer_acknowledged,
+            review_rationale=review_rationale,
         )
     except Exception as exc:
         if saved is not None:
@@ -455,6 +539,96 @@ def _approve(view, buffer) -> None:
             st.error(f"Approval was not saved. Your current text remains on screen: {exc}")
         return
     _advance_queue(1)
+
+
+def _render_manual_approval(view, buffer) -> None:
+    if view.protected:
+        return
+    with st.container(border=True):
+        st.markdown("**Manually verify the current recipe**")
+        st.caption("This approval records that you reviewed the recipe as written. It does not verify the transcription against the original scan.")
+        st.markdown(f"**{view.candidate.name or 'Untitled recipe'}**")
+        st.write("**Ingredients**")
+        st.write(view.candidate.ingredients or ["No ingredients recorded"])
+        st.write("**Instructions**")
+        st.write(view.candidate.instructions or ["No instructions recorded"])
+        if view.candidate.notes:
+            st.write("**Notes**")
+            st.write(view.candidate.notes)
+        if view.candidate.uncertainties:
+            st.warning("Uncertainties: " + " · ".join(view.candidate.uncertainties))
+        if view.critical_findings:
+            st.warning("Outstanding critical findings must be explicitly resolved before approval.")
+            for finding in view.critical_findings:
+                st.caption(f"{finding.field_path}: {finding.detail}")
+        if view.protected:
+            st.warning("This recipe has a protected Mealie outcome and cannot be approved again.")
+            return
+        candidate, _ = candidate_from_buffer(view, buffer)
+        blockers = [item for item in _approval_blockers(view, candidate) if item.code != "source"]
+        if blockers:
+            st.caption("Resolve the other approval blockers first: " + "; ".join(item.label for item in blockers))
+        ack_key = f"manual_approval_ack:{view.candidate_id}:{view.revision}"
+        rationale_key = f"manual_approval_rationale:{view.candidate_id}:{view.revision}"
+        acknowledged = st.checkbox(
+            "I have reviewed the recipe as currently written. I understand that the original source is unavailable and that this approval does not verify the transcription against the original document.",
+            key=ack_key,
+        )
+        rationale = st.text_area("Why are you approving this recipe without its original source?",
+                                 key=rationale_key, height=90)
+        if st.button("Approve manually & next", key=f"approve_manual:{view.candidate_id}",
+                     disabled=bool(blockers) or not acknowledged or not rationale.strip(),
+                     type="primary", width="stretch"):
+            _approve(view, buffer, approval_method="manual_source_unavailable",
+                     reviewer_acknowledged=acknowledged, review_rationale=rationale)
+
+
+def _render_no_instructions_control(view, buffer) -> None:
+    candidate, _ = candidate_from_buffer(view, buffer)
+    if any(str(item).strip() for item in candidate.instructions) or view.protected:
+        return
+    st.markdown("**How should this recipe be handled?**")
+    choice = st.radio(
+        "Choose what to do with missing instructions",
+        ["Add instructions manually", "Request AI-suggested instructions",
+         "Confirm that no instructions are needed", "Keep as incomplete draft"],
+        index=3,
+        key=f"instruction_handling:{view.candidate_id}",
+        label_visibility="collapsed",
+    )
+    if choice == "Add instructions manually":
+        st.session_state[f"review_pending_section:{view.candidate_id}"] = "Instructions"
+        st.rerun(scope="app")
+    elif choice == "Request AI-suggested instructions":
+        _render_suggestion_request_controls(view)
+    elif choice == "Confirm that no instructions are needed":
+        reason = st.selectbox(
+            "Why are no preparation instructions required?",
+            ["Dry ingredient blend", "Ready-to-use mixture", "Instructions intentionally omitted", "Other"],
+            key=f"no_instructions_reason_choice:{view.candidate_id}",
+        )
+        explanation = ""
+        if reason == "Other":
+            explanation = st.text_input("Explain why no instructions are required",
+                                        key=f"no_instructions_reason_other:{view.candidate_id}")
+        final_reason = explanation.strip() if reason == "Other" else reason
+        if st.button("Record no-instructions decision", key=f"confirm_no_instructions:{view.candidate_id}",
+                     disabled=not final_reason):
+            try:
+                saved, _ = save_draft(view, buffer)
+                reason_digest = hashlib.sha256(final_reason.encode("utf-8")).hexdigest()[:12]
+                review_store().record_no_instructions_decision(
+                    candidate_id=view.candidate_id, source_hash=view.source_hash,
+                    extraction_id=view.extraction_id, revision=saved.revision,
+                    reason=final_reason,
+                    operation_id=(f"ui-no-instructions:{view.candidate_id}:{view.extraction_id}:"
+                                  f"{saved.revision}:{reason_digest}"),
+                )
+                st.session_state.review_save_state = (
+                    f"Recorded for review revision {saved.revision}: {final_reason}.")
+                st.rerun(scope="app")
+            except Exception as exc:
+                st.error(f"The decision was not recorded. Your recipe remains selected. {exc}")
 
 
 def _restore_resume_state(views) -> None:
@@ -558,11 +732,16 @@ def main() -> None:
         "review_status": st.session_state.review_status,
     })
     _apply_pending_queue_change(views)
+    _apply_pending_blocker_jump(views)
     st.session_state.setdefault("review_selection", views[0].candidate_id)
     if st.session_state.get("review_transition_error"):
         st.error(st.session_state.pop("review_transition_error"))
     if st.session_state.get("review_filter_restore_notice"):
         st.info(st.session_state.pop("review_filter_restore_notice"))
+    if st.session_state.get("review_blocker_return_context"):
+        st.info("This recipe was outside your saved queue filters. The queue is showing all recipes so you can review it.")
+        st.button("Return to saved queue", key="review_restore_blocker_queue",
+                  on_click=_restore_blocker_queue)
     queue_page = _queue_page(views)
     candidates = queue_page["candidates"]
     if st.session_state.get("review_queue") == "Extraction quality":
@@ -596,8 +775,19 @@ def main() -> None:
     selected_id = st.session_state.get("review_selection")
     ids = [view.candidate_id for view in candidates]
     if selected_id not in ids:
-        selected_id = ids[0]
-        st.session_state.review_selection = selected_id
+        all_ids = queue_page["all_ids"]
+        if selected_id in all_ids:
+            st.session_state.review_page = all_ids.index(selected_id) // 25 + 1
+            queue_page = _queue_page(views)
+            candidates = queue_page["candidates"]
+            ids = [view.candidate_id for view in candidates]
+        elif ids:
+            selected_id = ids[0]
+            st.session_state.review_selection = selected_id
+        else:
+            _render_queue(views, queue_page)
+            st.info("The selected recipe is outside this queue. Adjust the filters to return to it.")
+            return
     st.session_state.review_queue_ids = ids
     st.session_state.review_all_queue_ids = queue_page["all_ids"]
     view = verify_selected_source(next(v for v in candidates if v.candidate_id == selected_id))
@@ -620,15 +810,17 @@ def main() -> None:
     _render_queue(views, queue_page)
     if view.protected:
         st.warning("Read-only until this recipe’s Mealie outcome is reconciled.")
+        if st.session_state.get("review_protected_target") == view.candidate_id:
+            st.info("This prior or uncertain Mealie outcome protects the recipe from approval and another create request. Use Import history to reconcile it.")
     workspace_view = _render_actions(view, buffer)
     if workspace_view == "Source":
-        _render_source(view)
+        _render_source(view, buffer)
     elif workspace_view == "Recipe":
         _render_editor_fragment(view, buffer)
     else:
         source, editor = st.columns([0.9, 1.1], gap="medium")
         with source:
-            _render_source(view)
+            _render_source(view, buffer)
         with editor:
             _render_editor_fragment(view, buffer)
     _render_ingredient_repair(view, buffer)
@@ -1145,14 +1337,41 @@ def _select_quality_result(candidate_id: str, field_path: str) -> None:
     st.session_state.review_show_issues = True
     st.session_state.review_quality_target = (candidate_id, field_path)
 
-def _render_source(view) -> None:
+def _render_source(view, buffer) -> None:
     with st.container(border=True):
         st.markdown(f"**Source scan** · {view.source_display_name}")
-        if not view.source_path:
-            st.info("Original scan path is unavailable.")
-            return
         if not view.source_verified or not view.source_available:
-            st.warning("The current source file could not be verified against this extraction. Its bytes are not shown as source evidence.")
+            st.warning("Original source unavailable. This recipe cannot be verified against its original scanned document.")
+            if view.source_path:
+                st.caption(f"Last known path: {view.source_path}")
+            st.write("You may restore the exact original file or manually approve the recipe after reviewing its current content.")
+            uploaded = st.file_uploader(
+                "Locate the original PDF or image",
+                type=["pdf", "jpg", "jpeg", "png", "webp"],
+                key=f"restore_source_upload:{view.candidate_id}",
+            )
+            if uploaded is not None:
+                source_bytes = uploaded.getvalue()
+                if hashlib.sha256(source_bytes).hexdigest() != view.source_hash:
+                    st.error("This file does not match the original source hash. It was not saved or linked.")
+                else:
+                    from app_pages.common import paths
+                    output, _ = paths()
+                    suffix = Path(uploaded.name).suffix.casefold()
+                    destination = output / "recovered_sources" / f"{view.candidate_id}-{view.source_hash}{suffix}"
+                    try:
+                        destination.parent.mkdir(parents=True, exist_ok=True)
+                        destination.write_bytes(source_bytes)
+                        review_store().record_source_relink(
+                            candidate_id=view.candidate_id, source_hash=view.source_hash,
+                            extraction_id=view.extraction_id, source_path=destination,
+                            operation_id=f"ui-source-relink:{view.candidate_id}:{view.extraction_id}:{view.source_hash}",
+                        )
+                        st.success("The exact original bytes were restored and linked.")
+                        st.rerun(scope="app")
+                    except Exception as exc:
+                        st.error(f"The source file was not linked. {exc}")
+            _render_manual_approval(view, buffer)
             return
         count("preview_renders")
         page_key = f"page:{view.candidate_id}"
@@ -1206,12 +1425,21 @@ def _render_editor_fragment(view, buffer) -> None:
 def _render_editor(view, buffer) -> None:
     with st.container(border=True):
         st.markdown("**Recipe**")
+        focus_field = st.session_state.pop("review_focus_field", None)
+        if focus_field == "title":
+            st.info("Review the Recipe title field below.")
         name_key = f"recipe_name:{view.candidate_id}"
         st.session_state.setdefault(name_key, str(buffer.get("name", view.candidate.name)))
         st.text_input("Recipe title", key=name_key, disabled=view.protected)
         if view.protected:
             st.text_area("Ingredients", "\n".join(view.candidate.ingredients), disabled=True, key=f"protected_i:{view.candidate_id}")
             st.text_area("Instructions", "\n\n".join(view.candidate.instructions), disabled=True, key=f"protected_s:{view.candidate_id}")
+            blockers = _approval_blockers(view, view.candidate)
+            if blockers:
+                render_approval_blockers(
+                    st, blockers,
+                    on_jump=lambda anchor, code: _jump_to_blocker(anchor, view.candidate_id, code),
+                )
             return
         with st.expander("Optional details", expanded=st.session_state.get("review_show_optional_details", False)):
             st.text_input("Yield", value=str(buffer.get("yield_text", "")),
@@ -1240,11 +1468,13 @@ def _render_editor(view, buffer) -> None:
             st.caption("Unsaved changes · use Save draft to keep these edits.")
         render_suggestion_summary(st, view.candidate.suggestions)
         candidate, _ = candidate_from_buffer(view, buffer)
+        _render_no_instructions_control(view, buffer)
+        candidate, _ = candidate_from_buffer(view, buffer)
         blockers = _approval_blockers(view, candidate)
         if blockers:
             render_approval_blockers(
                 st, blockers,
-                on_jump=lambda anchor: _jump_to_blocker(anchor, view.candidate_id),
+                on_jump=lambda anchor, code: _jump_to_blocker(anchor, view.candidate_id, code),
             )
         if st.button("Approve & next", key=f"approve:{view.candidate_id}", disabled=bool(blockers),
                      type="primary", width="stretch"):
@@ -1582,8 +1812,9 @@ def _render_suggestion_request_controls(view) -> None:
         if not view.source_available:
             st.warning(
                 "Original scan unavailable. Gemini can suggest instructions using the recipe text, "
-                "but the suggestions will be inferred rather than transcribed. The original scan "
-                "must still be verified before final recipe approval."
+                "but those suggestions remain unverified. Restore the exact source scan, or review "
+                "the current recipe and use the explicit manual approval path if you accept that it "
+                "cannot be checked against the scan."
             )
         consent_nonce_key = f"suggestion_consent_nonce:{view.candidate_id}"
         st.session_state.setdefault(consent_nonce_key, uuid.uuid4().hex)
@@ -1633,6 +1864,9 @@ def _render_findings(view, buffer) -> None:
                 st.warning(warning)
         for index, finding in enumerate(view.critical_findings):
             with st.container(border=True):
+                if st.session_state.get("review_finding_target") == (view.candidate_id, finding.field_path):
+                    st.info("Review this finding")
+                    st.session_state.pop("review_finding_target", None)
                 st.warning(f"{finding.field_path}: {finding.detail}")
                 if finding.source_evidence:
                     st.caption(f"Source evidence: {finding.source_evidence}")
@@ -1664,6 +1898,10 @@ def _render_findings(view, buffer) -> None:
                     # The mapped proposal and its decisions are shown inline by the field editor.
                     continue
             with st.container(border=True):
+                if st.session_state.get("review_suggestion_target") == (
+                        view.candidate_id, getattr(suggestion, "suggestion_id", "")):
+                    st.info("Review this suggestion")
+                    st.session_state.pop("review_suggestion_target", None)
                 st.markdown(f"**{path} ? {suggestion_status_label(status)}**")
                 st.caption("Source-supported proposal" if getattr(suggestion, "classification", "inferred") == "source_supported"
                            else "AI-inferred completion ? unverified")

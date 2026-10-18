@@ -26,6 +26,12 @@ class ReviewConflict(RuntimeError):
     """A stale revision or reused operation ID cannot be safely committed."""
 
 
+MANUAL_APPROVAL_ACKNOWLEDGMENT = (
+    "I have reviewed the recipe as currently written. I understand that the original source is unavailable "
+    "and that this approval does not verify the transcription against the original document."
+)
+
+
 @dataclass(frozen=True)
 class EffectiveReview:
     candidate_id: str
@@ -37,6 +43,9 @@ class EffectiveReview:
     resolutions: tuple[dict, ...] = ()
     legacy_draft_conflict: bool = False
     revision_target_bindings: tuple[dict, ...] = ()
+    approval_method: str = ""
+    approval_rationale: str = ""
+    no_instructions_reason: str = ""
 
 
 @contextmanager
@@ -257,6 +266,8 @@ class ReviewStore:
         self.registrations = {}
         self.revisions = {}
         self.approvals = {}
+        self.no_instructions_decisions = {}
+        self.source_relinks = {}
         self.resolutions = {}
         self.events = []
         self._exact_registration_index = {}
@@ -290,6 +301,10 @@ class ReviewStore:
                     self.revisions.setdefault(identity, []).append(event)
                 elif kind == "review_approval":
                     self.approvals.setdefault(identity, []).append(event)
+                elif kind == "review_no_instructions_decision":
+                    self.no_instructions_decisions.setdefault(identity, []).append(event)
+                elif kind == "review_source_relink":
+                    self.source_relinks.setdefault(identity, []).append(event)
                 elif kind == "review_issue_resolution":
                     self.resolutions.setdefault(identity, []).append(event)
                 elif kind == "candidate":
@@ -1921,8 +1936,89 @@ class ReviewStore:
             self._reload()
             return self._readback(revision_event), self._readback(decision_event)
 
+    def record_no_instructions_decision(self, *, candidate_id: str, source_hash: str,
+                                       extraction_id: str, revision: int, reason: str,
+                                       operation_id: str) -> dict:
+        """Record an explicit no-directions decision for one immutable revision."""
+        reason = str(reason or "").strip()
+        if not reason:
+            raise ReviewConflict("a reason is required to confirm that no instructions are needed")
+        with _state_lock(self.path):
+            self._reload()
+            registration, identity_status, _ = self._effective_identity_authority(
+                candidate_id, source_hash, extraction_id)
+            snapshot = next((item for item in self.revisions.get(candidate_id, [])
+                             if int(item.get("revision", -1)) == revision
+                             and item.get("source_hash") == source_hash
+                             and item.get("extraction_id") == extraction_id), None)
+            if not registration:
+                raise ReviewConflict("candidate must be registered before recording this decision")
+            if identity_status != "registered":
+                raise ReviewConflict("candidate identity requires explicit reconciliation")
+            if not snapshot or snapshot.get("content_digest_version") != 1:
+                raise ReviewConflict("the exact review revision is not present")
+            if _recipe_digest(snapshot.get("recipe", {})) != snapshot.get("content_sha256"):
+                raise ReviewConflict("review revision content digest does not match its recipe snapshot")
+            recipe = RecipeCandidate.model_validate(snapshot["recipe"])
+            if not recipe.name.strip() or not any(str(item).strip() for item in recipe.ingredients):
+                raise ReviewConflict("recipe title and ingredients are required before this decision")
+            if any(str(item).strip() for item in recipe.instructions):
+                raise ReviewConflict("remove the instructions in the saved revision before recording this decision")
+            event = self._base_event("review_no_instructions_decision", candidate_id,
+                                     source_hash, extraction_id, operation_id)
+            event.update({"authority_version": 1, "revision": revision,
+                          "content_sha256": snapshot["content_sha256"], "reason": reason})
+            expected = {key: value for key, value in event.items()
+                        if key not in {"event_id", "timestamp", "actor"}}
+            prior = self._existing_operation(operation_id, "review_no_instructions_decision", expected)
+            if prior:
+                return prior
+            current = max((int(item["revision"]) for item in self.revisions.get(candidate_id, [])
+                           if item.get("source_hash") == source_hash
+                           and item.get("extraction_id") == extraction_id), default=0)
+            if revision != current:
+                raise ReviewConflict(f"revision changed: expected {revision}, current {current}")
+            self._append(event, locked=True)
+            self._reload()
+            return self._readback(event)
+
+    def record_source_relink(self, *, candidate_id: str, source_hash: str,
+                             extraction_id: str, source_path: str | Path,
+                             operation_id: str) -> dict:
+        """Record a recovered location only after its bytes match the original digest."""
+        path = Path(source_path)
+        try:
+            digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        except OSError as exc:
+            raise ReviewConflict("recovered source file is unavailable") from exc
+        if digest != source_hash:
+            raise ReviewConflict("recovered source bytes do not match the registered source hash")
+        with _state_lock(self.path):
+            self._reload()
+            registration, identity_status, _ = self._effective_identity_authority(
+                candidate_id, source_hash, extraction_id)
+            if not registration:
+                raise ReviewConflict("candidate registration is unavailable")
+            if identity_status != "registered":
+                raise ReviewConflict("candidate identity requires explicit reconciliation")
+            event = self._base_event("review_source_relink", candidate_id, source_hash,
+                                     extraction_id, operation_id)
+            event.update({"authority_version": 1, "source_path": str(path.resolve()),
+                          "source_sha256": digest})
+            expected = {key: value for key, value in event.items()
+                        if key not in {"event_id", "timestamp", "actor"}}
+            prior = self._existing_operation(operation_id, "review_source_relink", expected)
+            if prior:
+                return prior
+            self._append(event, locked=True)
+            self._reload()
+            return self._readback(event)
+
     def approve_revision(self, *, candidate_id: str, source_hash: str, extraction_id: str,
-                         revision: int, operation_id: str, source_path: str | Path) -> dict:
+                         revision: int, operation_id: str, source_path: str | Path,
+                         approval_method: str = "source_verified",
+                         reviewer_acknowledged: bool = False,
+                         review_rationale: str = "") -> dict:
         with _state_lock(self.path):
             self._reload()
             registration, identity_status, _ = self._effective_identity_authority(
@@ -1936,8 +2032,22 @@ class ReviewStore:
             if not snapshot:
                 raise ReviewConflict("the exact review revision is not present")
             recipe = RecipeCandidate.model_validate(snapshot["recipe"])
-            if not is_complete(recipe):
+            no_instructions = next((item for item in reversed(
+                self.no_instructions_decisions.get(candidate_id, []))
+                if item.get("source_hash") == source_hash
+                and item.get("extraction_id") == extraction_id
+                and item.get("revision") == revision
+                and item.get("content_sha256") == snapshot.get("content_sha256")
+                and item.get("authority_version") == 1), None)
+            if not is_complete(recipe, no_instructions_confirmed=bool(no_instructions)):
                 raise ReviewConflict("an empty or incomplete recipe cannot be approved")
+            if approval_method not in {"source_verified", "manual_source_unavailable"}:
+                raise ReviewConflict("approval method is not supported")
+            review_rationale = str(review_rationale or "").strip()
+            if approval_method == "manual_source_unavailable" and not reviewer_acknowledged:
+                raise ReviewConflict("reviewer acknowledgment is required for manual approval")
+            if approval_method == "manual_source_unavailable" and not review_rationale:
+                raise ReviewConflict("a review rationale is required for manual approval")
             if (snapshot.get("content_digest_version") != 1
                     or _recipe_digest(snapshot["recipe"]) != snapshot.get("content_sha256")):
                 raise ReviewConflict("review revision content digest does not match its recipe snapshot")
@@ -1995,7 +2105,14 @@ class ReviewStore:
                 raise ReviewConflict("a generated suggestion request is still in progress")
             event = self._base_event("review_approval", candidate_id, source_hash,
                                      extraction_id, operation_id)
-            event.update({"revision": revision, "content_sha256": snapshot["content_sha256"],
+            event.update({"authority_version": 1, "approval_method": approval_method,
+                          "reviewer_acknowledged": bool(reviewer_acknowledged),
+                          "reviewer_acknowledgment": (
+                              MANUAL_APPROVAL_ACKNOWLEDGMENT
+                              if approval_method == "manual_source_unavailable" and reviewer_acknowledged else ""),
+                          "review_rationale": review_rationale,
+                          "no_instructions_reason": no_instructions.get("reason", "") if no_instructions else "",
+                          "revision": revision, "content_sha256": snapshot["content_sha256"],
                           "content_digest_version": snapshot.get("content_digest_version", 1),
                           "source_path": str(source_path),
                           "resolution_event_ids": [item["event_id"] for item in resolutions],
@@ -2010,9 +2127,11 @@ class ReviewStore:
             try:
                 actual_source_hash = hashlib.sha256(Path(source_path).read_bytes()).hexdigest()
             except OSError as exc:
-                raise ReviewConflict("source scan is unavailable; no new approval was recorded") from exc
-            if actual_source_hash != source_hash:
-                raise ReviewConflict("source scan bytes do not match the registered source hash")
+                if approval_method != "manual_source_unavailable":
+                    raise ReviewConflict("source scan is unavailable; no new approval was recorded") from exc
+            else:
+                if actual_source_hash != source_hash:
+                    raise ReviewConflict("source scan bytes do not match the registered source hash")
             current = max((int(item["revision"]) for item in self.revisions.get(candidate_id, [])
                            if item.get("source_hash") == source_hash
                            and item.get("extraction_id") == extraction_id), default=0)
@@ -2049,11 +2168,29 @@ class ReviewStore:
         resolution_sha256 = _resolution_digest(current_resolutions)
         approvals = [item for item in self.approvals.get(candidate_id, [])
                      if item.get("revision") == latest["revision"]
+                     and item.get("source_hash") == source_hash
                      and item.get("content_sha256") == latest["content_sha256"]
                      and item.get("extraction_id") == extraction_id
                      and required_resolution_ids == set(item.get("resolution_event_ids", []))
                      and item.get("resolution_sha256") == resolution_sha256]
         approval = max(approvals, key=lambda item: item.get("timestamp", ""), default=None)
+        no_instructions = next((item for item in reversed(
+            self.no_instructions_decisions.get(candidate_id, []))
+            if item.get("source_hash") == source_hash
+            and item.get("extraction_id") == extraction_id
+            and item.get("revision") == latest["revision"]
+            and item.get("content_sha256") == latest.get("content_sha256")
+            and item.get("authority_version") == 1 and str(item.get("reason", "")).strip()), None)
+        approval_method = str((approval or {}).get("approval_method", "source_verified"))
+        authority_valid = bool(approval and (
+            approval_method == "source_verified"
+            or (approval_method == "manual_source_unavailable"
+                and approval.get("authority_version") == 1
+                and approval.get("reviewer_acknowledged") is True
+                and approval.get("reviewer_acknowledgment") == MANUAL_APPROVAL_ACKNOWLEDGMENT
+                and str(approval.get("review_rationale", "")).strip())
+        ) and (not no_instructions
+               or approval.get("no_instructions_reason") == no_instructions.get("reason")))
         snapshot_integrity_valid = (
             latest.get("content_digest_version") == 1
             and _recipe_digest(latest.get("recipe", {})) == latest.get("content_sha256")
@@ -2062,12 +2199,13 @@ class ReviewStore:
             approval and legacy_draft and legacy_draft.saved_at
             and legacy_draft.saved_at > approval.get("timestamp", "")
         )
-        approved = bool(approval and snapshot_integrity_valid and not legacy_draft_conflict and registration
+        approved = bool(authority_valid and snapshot_integrity_valid and not legacy_draft_conflict and registration
                         and identity_status == "registered")
         recipe = latest["recipe"]
         recipe = json.loads(json.dumps(recipe, ensure_ascii=False))
         try:
-            complete = is_complete(RecipeCandidate.model_validate(recipe))
+            complete = is_complete(RecipeCandidate.model_validate(recipe),
+                                   no_instructions_confirmed=bool(no_instructions))
         except (TypeError, ValueError):
             complete = False
         resolutions = tuple(item for item in self.resolutions.get(candidate_id, [])
@@ -2168,7 +2306,8 @@ class ReviewStore:
                                               if not any(issue_id.endswith(":" + item.get("field_path", ""))
                                                          for issue_id in resolved_findings)]
         try:
-            complete = is_complete(RecipeCandidate.model_validate(recipe))
+            complete = is_complete(RecipeCandidate.model_validate(recipe),
+                                   no_instructions_confirmed=bool(no_instructions))
         except (TypeError, ValueError):
             complete = False
         pending = bool(registration and any(
@@ -2210,7 +2349,10 @@ class ReviewStore:
         return EffectiveReview(candidate_id, recipe, int(latest["revision"]),
                                latest["content_sha256"], approved,
                                import_ready, resolutions, legacy_draft_conflict,
-                               tuple(latest.get("target_bindings", [])))
+                               tuple(latest.get("target_bindings", [])),
+                               approval_method if authority_valid else "",
+                               str((approval or {}).get("review_rationale", "")) if authority_valid else "",
+                               str(no_instructions.get("reason", "")) if no_instructions else "")
 
     def add_candidate(self, source: str, candidate_id: str, candidate: RecipeCandidate) -> None:
         if candidate_id in self.candidates:

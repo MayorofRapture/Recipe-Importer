@@ -31,10 +31,20 @@ class ImportService:
     """UI import boundary. It never loads credentials or constructs a client."""
 
     def __init__(self, output_dir: Path, source_root: Path | None = None, client: Any = None,
-                 *, review_path: Path | None = None, state_path: Path | None = None):
+                 *, review_path: Path | None = None, state_path: Path | None = None,
+                 supports_empty_instructions: bool | None = None):
         self.output_dir = Path(output_dir)
         self.source_root = Path(source_root) if source_root is not None else None
         self.client = client
+        configured_empty_instruction_support = (
+            str(os.environ.get("MEALIE_SUPPORTS_EMPTY_INSTRUCTIONS", "")).strip().casefold()
+            in {"1", "true", "yes", "on"}
+        )
+        self.supports_empty_instructions = bool(
+            getattr(client, "supports_empty_instructions", False)
+            if supports_empty_instructions is None
+            else supports_empty_instructions
+        ) or configured_empty_instruction_support
         self.event_path = self.output_dir / "ui_import_events.jsonl"
         self.review_path = Path(review_path) if review_path is not None else self.output_dir / "review_events.jsonl"
         self.state_path = Path(state_path) if state_path is not None else self.output_dir / "import_state.jsonl"
@@ -56,18 +66,23 @@ class ImportService:
                 if reason:
                     excluded.append({"candidate_id": candidate_id, "reason": reason})
                     continue
+                effective = self._effective(review, view)
                 eligible.append({
                     "candidate_id": candidate_id, "title": view.candidate.name,
                     "source_path": view.source_path, "source_hash": view.source_hash,
                     "extraction_id": view.extraction_id, "revision": view.revision,
-                    "content_sha256": self._digest(review, view), "recipe": recipe,
+                    "content_sha256": effective.content_sha256, "recipe": recipe,
+                    "approval_method": effective.approval_method,
+                    "approval_rationale": effective.approval_rationale,
+                    "no_instructions_reason": effective.no_instructions_reason,
                 })
             self._append_locked({
                 "event": "plan_created", "schema_version": 1, "event_id": str(uuid.uuid4()),
                 "plan_id": plan_id, "created_at": _now(), "batch_tag": tag,
                 "eligible": [{key: row[key] for key in (
                     "candidate_id", "title", "source_path", "source_hash", "extraction_id",
-                    "revision", "content_sha256",
+                    "revision", "content_sha256", "approval_method",
+                    "approval_rationale", "no_instructions_reason",
                 )} for row in eligible],
                 "excluded": excluded,
             })
@@ -95,6 +110,7 @@ class ImportService:
                     outcomes.append(self._outcome(candidate_id, planned.get("title", ""),
                                                   blocked_status or "not_sent", reason=reason))
                     continue
+                effective = self._effective(review, view)
                 digest = self._digest(review, view)
                 if (view.revision != planned.get("revision")
                         or digest != planned.get("content_sha256")
@@ -111,6 +127,9 @@ class ImportService:
                     "revision": view.revision, "content_sha256": digest,
                     "title": view.candidate.name, "source_path": view.source_path,
                     "batch_tag": batch_tag, "created_at": _now(),
+                    "approval_method": effective.approval_method,
+                    "approval_rationale": effective.approval_rationale,
+                    "no_instructions_reason": effective.no_instructions_reason,
                 })
             try:
                 slug = self.client.create_recipe(RecipeCandidate.model_validate(recipe))
@@ -125,6 +144,11 @@ class ImportService:
                         "schema_version": 1, "event_id": str(uuid.uuid4()),
                         "attempt_id": attempt_id, "candidate_id": candidate_id,
                         "title": planned.get("title", ""), "source_hash": planned.get("source_hash", ""),
+                        "extraction_id": view.extraction_id, "revision": view.revision,
+                        "content_sha256": digest,
+                        "empty_instructions_rejected": (
+                            not any(str(item).strip() for item in RecipeCandidate.model_validate(recipe).instructions)
+                            and status == "rejected"),
                         "source_path": planned.get("source_path", ""), "batch_tag": batch_tag,
                         "category": category, "http_status": http_status, "created_at": _now(),
                     })
@@ -163,6 +187,9 @@ class ImportService:
                         "source_hash": view.source_hash, "source_path": view.source_path,
                         "extraction_id": view.extraction_id, "revision": view.revision,
                         "content_sha256": digest, "slug": slug, "batch_tag": batch_tag,
+                        "approval_method": planned.get("approval_method", ""),
+                        "approval_rationale": planned.get("approval_rationale", ""),
+                        "no_instructions_reason": planned.get("no_instructions_reason", ""),
                         "created_at": _now(),
                     })
             except Exception:
@@ -194,10 +221,9 @@ class ImportService:
         candidate = RecipeCandidate.model_validate(recipe)
         candidate_id = str(candidate_id)
         source_path = str(source_path)
-        if not is_complete(candidate):
-            return {"status": "not_sent", "slug": "", "tag_status": "not_attempted",
-                    "reason": "Recipe is incomplete."}
         attempt_id = str(uuid.uuid4())
+        approval_provenance = {"approval_method": "", "approval_rationale": "",
+                               "no_instructions_reason": ""}
         review = ReviewStore(self.review_path, state_path=self.state_path)
         with _state_lock(self.review_path):
             review._reload()
@@ -209,27 +235,51 @@ class ImportService:
                          and item.get("extraction_id") == extraction_id
                          for item in review.revisions.get(candidate_id, []))
             if modern:
-                if not self._source_matches(source_path, source_hash):
-                    return {"status": "not_sent", "slug": "", "tag_status": "not_attempted",
-                            "reason": "Source scan is unavailable or no longer matches."}
                 if registration is None:
                     return {"status": "not_sent", "slug": "", "tag_status": "not_attempted",
                             "reason": "Approved review registration is unavailable."}
                 effective = review.project_loaded(candidate_id, source_hash, extraction_id, candidate)
+                approval_provenance = {
+                    "approval_method": effective.approval_method,
+                    "approval_rationale": effective.approval_rationale,
+                    "no_instructions_reason": effective.no_instructions_reason,
+                    "content_sha256": effective.content_sha256,
+                }
                 exact_candidate = RecipeCandidate.model_validate(effective.recipe)
+                if (not any(str(item).strip() for item in exact_candidate.instructions)
+                        and not self.supports_empty_instructions):
+                    return {"status": "not_sent", "slug": "", "tag_status": "not_attempted",
+                            "reason": "Empty-instructions import is disabled until support is verified for the installed Mealie endpoint. Set MEALIE_SUPPORTS_EMPTY_INSTRUCTIONS=true only after confirming it preserves an empty list."}
+                if (effective.approval_method != "manual_source_unavailable"
+                        and not self._source_matches(source_path, source_hash)):
+                    return {"status": "not_sent", "slug": "", "tag_status": "not_attempted",
+                            "reason": "Source scan is unavailable or no longer matches."}
+                if (effective.approval_method == "manual_source_unavailable"
+                        and Path(source_path).is_file()
+                        and not self._source_matches(source_path, source_hash)):
+                    return {"status": "not_sent", "slug": "", "tag_status": "not_attempted",
+                            "reason": "Available source bytes do not match the registered source hash."}
                 if (not effective.import_ready
                         or exact_candidate.model_dump(mode="json") != candidate.model_dump(mode="json")):
                     return {"status": "not_sent", "slug": "", "tag_status": "not_attempted",
                             "reason": "CLI payload does not match the exact approved review revision."}
+                if self._empty_instruction_rejection(events, candidate_id, source_hash,
+                                                     extraction_id, effective.revision,
+                                                     effective.content_sha256):
+                    return {"status": "not_sent", "slug": "", "tag_status": "not_attempted",
+                            "reason": "Mealie rejected an empty-instructions recipe for this exact revision. Edit the recipe or verify endpoint support before another create attempt."}
                 try:
                     protected = review._protected_import_outcome(registration)
                 except ReviewConflict:
                     return {"status": "uncertain", "slug": "", "tag_status": "not_attempted",
                             "reason": "Import history is unreadable; candidate remains protected."}
-                if registration.get("identity_status") != "registered" or protected:
+                if review.identity_link_status(candidate_id, source_hash, extraction_id) != "registered" or protected:
                     return {"status": "already_done", "slug": "", "tag_status": "not_attempted",
                             "reason": "Candidate identity or prior import outcome is protected."}
             elif registration:
+                if not is_complete(candidate):
+                    return {"status": "not_sent", "slug": "", "tag_status": "not_attempted",
+                            "reason": "Recipe is incomplete."}
                 try:
                     protected = review._protected_import_outcome(registration)
                 except ReviewConflict:
@@ -240,6 +290,9 @@ class ImportService:
                     return {"status": status, "slug": str(protected.get("slug", "")),
                             "tag_status": str(protected.get("tag_status", "")),
                             "reason": "A prior import outcome protects this candidate."}
+            elif not is_complete(candidate):
+                return {"status": "not_sent", "slug": "", "tag_status": "not_attempted",
+                        "reason": "Recipe is incomplete."}
             state = StateStore(self.state_path)
             existing = self._state_for(state, candidate_id)
             if existing and str(existing.get("status", "")).upper() in {
@@ -265,6 +318,7 @@ class ImportService:
                                  and item.get("extraction_id") == extraction_id), default=0),
                 "title": candidate.name, "source_path": source_path,
                 "batch_tag": str(batch_tag or "").strip(), "created_at": _now(),
+                **approval_provenance,
             })
         try:
             slug = create_callback(candidate)
@@ -293,6 +347,15 @@ class ImportService:
                     "schema_version": 1, "event_id": str(uuid.uuid4()),
                     "attempt_id": attempt_id, "candidate_id": candidate_id,
                     "title": candidate.name, "source_hash": source_hash,
+                    "extraction_id": extraction_id,
+                    "revision": max((int(item.get("revision", 0))
+                                     for item in review.revisions.get(candidate_id, [])
+                                     if item.get("source_hash") == source_hash
+                                     and item.get("extraction_id") == extraction_id), default=0),
+                    "content_sha256": (approval_provenance.get("content_sha256", "")),
+                    "empty_instructions_rejected": (
+                        not any(str(item).strip() for item in candidate.instructions)
+                        and status == "rejected"),
                     "source_path": source_path, "batch_tag": str(batch_tag or "").strip(),
                     "category": category, "http_status": http_status, "created_at": _now(),
                 })
@@ -313,6 +376,7 @@ class ImportService:
                     "candidate_id": candidate_id, "title": candidate.name,
                     "source_hash": source_hash, "source_path": source_path,
                     "extraction_id": extraction_id, "slug": slug, "batch_tag": tag,
+                    **approval_provenance,
                     "created_at": _now(),
                 })
                 if not tag:
@@ -378,8 +442,13 @@ class ImportService:
                     "creation_status": "not_started", "tag_status": "not_attempted",
                     "batch_tag": str(event.get("batch_tag", "")),
                     "timestamp": str(event.get("created_at", "")), "cache_available": False,
+                    "approval_method": "", "approval_rationale": "",
+                    "no_instructions_reason": "",
                 })
                 kind = event.get("event")
+                for provenance_key in ("approval_method", "approval_rationale", "no_instructions_reason"):
+                    if event.get(provenance_key):
+                        row[provenance_key] = str(event[provenance_key])
                 if kind == "intent_started" and row.get("creation_status") not in {
                     "created", "confirmed", "linked_existing", "already_created",
                 }:
@@ -549,19 +618,33 @@ class ImportService:
             return "Candidate is no longer available.", None
         if view.revision < 1:
             return "UI import requires an explicitly approved review revision.", None
-        if view.identity_status != "registered":
-            return "Candidate identity needs reconciliation.", None
-        if not view.source_path or not self._source_matches(view.source_path, view.source_hash):
-            return "Source scan is unavailable or no longer matches.", None
         effective = self._effective(review, view)
+        if effective and self._empty_instruction_rejection(
+                events, view.candidate_id, view.source_hash, view.extraction_id,
+                effective.revision, effective.content_sha256):
+            return ("Mealie rejected an empty-instructions recipe for this exact revision. Edit the recipe or verify endpoint support before another create attempt.", None)
+        if (view.source_path and Path(view.source_path).is_file()
+                and not self._source_matches(view.source_path, view.source_hash)):
+            return "Source scan is unavailable or no longer matches.", None
         if effective is None or not effective.import_ready:
             return "Exact revision is no longer approved or has unresolved review items.", None
+        if (not any(str(item).strip() for item in effective.recipe.get("instructions", []))
+                and not self.supports_empty_instructions):
+            return ("Empty-instructions import is disabled until support is verified for the installed Mealie endpoint. Set MEALIE_SUPPORTS_EMPTY_INSTRUCTIONS=true only after confirming it preserves an empty list.", None)
+        if view.identity_status != "registered":
+            return "Candidate identity needs reconciliation.", None
+        if effective.approval_method != "manual_source_unavailable":
+            if not view.source_path or not self._source_matches(view.source_path, view.source_hash):
+                return "Source scan is unavailable or no longer matches.", None
+        elif (view.source_path and Path(view.source_path).is_file()
+              and not self._source_matches(view.source_path, view.source_hash)):
+            return "Available source bytes do not match the registered source hash.", None
         if effective.revision != view.revision:
             return "Review changed while loading; refresh the import preflight.", None
         registration = self._registration(review, view)
         if not registration:
             return "Candidate registration is unavailable.", None
-        if registration.get("identity_status") != "registered":
+        if review.identity_link_status(view.candidate_id, view.source_hash, view.extraction_id) != "registered":
             return "Candidate identity needs reconciliation.", None
         try:
             protected = review._protected_import_outcome(registration)
@@ -574,6 +657,19 @@ class ImportService:
             return ("A prior create attempt is uncertain; check Mealie before retrying."
                     if status == "uncertain" else "Candidate was already created; use tag repair if needed."), None
         return "", effective.recipe
+
+    @staticmethod
+    def _empty_instruction_rejection(events: list[dict], candidate_id: str,
+                                     source_hash: str, extraction_id: str,
+                                     revision: int, content_sha256: str) -> bool:
+        return any(item.get("event") == "create_rejected"
+                   and item.get("empty_instructions_rejected") is True
+                   and item.get("candidate_id") == candidate_id
+                   and item.get("source_hash") == source_hash
+                   and item.get("extraction_id") == extraction_id
+                   and item.get("revision") == revision
+                   and item.get("content_sha256") == content_sha256
+                   for item in events)
 
     @staticmethod
     def _effective(review: ReviewStore, view: RecipeView):

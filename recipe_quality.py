@@ -59,11 +59,11 @@ class ExtractionBatch(BaseModel):
     general_warnings: list[str] = Field(default_factory=list)
 
 
-def is_complete(recipe: RecipeCandidate) -> bool:
-    """Return true when the source-derived minimum recipe fields exist."""
+def is_complete(recipe: RecipeCandidate, *, no_instructions_confirmed: bool = False) -> bool:
+    """Return true when required fields exist or a reviewer recorded no directions are needed."""
     return bool(recipe.name.strip() and
                 any(x.strip() for x in recipe.ingredients) and
-                any(x.strip() for x in recipe.instructions))
+                (any(x.strip() for x in recipe.instructions) or no_instructions_confirmed))
 
 
 def needs_review(recipe: RecipeCandidate) -> bool:

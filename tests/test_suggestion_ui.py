@@ -104,6 +104,36 @@ class SuggestionUiProjectionTests(unittest.TestCase):
         )
         self.assertEqual(approval_blockers(view)[0].label, "Missing recipe instructions")
 
+    def test_blockers_point_to_the_field_or_recovery_area_that_needs_attention(self):
+        view = SimpleNamespace(
+            protected=False, identity_status="registered", source_available=False,
+            legacy_draft_conflict=False, critical_findings=[], pending_suggestions=[],
+            candidate=SimpleNamespace(name="", ingredients=[], instructions=[]),
+        )
+        blockers = approval_blockers(view)
+        self.assertEqual(
+            [(item.code, item.anchor) for item in blockers],
+            [("source", "source-recovery"), ("incomplete", "recipe-title"),
+             ("incomplete", "recipe-ingredients"), ("incomplete", "recipe-instructions")],
+        )
+
+    def test_blockers_route_identity_protection_findings_and_suggestions(self):
+        view = SimpleNamespace(
+            protected=True, identity_status="needs_reconciliation", source_available=True,
+            legacy_draft_conflict=False,
+            critical_findings=[SimpleNamespace(field_path="ingredients[0]")],
+            pending_suggestions=[],
+            candidate=SimpleNamespace(
+                name="Blend", ingredients=["1 tsp oregano"], instructions=["Serve."],
+                suggestions=[SimpleNamespace(review_status="pending")],
+            ),
+        )
+        self.assertEqual(
+            [(item.code, item.anchor) for item in approval_blockers(view)],
+            [("protected", "protected-outcome"), ("identity", "recipe-identity"),
+             ("critical", "critical-findings"), ("suggestions", "suggestions")],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

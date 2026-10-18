@@ -13,7 +13,7 @@ from streamlit.testing.v1 import AppTest
 from tests.ui_fixture_factory import write_ui_fixture
 from ui_data import load_catalog
 from recipe_quality import RecipeCandidate
-from app_pages.common import buffer_for, save_draft
+from app_pages.common import buffer_for, paths as configured_paths, save_draft
 from review_store import ReviewStore
 
 
@@ -26,12 +26,21 @@ class ReviewNavigationTests(unittest.TestCase):
         self.root.mkdir()
         self.addCleanup(lambda: shutil.rmtree(self.root, ignore_errors=True))
         self.fixture = write_ui_fixture(self.root)
+        production_output = (Path(__file__).resolve().parents[1] / "output").resolve()
+        fixture_output = Path(self.fixture["output"]).resolve()
+        self.assertNotEqual(fixture_output, production_output)
         self.env = patch.dict(os.environ, {
             "RECIPE_IMPORTER_OUTPUT_DIR": str(self.fixture["output"]),
             "RECIPE_IMPORTER_SOURCE_DIR": str(self.root / "sources"),
         }, clear=False)
         self.env.start()
         self.addCleanup(self.env.stop)
+        self.assertEqual(configured_paths()[0].resolve(), fixture_output)
+        self.assertEqual(configured_paths()[1].resolve(), (self.root / "sources").resolve())
+        self.assertIn("synthetic", (fixture_output / ".fixture-library")
+                      .read_text(encoding="utf-8").casefold())
+        titles = {view.candidate.name for view in load_catalog(fixture_output, self.root / "sources")}
+        self.assertTrue({"Fried Rice", "The Best Caramel Apples", "Cranberry & Caramel Date Bars"} <= titles)
 
     def test_skip_then_back_returns_to_prior_recipe(self):
         app = AppTest.from_file(str(APP_PATH)).run(timeout=10)
@@ -125,8 +134,86 @@ class ReviewNavigationTests(unittest.TestCase):
         next(item for item in app.selectbox if item.label == "Jump to recipe").set_value(imported_id).run(timeout=10)
         self.assertEqual(app.session_state["review_selection"], imported_id)
         self.assertTrue(any("Read-only" in item.value for item in app.warning))
+        next(item for item in app.button if item.key == "approval_blocker:protected:0").click().run(timeout=10)
+        self.assertEqual(app.session_state["review_selection"], imported_id)
+        self.assertEqual(app.session_state["review_protected_target"], imported_id)
+        self.assertTrue(any("protects the recipe from approval" in item.value for item in app.info))
         next(item for item in app.button if item.label == "Back").click().run(timeout=10)
         self.assertEqual(app.session_state["review_selection"], fried_rice)
+        self.assertFalse(app.exception)
+
+    def test_blocker_review_keeps_the_candidate_and_opens_its_destination(self):
+        output = Path(self.fixture["output"])
+        view = next(view for view in load_catalog(output) if view.candidate.name == "Fried Rice")
+        candidate_id = view.candidate_id
+        buffer = buffer_for(view)
+        buffer["structured_instructions"] = []
+        buffer["raw_instructions"] = ""
+        save_draft(view, buffer)
+        Path(self.fixture["source"]).unlink()
+
+        app = AppTest.from_file(str(APP_PATH)).run(timeout=10)
+        next(item for item in app.selectbox if item.label == "Show").set_value("All recipes").run(timeout=10)
+        next(item for item in app.selectbox if item.label == "Jump to recipe").set_value(candidate_id).run(timeout=10)
+        next(item for item in app.button if item.key == "approval_blocker:incomplete:1").click().run(timeout=10)
+        self.assertEqual(app.session_state["review_selection"], candidate_id)
+        self.assertEqual(app.session_state[f"recipe_sections:{candidate_id}"], "Instructions")
+        next(item for item in app.button if item.key == "approval_blocker:source:0").click().run(timeout=10)
+        self.assertEqual(app.session_state["review_selection"], candidate_id)
+        self.assertEqual(app.session_state["review_workspace_view"], "Source")
+        self.assertFalse(app.exception)
+
+    def test_title_and_ingredient_blockers_open_the_matching_editor_area(self):
+        output = Path(self.fixture["output"])
+        view = next(item for item in load_catalog(output) if item.candidate.name == "Fried Rice")
+        candidate_id = view.candidate_id
+        buffer = buffer_for(view)
+        buffer["name"] = ""
+        buffer["structured_ingredients"] = []
+        buffer["raw_ingredients"] = ""
+        save_draft(view, buffer)
+
+        app = AppTest.from_file(str(APP_PATH)).run(timeout=10)
+        next(item for item in app.selectbox if item.label == "Show").set_value("All recipes").run(timeout=10)
+        next(item for item in app.selectbox if item.label == "Jump to recipe").set_value(candidate_id).run(timeout=10)
+        next(item for item in app.button if item.key == "approval_blocker:incomplete:0").click().run(timeout=10)
+        self.assertEqual(app.session_state["review_selection"], candidate_id)
+        self.assertTrue(any("Recipe title field below" in item.value for item in app.info))
+        next(item for item in app.button if item.key == "approval_blocker:incomplete:1").click().run(timeout=10)
+        self.assertEqual(app.session_state["review_selection"], candidate_id)
+        self.assertEqual(app.session_state[f"recipe_sections:{candidate_id}"], "Ingredients")
+        self.assertFalse(app.exception)
+
+    def test_manual_no_instructions_and_source_unavailable_approval_workflow(self):
+        output = Path(self.fixture["output"])
+        source = Path(self.fixture["source"])
+        view = next(item for item in load_catalog(output) if item.candidate.name == "Fried Rice")
+        buffer = buffer_for(view)
+        buffer["structured_instructions"] = []
+        buffer["raw_instructions"] = ""
+        save_draft(view, buffer)
+        source.unlink()
+
+        app = AppTest.from_file(str(APP_PATH)).run(timeout=10)
+        next(item for item in app.selectbox if item.label == "Show").set_value("All recipes").run(timeout=10)
+        next(item for item in app.selectbox if item.label == "Jump to recipe").set_value(view.candidate_id).run(timeout=10)
+        app.radio(key=f"instruction_handling:{view.candidate_id}").set_value(
+            "Confirm that no instructions are needed").run(timeout=10)
+        next(item for item in app.button if item.key == f"confirm_no_instructions:{view.candidate_id}").click().run(timeout=10)
+        current = next(item for item in load_catalog(output) if item.candidate_id == view.candidate_id)
+        self.assertEqual(current.no_instructions_reason, "Dry ingredient blend")
+        self.assertEqual(app.session_state["review_selection"], view.candidate_id)
+
+        app.checkbox(key=f"manual_approval_ack:{view.candidate_id}:{current.revision}").check().run(timeout=10)
+        app.text_area(key=f"manual_approval_rationale:{view.candidate_id}:{current.revision}").set_value(
+            "Reviewed the current recipe without the original scan.").run(timeout=10)
+        next(item for item in app.button if item.key == f"approve_manual:{view.candidate_id}").click().run(timeout=10)
+        approvals = [item for item in ReviewStore(output / "review_events.jsonl").events
+                     if item.get("event") == "review_approval" and item.get("candidate_id") == view.candidate_id]
+        self.assertEqual(len(approvals), 1)
+        self.assertEqual(approvals[0]["approval_method"], "manual_source_unavailable")
+        self.assertEqual(approvals[0]["source_hash"], view.source_hash)
+        self.assertTrue(approvals[0]["reviewer_acknowledged"])
         self.assertFalse(app.exception)
         self.assertFalse(app.exception)
 

@@ -44,6 +44,9 @@ records.
 ## Local review app
 
 See [identity stability and reconciliation](docs/identity-stability-and-reconciliation.md) for the versioned matching rules and safe recovery workflow.
+See [manual approval and recipes without instructions](docs/manual-approval-and-no-instructions.md)
+for the explicit source-unavailable approval path, revision-bound no-instructions
+decisions, and Mealie endpoint verification limits.
 
 After installing the project dependencies, double-click `run_app.bat` or start
 the app from PowerShell:
@@ -77,15 +80,21 @@ recipes as read-only results; opening the audit does not write review state. Not
 substitutions remain outside ingredient rows and are carried into Mealie's recipe
 description.
 
-In Instructions, use **Suggest missing instructions with AI** when there are no usable steps, or **Suggest improvements with AI** when instructions already exist. Each request requires fresh consent and sends only the recipe title, ingredients, and current instructions as text to Gemini; it does not send the scan. If the scan is unavailable, the page explains that suggestions are inferred from recipe text and the scan must still be verified before final approval. The durable job runs in the background, and its result stays labeled inferred and unverified until you accept or edit it. Review the current wording, proposed wording, difference, and uncertainty together beside the relevant step. Declining an optional generated completion leaves the recipe unchanged; critical source findings remain separate. If a proposal is stale, compare it with the current wording and explicitly apply it only when its target still exists, or discard it before requesting again with fresh consent.
+In Instructions, use **Suggest missing instructions with AI** when there are no usable steps, or **Suggest improvements with AI** when instructions already exist. Each request requires fresh consent and sends only the recipe title, ingredients, and current instructions as text to Gemini; it does not send the scan. If the scan is unavailable, the page explains that suggestions are inferred from recipe text and must be reviewed as unverified. The durable job runs in the background, and its result stays labeled inferred and unverified until you accept or edit it. Review the current wording, proposed wording, difference, and uncertainty together beside the relevant step. Declining an optional generated completion leaves the recipe unchanged; critical source findings remain separate. If a proposal is stale, compare it with the current wording and explicitly apply it only when its target still exists, or discard it before requesting again with fresh consent.
 
 The Review panel summarizes suggestion decisions and shows each approval blocker beside a direct Review action. This keeps the next correction close to the reason approval is unavailable. Applied proposals remain distinguishable from accepted edits and declined suggestions, while rejection leaves the source issue visible until a separate follow-up is recorded. If the recipe changes while a generated proposal is pending, compare its original wording with the current wording; explicitly apply it to the current revision when its target still exists, or discard it and request a new proposal with fresh consent.
 
 Use **Back** to revisit the prior recipe, **Skip for now** to move it to the persistent Skipped recipes list, and **Return to** to reopen that exact recipe. If its status no longer matches saved queue filters, Review adjusts the filters and explains the change. A queued AI request remains visible after reopening the app; resume or cancel it explicitly. If a worker may have stopped during a provider call, the app does not retry automatically because the provider outcome is unknown. Start another request only with fresh consent.
 
-If a source preview is unavailable, re-upload the exact original file in Upload.
-The app verifies its content hash before reconnecting it to existing work; a
-same-named file with different bytes cannot restore or approve that recipe.
+If a source preview is unavailable, use **Locate the original PDF or image** in
+Review to reconnect the exact original bytes. The app verifies its content hash;
+a same-named file with different bytes cannot restore or approve that recipe.
+When the original is permanently unavailable, Review offers a separate manual
+approval that requires an acknowledgment and rationale and records that it was
+not verified against the scan. Recipes with no preparation steps remain
+incomplete until you record an exact-revision reason that none are required.
+Import preflight blocks empty-instructions recipes until installed Mealie
+support is verified and `MEALIE_SUPPORTS_EMPTY_INSTRUCTIONS=true` is set.
 
 Use Import & history to select approved recipes and review the exact preflight
 before starting a Mealie import. The selected batch tag applies only to recipes

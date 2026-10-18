@@ -16,6 +16,11 @@ from review_store import ReviewDecision, ReviewStore, apply_review_decision
 
 
 class QualityReviewTests(unittest.TestCase):
+    def test_missing_instructions_stay_incomplete_without_human_decision_and_payload_stays_empty(self):
+        candidate = RecipeCandidate(name="Mediterranean Blend", ingredients=["1 tsp oregano"])
+        self.assertFalse(is_complete(candidate))
+        self.assertEqual(schema_recipe(candidate)["recipeInstructions"], [])
+
     def test_legacy_extraction_json_loads_with_empty_quality_fields(self):
         batch = ExtractionBatch.model_validate({
             "recipes": [{
