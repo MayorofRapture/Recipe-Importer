@@ -10,6 +10,39 @@ from ui_import_service import ImportService
 
 
 class UiHistoryTests(unittest.TestCase):
+    def test_tag_timeout_is_unknown_then_read_before_write_repair_finishes(self):
+        class FakeMealie:
+            def __init__(self):
+                self.add_calls = 0
+            def ensure_tag(self, name):
+                return {"name": name, "slug": "batch"}
+            def add_tag(self, _slug, _tag):
+                self.add_calls += 1
+                if self.add_calls == 1:
+                    raise TimeoutError("synthetic timeout after possible tag update")
+                return "already_present"
+            def create_recipe(self, _recipe):
+                raise AssertionError("tag repair cannot create recipes")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "output"
+            output.mkdir()
+            StateStore(output / "import_state.jsonl").add(
+                "uncertain-tag", "IMPORTED", "existing-slug", "missing.pdf", "Old Recipe",
+                identity="uncertain-tag", batch_tag="Original Tag", tag_status="pending",
+            )
+            client = FakeMealie()
+            service = ImportService(output, client=client)
+            unknown = service.repair_tag("uncertain-tag")
+            after_restart = ImportService(output, client=client).repair_tag("uncertain-tag")
+            rows = ImportService(output).history()
+
+        self.assertEqual(unknown["tag_status"], "unknown")
+        self.assertIn("outcome is unknown", unknown["tag_reason"])
+        self.assertEqual(after_restart["tag_status"], "already_tagged")
+        self.assertEqual(client.add_calls, 2)
+        self.assertEqual(rows[0]["tag_status"], "tagged")
+
     def test_history_includes_legacy_import_when_extraction_cache_is_missing(self):
         with tempfile.TemporaryDirectory() as tmp:
             output = Path(tmp) / "output"

@@ -19,6 +19,28 @@ APP_PATH = Path(__file__).resolve().parents[1] / "streamlit_app.py"
 
 
 class StreamlitImportHistoryTests(unittest.TestCase):
+    def test_pending_and_unknown_tag_states_have_recovery_actions(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            fixture = write_ui_fixture(root)
+            output = Path(fixture["output"])
+            state = StateStore(output / "import_state.jsonl")
+            state.add("pending-tag", "IMPORTED", "pending-slug", "missing.pdf", "Pending Tag",
+                      identity="pending-tag", batch_tag="Cookbook", tag_status="pending")
+            state.add("unknown-tag", "IMPORTED", "unknown-slug", "missing.pdf", "Unknown Tag",
+                      identity="unknown-tag", batch_tag="Cookbook", tag_status="unknown")
+            with patch.dict(os.environ, {
+                "RECIPE_IMPORTER_OUTPUT_DIR": str(output),
+                "RECIPE_IMPORTER_SOURCE_DIR": str(root / "sources"),
+                "RECIPE_IMPORTER_FIXTURE_MODE": "1",
+            }):
+                app = AppTest.from_file(str(PAGE)).run(timeout=15)
+
+        self.assertFalse(app.exception)
+        labels = {item.label for item in app.button}
+        self.assertIn("Apply pending tag", labels)
+        self.assertIn("Verify or repair tag", labels)
+
     def test_reconciliation_error_without_service_identifiers_is_visible_and_durable(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -179,13 +201,13 @@ class StreamlitImportHistoryTests(unittest.TestCase):
                                          "RECIPE_IMPORTER_FIXTURE_MODE": "1"}), \
                     patch("application_services.configured_mealie_client", return_value=client):
                 app = AppTest.from_file(str(PAGE)).run(timeout=15)
-                next(button for button in app.button if button.label == "Retry tag only").click().run(timeout=15)
+                next(button for button in app.button if button.label == "Retry failed tag").click().run(timeout=15)
                 self.assertFalse(app.exception)
-                self.assertTrue(any("Tag repair succeeded" in item.value for item in app.success))
+                self.assertTrue(any("Tag applied" in item.value for item in app.success))
                 app.run(timeout=15)
-                self.assertTrue(any("Tag repair succeeded" in item.value for item in app.success))
+                self.assertTrue(any("Tag applied" in item.value for item in app.success))
                 next(button for button in app.button if button.label == "Dismiss recovery result").click().run(timeout=15)
-                self.assertFalse(any("Tag repair succeeded" in item.value for item in app.success))
+                self.assertFalse(any("Tag applied" in item.value for item in app.success))
 
     def test_current_batch_tag_defaults_into_selected_import_preflight(self):
         with tempfile.TemporaryDirectory() as tmp:

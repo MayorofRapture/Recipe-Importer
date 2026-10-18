@@ -143,9 +143,10 @@ else:
         with st.container(border=True):
             st.markdown(f"**{item.get('title') or 'Recipe'}**")
             status = str(item.get("creation_status") or item.get("status", item.get("state", ""))).upper()
-            tag_failed = item.get("tag_status") == "failed"
+            tag_status = str(item.get("tag_status", "")).casefold()
+            tag_recoverable = tag_status in {"pending", "failed", "unknown"}
             uncertain = status in {"UNCERTAIN", "REQUEST_STARTED", "PREPARED", "CHECK_MEALIE"}
-            st.write("Check whether Mealie received this recipe" if uncertain else "Imported · tag needs attention" if tag_failed else "Imported" if status in {"IMPORTED", "CONFIRMED", "CREATED", "LINKED_EXISTING"} else "Import needs attention")
+            st.write("Check whether Mealie received this recipe" if uncertain else "Imported · tag needs attention" if tag_recoverable else "Imported" if status in {"IMPORTED", "CONFIRMED", "CREATED", "LINKED_EXISTING"} else "Import needs attention")
             source_label = (history_view.source_display_name if history_view
                             else human_source_name(item.get("source", "")))
             collection = f" · {history_view.batch_name}" if history_view else ""
@@ -159,7 +160,9 @@ else:
             if item.get("slug"):
                 st.write(f"Mealie recipe: {item['slug']}")
             repair_result_key = f"tag_repair_result:{identity}"
-            if tag_failed and st.button("Retry tag only", key=f"repair:{identity}"):
+            repair_label = {"pending": "Apply pending tag", "failed": "Retry failed tag",
+                            "unknown": "Verify or repair tag"}.get(tag_status, "")
+            if tag_recoverable and st.button(repair_label, key=f"repair:{identity}"):
                 try:
                     st.session_state[repair_result_key] = connected_service().repair_tag(identity)
                     st.rerun()
@@ -170,8 +173,12 @@ else:
                     failure("Tag repair", error)
             repair_result = st.session_state.get(repair_result_key)
             if repair_result:
-                if repair_result.get("tag_status") in {"tagged", "already_tagged"}:
-                    st.success("Tag repair succeeded. No recipe was created.")
+                if repair_result.get("tag_status") == "tagged":
+                    st.success("Tag applied. No recipe was created.")
+                elif repair_result.get("tag_status") == "already_tagged":
+                    st.success("Tag was already applied. No recipe was created.")
+                elif repair_result.get("tag_status") == "unknown":
+                    st.warning(repair_result.get("tag_reason") or "The tag result is unknown. Verify the recipe in Mealie before retrying.")
                 elif repair_result.get("tag_status") == "failed":
                     st.error(f"Tag repair failed: {repair_result.get('tag_reason') or 'Check the Mealie connection and retry.'}")
                 else:

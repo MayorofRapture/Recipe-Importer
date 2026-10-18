@@ -514,7 +514,7 @@ class ImportService:
                     row["slug"] = str(event.get("slug", row.get("slug", "")))
                     row["tag_status"] = "pending" if event.get("batch_tag") else "not_requested"
                     row["batch_tag"] = str(event.get("batch_tag", row.get("batch_tag", "")))
-                elif kind == "tag_started":
+                elif kind in {"tag_started", "tag_unknown"}:
                     row["tag_status"] = "unknown"
                 elif kind == "tagged":
                     row["tag_status"] = "tagged"
@@ -554,7 +554,7 @@ class ImportService:
                     row["cache_available"] = self._cache_available(str(event["source_hash"]))
             return sorted(rows.values(), key=lambda item: str(item.get("timestamp", "")), reverse=True)
 
-    def repair_tag(self, candidate_id: str) -> dict:
+    def repair_tag(self, candidate_id: str, *, expected_tag: str = "") -> dict:
         self._require_client()
         with _state_lock(self.review_path):
             events = self._read_events()
@@ -570,6 +570,9 @@ class ImportService:
             if not slug or not tag or not record or record.get("status") != "IMPORTED":
                 return self._outcome(candidate_id, title, "not_available",
                                      reason="No confirmed imported recipe with a pending batch tag was found.")
+            if expected_tag and tag != str(expected_tag).strip():
+                return self._outcome(candidate_id, title, "not_available", slug=slug,
+                                     reason="The imported recipe's recorded batch tag does not match the selected tag scope.")
             if self._latest_tag_status(candidate_events) == "tagged" or record.get("tag_status") == "tagged":
                 return self._outcome(candidate_id, title, "already_tagged", tag_status="tagged", slug=slug)
             attempt_id = str(uuid.uuid4())
@@ -790,8 +793,10 @@ class ImportService:
             })
         category = ""
         http_status = None
+        updating_recipe = False
         try:
             tag = tag_client.ensure_tag(tag_name)
+            updating_recipe = True
             result = tag_client.add_tag(slug, tag)
             status = "already_tagged" if result == "already_present" else "tagged"
             event = {
@@ -801,9 +806,12 @@ class ImportService:
             }
         except Exception as exc:
             _, category, http_status = self._create_failure(exc)
-            status = "failed"
+            status = ("unknown" if updating_recipe and category in {
+                "timeout", "server_error", "request_outcome_unknown",
+            } else "failed")
             event = {
-                "event": "tag_failed", "schema_version": 1, "event_id": str(uuid.uuid4()),
+                "event": "tag_unknown" if status == "unknown" else "tag_failed",
+                "schema_version": 1, "event_id": str(uuid.uuid4()),
                 "attempt_id": attempt_id, "candidate_id": candidate_id, "title": title,
                 "slug": slug, "batch_tag": tag_name, "category": category,
                 "http_status": http_status, "created_at": _now(),
@@ -820,16 +828,18 @@ class ImportService:
                 review_revision=old.get("review_revision"), content_sha256=str(old.get("content_sha256", "")),
                 import_operation_id=str(old.get("import_operation_id", "")),
                 creation_status=str(old.get("creation_status", "confirmed")),
-                tag_status="tagged" if status in {"tagged", "already_tagged"} else "failed",
+                tag_status=("tagged" if status in {"tagged", "already_tagged"}
+                            else "unknown" if status == "unknown" else "failed"),
                 batch_tag=tag_name,
             )
         except Exception:
             if status in {"tagged", "already_tagged"}:
                 return {"status": "unknown", "reason": "Tag update succeeded but local history could not be updated."}
         return {
-            "status": "tagged" if status in {"tagged", "already_tagged"} else "failed",
-            "reason": "" if status in {"tagged", "already_tagged"}
-            else self._failure_message(category, http_status),
+            "status": status if status in {"tagged", "already_tagged", "unknown"} else "failed",
+            "reason": ("" if status in {"tagged", "already_tagged"} else
+                       "Tag update outcome is unknown; inspect the recipe in Mealie before retrying."
+                       if status == "unknown" else self._failure_message(category, http_status)),
         }
 
     def _eligibility(self, review: ReviewStore, events: list[dict],
@@ -1320,6 +1330,8 @@ class ImportService:
                 return "tagged"
             if event.get("event") == "tag_failed":
                 return "failed"
+            if event.get("event") == "tag_unknown":
+                return "unknown"
         return ""
 
     @staticmethod
