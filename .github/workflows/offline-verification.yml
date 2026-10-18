@@ -51,7 +51,6 @@ jobs:
           $env:TEMP = $testTemp
           $env:TMP = $testTemp
           $env:TMPDIR = $testTemp
-          $env:PYTHON_DOTENV_DISABLED = '1'
           .\.venv\Scripts\python.exe -m unittest discover -s tests -v
 
       - name: Check browser harness syntax
