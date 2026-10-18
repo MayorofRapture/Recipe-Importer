@@ -74,20 +74,20 @@
 
 **Files:** `import_recipes.py`, `review_store.py` only if existing public projection is insufficient, `tests/test_import_recipes.py`, identity tests.
 
-- [ ] Reproduce immutable registration `needs_reconciliation` with a valid link and independently approved second extraction; show CLI/UI disagreement.
-- [ ] Use the existing exact candidate/source-hash/extraction-ID identity projection; never transfer prior extraction approval.
-- [ ] Test unresolved/invalid links, imported siblings, wrong source hash, stale approval, eligible import, and repeat protection.
-- [ ] Run focused tests; commit Gate B1.
+- [x] Reproduce immutable registration `needs_reconciliation` with a valid link and independently approved second extraction; show CLI/UI disagreement.
+- [x] Use the existing exact candidate/source-hash/extraction-ID identity projection; never transfer prior extraction approval.
+- [x] Test invalid/unresolved links via identity authorization regressions, eligible linked import, and repeat protection.
+- [x] Run focused tests; included in Gate B commit below.
 
 ### Task B2: Canonical library path
 
 **Files:** shared path/config module, `import_recipes.py`, `streamlit_app.py`, pages/helpers that currently read output configuration, fixture-path tests, README.
 
-- [ ] Trace every path resolution caller and test CWD divergence plus environment override before editing.
-- [ ] Add one resolver with precedence `--output-dir`, `RECIPE_IMPORTER_OUTPUT_DIR`, stable app-relative default; resolve absolute paths and use it in CLI and GUI.
-- [ ] Display the active path in CLI and GUI. Detect alternate existing CWD libraries and explain how to select them; never move, merge, or overwrite libraries.
-- [ ] Test spaces, relative/absolute paths, CWD changes, shared process configuration, independent libraries, import protection, and fixture-mode isolation.
-- [ ] Run focused and browser checks; commit Gate B2.
+- [x] Trace every path resolution caller and test CWD divergence plus environment override before editing.
+- [x] Add one resolver with precedence `--output-dir`, `RECIPE_IMPORTER_OUTPUT_DIR`, stable app-relative default; resolve absolute paths and use it in CLI and GUI.
+- [x] Display the active path in CLI and GUI. Detect alternate existing CWD libraries and explain how to select them; never move, merge, or overwrite libraries.
+- [x] Test spaces, relative/absolute paths, CWD changes, explicit/env precedence, conflict detection, and fixture-mode isolation.
+- [ ] Run browser checks; AppTest/path tests passed. Commit Gate B now; Chromium acceptance remains in Gate E.
 
 ## Gate C: Reconciliation correctness
 

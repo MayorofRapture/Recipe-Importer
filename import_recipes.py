@@ -26,6 +26,7 @@ from google.genai import types
 from model_routing import ModelRouter, UsageLedger, parse_model_config, validate_model_ids
 from recipe_quality import ExtractionBatch, RecipeCandidate, is_complete, needs_review, schema_recipe
 from mealie_client import MealieClient
+from library_paths import LibraryPathConflict, alternate_cwd_library, resolve_library_path
 from ui_diagnostics import count as ui_count
 import local_ocr
 from ocr_structuring import OcrLineReferences, assemble_line_references, numbered_lines
@@ -823,7 +824,7 @@ def process_file(path: Path, digest: str, config: dict, gate: RateGate | None, s
     for index, (candidate, registration) in enumerate(zip(batch.recipes, registrations)):
         identity = registration["candidate_id"]
         state.refresh()
-        if registration.get("identity_status") != "registered":
+        if reviews.identity_link_status(identity, digest, extraction_id) != "registered":
             results.append(record("NEEDS_REVIEW", candidate.name,
                                   note="Indistinguishable recipe candidates require explicit reconciliation.",
                                   model=selected_model, route_reason=route_reason, candidate_id=identity))
@@ -1286,6 +1287,7 @@ def main() -> int:
     load_dotenv()
     parser = argparse.ArgumentParser(description="Batch import PDF/JPG recipes into Mealie")
     parser.add_argument("--source", default=os.getenv("RECIPE_DIR", "recipes"))
+    parser.add_argument("--output-dir", help="Select the local application library (overrides RECIPE_IMPORTER_OUTPUT_DIR)")
     parser.add_argument("--limit", type=int, default=0)
     parser.add_argument("--extract-only", action="store_true")
     import_modes = parser.add_mutually_exclusive_group()
@@ -1318,8 +1320,17 @@ def main() -> int:
     token = os.getenv("MEALIE_TOKEN", "").strip()
     url = os.getenv("MEALIE_URL", "").strip()
     model = os.getenv("GEMINI_MODEL", "").strip()
-    work = Path(__file__).resolve().parent / "output"
-    work.mkdir(exist_ok=True)
+    try:
+        work = resolve_library_path(args.output_dir, app_root=Path(__file__).resolve().parent)
+    except LibraryPathConflict as exc:
+        parser.error(str(exc))
+    work.mkdir(parents=True, exist_ok=True)
+    print(f"Application library: {work}")
+    alternate_library = alternate_cwd_library(work)
+    if alternate_library:
+        print(f"Another populated launch-directory library exists at {alternate_library}. "
+              "Set --output-dir or RECIPE_IMPORTER_OUTPUT_DIR to select it; no libraries were moved or merged.",
+              file=sys.stderr)
     if args.extract_only and (args.legacy_auto_import or args.import_approved or args.repair_failed_tags):
         parser.error("--extract-only cannot be combined with import or tag-repair authorization flags")
     if args.repair_failed_tags and (args.legacy_auto_import or args.import_approved):

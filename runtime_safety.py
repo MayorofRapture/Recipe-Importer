@@ -131,7 +131,8 @@ def _is_relative_to(path: Path, root: Path) -> bool:
 
 def _production_output_dir() -> Path:
     configured = str(os.environ.get("RECIPE_IMPORTER_PRODUCTION_OUTPUT_DIR", "")).strip()
-    return (Path(configured).expanduser() if configured else Path.cwd() / "output").resolve()
+    return (Path(configured).expanduser() if configured
+            else Path(__file__).resolve().parent / "output").resolve()
 
 
 def _paths_overlap(first: Path, second: Path) -> bool:

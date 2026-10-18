@@ -83,7 +83,8 @@ class RuntimeSafetyTests(unittest.TestCase):
             output.mkdir(parents=True)
             (output / ".fixture-library").write_text("synthetic", encoding="utf-8")
             with patch("runtime_safety.Path.cwd", return_value=root):
-                with patch.dict(os.environ, {"RECIPE_IMPORTER_FIXTURE_MODE": "1",
+                with patch.dict(os.environ, {"RECIPE_IMPORTER_PRODUCTION_OUTPUT_DIR": str(root / "output"),
+                                             "RECIPE_IMPORTER_FIXTURE_MODE": "1",
                                              "RECIPE_IMPORTER_OUTPUT_DIR": str(output)}, clear=False):
                     with self.assertRaises(FixtureModeError):
                         fixture_output_dir()
@@ -93,7 +94,8 @@ class RuntimeSafetyTests(unittest.TestCase):
             root = Path(tmp)
             (root / ".fixture-library").write_text("synthetic", encoding="utf-8")
             with patch("runtime_safety.Path.cwd", return_value=root):
-                with patch.dict(os.environ, {"RECIPE_IMPORTER_FIXTURE_MODE": "1",
+                with patch.dict(os.environ, {"RECIPE_IMPORTER_PRODUCTION_OUTPUT_DIR": str(root / "output"),
+                                             "RECIPE_IMPORTER_FIXTURE_MODE": "1",
                                              "RECIPE_IMPORTER_OUTPUT_DIR": str(root)}, clear=False):
                     with self.assertRaises(FixtureModeError):
                         fixture_output_dir()

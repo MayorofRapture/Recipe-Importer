@@ -1,11 +1,11 @@
 """Recipe-Importer Streamlit entrypoint."""
 import streamlit as st
 import os
-from pathlib import Path
 
 st.set_page_config(page_title="Recipe-Importer", page_icon=":material/menu_book:", layout="wide")
 from runtime_safety import (FixtureModeError, fixture_mode, fixture_output_dir,
                             validate_browser_fixture_environment)
+from library_paths import LibraryPathConflict, alternate_cwd_library, resolve_library_path
 
 fixture_library = None
 browser_fixture_attestation = None
@@ -23,8 +23,22 @@ if fixture_mode():
 if browser_fixture_attestation:
     st.caption(f"Isolated browser fixture: {browser_fixture_attestation}")
 
+try:
+    application_library = fixture_library or resolve_library_path()
+except (FixtureModeError, LibraryPathConflict) as exc:
+    st.error(str(exc), icon=":material/lock:")
+    st.stop()
+st.caption(f"Local application library: {application_library}")
+alternate_library = alternate_cwd_library(application_library)
+if alternate_library:
+    st.warning(
+        f"Another populated library exists at {alternate_library}. This app is using "
+        f"{application_library}; set RECIPE_IMPORTER_OUTPUT_DIR to select the other library. "
+        "Libraries are never merged or moved automatically."
+    )
+
 if "initial_destination" not in st.session_state:
-    library = fixture_library or Path(os.environ.get("RECIPE_IMPORTER_OUTPUT_DIR", "output"))
+    library = application_library
     st.session_state.initial_destination = (
         "Review" if any((library / "extracted").glob("*.json")) else
         "Import & history" if (library / "import_state.jsonl").exists() else "Upload"

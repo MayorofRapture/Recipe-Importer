@@ -42,6 +42,12 @@ class ReviewNavigationTests(unittest.TestCase):
         titles = {view.candidate.name for view in load_catalog(fixture_output, self.root / "sources")}
         self.assertTrue({"Fried Rice", "The Best Caramel Apples", "Cranberry & Caramel Date Bars"} <= titles)
 
+    def test_active_absolute_library_path_is_visible_in_the_app(self):
+        app = AppTest.from_file(str(APP_PATH)).run(timeout=10)
+
+        self.assertTrue(any(str(Path(self.fixture["output"]).resolve()) in item.value
+                            for item in app.caption))
+
     def test_skip_then_back_returns_to_prior_recipe(self):
         app = AppTest.from_file(str(APP_PATH)).run(timeout=10)
         recipe_a = app.session_state["review_selection"]

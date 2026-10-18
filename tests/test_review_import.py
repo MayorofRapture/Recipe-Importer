@@ -10,7 +10,7 @@ from unittest.mock import patch
 
 from import_recipes import StateStore, candidate_identity, process_file
 from recipe_quality import Diagnostic, ExtractionBatch, RecipeCandidate, Suggestion
-from review_store import ReviewStore
+from review_store import ReviewStore, _candidate_payload, _canonical, extraction_identity
 
 
 class ReviewImportTests(unittest.TestCase):
@@ -93,17 +93,25 @@ class ReviewImportTests(unittest.TestCase):
                 operation_id="approved-review-revision-approval", source_path=str(source),
             )
             imported = []
+            state = StateStore(root / "state.jsonl")
 
             with patch("import_recipes.import_mealie",
                        side_effect=lambda recipe, *_: imported.append(recipe) or "toast"):
                 rows = process_file(
                     source, digest, {"api_key": "", "mealie_url": "http://mealie",
                                     "mealie_token": "token", "model": "primary"}, None,
-                    StateStore(root / "state.jsonl"), cache, False, review_store=reviews,
+                    state, cache, False, review_store=reviews,
+                    legacy_auto_import=False, approved_only=True,
+                )
+                repeated = process_file(
+                    source, digest, {"api_key": "", "mealie_url": "http://mealie",
+                                    "mealie_token": "token", "model": "primary"}, None,
+                    state, cache, False, review_store=reviews,
                     legacy_auto_import=False, approved_only=True,
                 )
 
         self.assertEqual([row["status"] for row in rows], ["IMPORTED"])
+        self.assertEqual([row["status"] for row in repeated], ["ALREADY_DONE"])
         self.assertEqual([recipe.name for recipe in imported], ["Toast"])
 
     def test_cli_default_is_review_only_and_does_not_initialize_mealie(self):
@@ -125,7 +133,9 @@ class ReviewImportTests(unittest.TestCase):
                  patch("import_recipes.sys.argv", ["import_recipes.py", "--source", str(source)]), \
                  patch("import_recipes.load_dotenv"), \
                  patch.dict(os.environ, {"GEMINI_API_KEY": "synthetic", "GEMINI_MODEL": "test-model",
-                                         "MEALIE_TOKEN": "", "MEALIE_URL": ""}, clear=False), \
+                                         "MEALIE_TOKEN": "", "MEALIE_URL": "",
+                                         "RECIPE_IMPORTER_OUTPUT_DIR": ""}, clear=False), \
+                 patch("pathlib.Path.cwd", return_value=root), \
                  patch("import_recipes.preflight_mealie") as preflight, \
                  patch("import_recipes.MealieClient") as mealie_client, \
                  patch("import_recipes.import_mealie") as create, redirect_stdout(output):
@@ -178,6 +188,79 @@ class ReviewImportTests(unittest.TestCase):
                     __import__("import_recipes").main()
 
         self.assertEqual(raised.exception.code, 2)
+
+    def test_cli_accepts_linked_identity_using_exact_effective_authority(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "toast.jpg"
+            source.write_bytes(b"synthetic toast")
+            digest = __import__("hashlib").sha256(source.read_bytes()).hexdigest()
+            original = RecipeCandidate(name="Toast", ingredients=["bread"], instructions=["Toast."])
+            current = original.model_copy(update={"suggestions": [Suggestion(
+                suggestion_id="toast-detail", field_path="instructions[0]",
+                proposed_value="Toast until lightly browned.", rationale="Review proposal.",
+            )]})
+            batch = ExtractionBatch(recipes=[current])
+            extraction_id = extraction_identity(digest, batch.model_dump(mode="json"))
+            cache = root / "extracted"
+            cache.mkdir()
+            (cache / f"{digest}.json").write_text(batch.model_dump_json(), encoding="utf-8")
+            reviews = ReviewStore(root / "review.jsonl")
+            prior = reviews.register_candidates(str(source), digest, "prior-extraction", [original])[0]
+            target_bindings = ReviewStore(root / "target-bindings.jsonl").register_candidates(
+                str(source), digest, extraction_id, [current]
+            )[0]["target_bindings"]
+            held_id = "held-toast-current-extraction"
+            registration = reviews._base_event(
+                "candidate_registration", held_id, digest, extraction_id, "held-registration"
+            )
+            registration.update({
+                "source": str(source),
+                "fingerprint": __import__("hashlib").sha256(
+                    _canonical(_candidate_payload(current)).encode()
+                ).hexdigest(),
+                "identity_status": "needs_reconciliation",
+                "candidate": current.model_dump(mode="json"), "legacy_id": "",
+                "title_legacy_id": "", "legacy_aliases": [], "target_bindings": target_bindings,
+            })
+            with reviews.path.open("a", encoding="utf-8") as ledger:
+                ledger.write(json.dumps(registration) + "\n")
+            reviews = ReviewStore(reviews.path)
+            reviews.confirm_identity_match(held_id, prior["candidate_id"])
+            issue = next(item for item in target_bindings if item.get("issue_id") == "toast-detail")
+            revision = reviews.save_revision(
+                candidate_id=held_id, source_hash=digest, extraction_id=extraction_id,
+                expected_parent=0, operation_id="save-linked-toast-review",
+                recipe=current.model_dump(mode="json"), target_bindings=[
+                    {"target_id": issue["source_target_id"], "field": "instructions", "position": 0}
+                ],
+            )
+            reviews.resolve_issue(
+                candidate_id=held_id, source_hash=digest, extraction_id=extraction_id,
+                revision=revision["revision"], issue_id=issue["issue_id"],
+                target_id=issue["target_id"], disposition="accepted",
+                final_value="Toast until lightly browned.", operation_id="accept-linked-toast-proposal",
+            )
+            reviews.approve_revision(
+                candidate_id=held_id, source_hash=digest, extraction_id=extraction_id,
+                revision=revision["revision"], operation_id="approve-linked-toast-review",
+                source_path=str(source),
+            )
+            imported = []
+
+            with patch("import_recipes.import_mealie",
+                       side_effect=lambda recipe, *_: imported.append(recipe) or "toast"):
+                rows = process_file(
+                    source, digest, {"api_key": "", "mealie_url": "http://mealie",
+                                    "mealie_token": "token", "model": "primary"}, None,
+                    StateStore(root / "state.jsonl"), cache, False, review_store=reviews,
+                    legacy_auto_import=False, approved_only=True,
+                )
+
+        self.assertEqual(reviews.registrations[held_id][0]["identity_status"], "needs_reconciliation")
+        self.assertEqual(reviews.identity_link_status(held_id, digest, extraction_id), "registered")
+        self.assertEqual([row["status"] for row in rows], ["IMPORTED"])
+        self.assertEqual([recipe.name for recipe in imported], ["Toast"])
 
     def test_forced_renamed_retry_is_held_when_same_source_has_an_imported_sibling(self):
         with tempfile.TemporaryDirectory() as tmp:

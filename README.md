@@ -133,10 +133,19 @@ marker. It stops when that boundary is missing or invalid, uses synthetic result
 and disables live service clients. The normal launcher does not enable fixture
 mode.
 
-The default local library is `output/`. To keep it elsewhere, set
-`RECIPE_IMPORTER_OUTPUT_DIR` before launching. Set `RECIPE_IMPORTER_SOURCE_DIR`
-only when scans are stored separately from the output library. Keep those paths
-local and do not commit recipe scans, `.env`, or output records.
+The canonical default local library is the `output/` folder beside the
+application, independent of the launch directory. Both CLI and GUI show its
+absolute path. To select an existing library elsewhere, set
+`RECIPE_IMPORTER_OUTPUT_DIR` before launching either interface; relative
+environment paths are resolved from the application folder. The CLI also accepts
+`--output-dir` (a relative value is resolved from the current PowerShell
+directory), which takes precedence over the environment setting. If a populated
+`output/` folder is found in a different launch directory while no path is
+configured, startup stops and asks you to select the intended library. When
+another populated library is detected, the app points it out; it never moves,
+copies, merges, or overwrites libraries. Set `RECIPE_IMPORTER_SOURCE_DIR` only
+when scans are stored separately from the output library. Keep those paths local
+and do not commit recipe scans, `.env`, or output records.
 
 Run the complete offline regression suite from PowerShell:
 

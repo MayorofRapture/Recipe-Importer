@@ -21,11 +21,11 @@ from ui_diagnostics import count
 
 
 def paths() -> tuple[Path, Path | None]:
-    from runtime_safety import FixtureModeError, fixture_mode, fixture_output_dir
+    from library_paths import LibraryPathConflict, resolve_library_path
+    from runtime_safety import FixtureModeError
     try:
-        output = (fixture_output_dir() if fixture_mode()
-                  else Path(os.environ.get("RECIPE_IMPORTER_OUTPUT_DIR", "output")).expanduser().resolve())
-    except FixtureModeError as exc:
+        output = resolve_library_path()
+    except (FixtureModeError, LibraryPathConflict) as exc:
         st.error(str(exc), icon=":material/lock:")
         st.stop()
     source_value = os.environ.get("RECIPE_IMPORTER_SOURCE_DIR", "")
