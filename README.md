@@ -163,6 +163,11 @@ Mealie credentials. The broad browser acceptance is run locally with
 `node tools/browser_review_acceptance.mjs`; it starts only its owned, attested
 synthetic Streamlit process and needs cached Playwright Chromium.
 
+Run the historical import reconciliation browser journey with
+`node tools/browser_history_recovery_acceptance.mjs --evidence-dir=.test-tmp\historical-recovery`.
+The browser harness uses Node's built-in WebSocket and Chromium DevTools
+Protocol accessibility tree; no npm Playwright package is required.
+
 To structure the saved/local OCR into reviewable recipe JSON, using deterministic
 Python parsing first and a text-only Gemini line-reference request only when the
 boundaries are ambiguous:

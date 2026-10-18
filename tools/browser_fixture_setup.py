@@ -13,7 +13,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from PIL import Image, ImageDraw
 
 from import_recipes import file_digest
-from recipe_quality import ExtractionBatch, RecipeCandidate, Suggestion
+from recipe_quality import ExtractionBatch, RecipeCandidate, Suggestion, schema_recipe
 from review_store import ReviewStore, _candidate_payload, _canonical, extraction_identity
 from tests.ui_fixture_factory import write_ui_fixture
 from ui_data import load_catalog
@@ -142,6 +142,31 @@ def prepare(root: Path, scenario: str, run_id: str, nonce: str) -> dict:
         "Imported Recipe",
     ]
     if scenario == "identity":
+        marker_candidates = ["Fried Rice"]
+    if scenario == "history":
+        view = next(item for item in load_catalog(output, sources)
+                    if item.candidate.name == "Fried Rice")
+        attempt_id = "synthetic-historical-cli-attempt"
+        intent = {
+            "event": "intent_started", "schema_version": 1, "attempt_id": attempt_id,
+            "plan_id": "cli", "candidate_id": view.candidate_id,
+            "source_hash": view.source_hash, "extraction_id": view.extraction_id,
+            "revision": view.revision, "title": view.candidate.name,
+            "source_path": str(fixture["source"]), "batch_tag": "",
+        }
+        (output / "ui_import_events.jsonl").write_text("\n".join((
+            json.dumps(intent), json.dumps({
+                "event": "create_uncertain", "attempt_id": attempt_id,
+                "candidate_id": view.candidate_id, "category": "timeout",
+            }),
+        )) + "\n", encoding="utf-8")
+        (output / "fixture_mealie.json").write_text(json.dumps({
+            "recipes": {"historical-existing": {
+                "id": "synthetic-mealie-recipe-id", "slug": "historical-existing",
+                "name": view.candidate.name, "tags": [],
+                "payload": schema_recipe(view.candidate),
+            }}, "tags": {},
+        }), encoding="utf-8")
         marker_candidates = ["Fried Rice"]
     if scenario == "p0":
         marker_candidates.append("Synthetic Manual Directions")
