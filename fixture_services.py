@@ -34,7 +34,11 @@ class FixtureMealie:
 
     def get_recipe(self, slug):
         with _state_lock(self.path):
-            return self._load()["recipes"].get(slug)
+            recipe = self._load()["recipes"].get(slug)
+            if recipe is None:
+                return None
+            payload = recipe.get("payload", {})
+            return {**recipe, **payload} if isinstance(payload, dict) else dict(recipe)
 
     def ensure_tag(self, name):
         with _state_lock(self.path):

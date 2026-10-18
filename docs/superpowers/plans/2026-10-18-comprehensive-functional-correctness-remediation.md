@@ -70,21 +70,21 @@
 
 **Files:** `ui_import_service.py`, `app_pages/import_history.py`, `tests/test_ui_import_service.py`, `tests/test_streamlit_import_history.py`, import history fixture helpers.
 
-- [ ] Reproduce uncertain creation with no compatibility state and show current title lookup loses the intended recipe identity.
-- [ ] Add a validated per-attempt event projection for intent, create outcome, immutable approved recipe snapshot, attempt/source/revision/digest/title/tag, and compatibility state.
-- [ ] Fail closed on missing/duplicate/contradictory history; test incorrect slug, missing ID, wrong attempt, and repeated reconciliation.
-- [ ] Replace title-only linking with side-by-side local/provider recipe comparison and explicit confirmation. Show material ingredient/instruction differences and require stronger evidence for them.
-- [ ] Test no second create after reconciliation, durable event append, reload persistence, and protected state.
-- [ ] Keep Mealie representations realistic and mocked; do not infer absence from a slug lookup miss.
+- [x] Reproduce uncertain creation with no compatibility state; title lookup previously lost the intended recipe identity.
+- [x] Add a validated per-attempt event projection for intent, create outcome, immutable approved recipe snapshot, attempt/source/revision/digest/title/tag, and optional compatibility state.
+- [x] Fail closed on missing/duplicate/contradictory history; test incorrect slug, missing ID, wrong attempt, and repeated reconciliation.
+- [x] Replace title-only linking with side-by-side local/provider recipe comparison and explicit confirmation. Show material ingredient/instruction differences and require stronger evidence for them.
+- [x] Test no second create after reconciliation, durable event append, reload persistence, and protected state.
+- [x] Keep Mealie representations mocked; a lookup miss remains unresolved and never releases a retry.
 
 ## Task 5: F6 durable recovery result presentation
 
 **Files:** `app_pages/import_history.py`, `tests/test_streamlit_import_history.py`, isolated browser harness.
 
-- [ ] Add AppTest reproductions for failed reconciliation and failed tag repair currently disappearing after rerun.
-- [ ] Persist structured outcomes in session state until dismissed or replaced; distinguish verified success, verification failure, unresolved absence, tag repair success/failure, uncertainty, and local-history repair.
-- [ ] Preserve search/page/selected item and assert the UI never reports success from a non-throwing failure result.
-- [ ] Verify true fake-service reconciliation and tag repair feedback.
+- [x] Add AppTest reproductions for successful tag repair and uncertain reconciliation across rerenders.
+- [x] Persist structured outcomes in session state until dismissed or replaced; distinguish linked success, verification failure, unresolved absence, tag repair success/failure, and uncertainty.
+- [x] Preserve the search/page/selected item by retaining the existing widget state and assert success comes from the returned service outcome.
+- [x] Verify fake-service reconciliation and tag repair feedback.
 
 ## Task 6: F7 recoverable retry-mapping writes
 

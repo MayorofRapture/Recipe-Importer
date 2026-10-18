@@ -503,22 +503,88 @@ print(json.dumps(ImportService(Path(sys.argv[1]), source_root=Path(sys.argv[2]),
         self.assertEqual(second[0]["creation_status"], "uncertain")
         self.assertEqual(len(client.created), 1)
 
-    def test_reconciliation_lookup_found_links_and_absence_does_not_release_retry(self):
+    def test_uncertain_attempt_reconciles_without_compatibility_state_and_requires_human_evidence(self):
         with tempfile.TemporaryDirectory() as tmp:
             output, source_root, candidate_id = _approved_fried_rice(Path(tmp))
-            state = __import__("import_recipes").StateStore(output / "import_state.jsonl")
-            state.add(candidate_id, "UNCERTAIN", "", "scan.pdf", "Fried Rice", identity=candidate_id)
-            client = FakeMealie()
-            client.get_recipe = lambda slug: None
+            client = FakeMealie(create_error=TimeoutError("synthetic timeout after possible create"))
             service = ImportService(output, source_root=Path(source_root), client=client)
+            plan = service.preview([candidate_id])
+            uncertain = service.dispatch(plan["plan_id"])
+            self.assertEqual(uncertain[0]["creation_status"], "uncertain")
+            self.assertIsNone(__import__("import_recipes").StateStore(
+                output / "import_state.jsonl").records.get(candidate_id))
+            events = [json.loads(line) for line in (output / "ui_import_events.jsonl").read_text(encoding="utf-8").splitlines()]
+            intent = next(item for item in events if item.get("event") == "intent_started")
+            client.get_recipe = lambda slug: None
 
-            absent = service.reconcile_existing(candidate_id, "missing-slug")
+            absent = service.reconcile_existing(candidate_id, "missing-slug", intent["attempt_id"])
             client.get_recipe = lambda slug: {"id": "valid-id", "slug": slug, "name": "Fried Rice"}
-            found = service.reconcile_existing(candidate_id, "existing-slug")
+            inspected = service.reconcile_existing(candidate_id, "existing-slug", intent["attempt_id"])
+            self.assertEqual(inspected["creation_status"], "confirmation_required", inspected.get("reason"))
+            self.assertTrue(inspected["comparison"]["material_differences"])
+            blocked = service.reconcile_existing(
+                candidate_id, "existing-slug", intent["attempt_id"], reviewer_confirmed=True,
+                evidence="The title appears familiar.", observed_recipe_digest=inspected["comparison_digest"])
+            found = service.reconcile_existing(
+                candidate_id, "existing-slug", intent["attempt_id"], reviewer_confirmed=True,
+                evidence="Compared the returned ingredients and steps with the approved review revision.",
+                material_difference_ack=True, observed_recipe_digest=inspected["comparison_digest"])
+            repeated = service.reconcile_existing(
+                candidate_id, "existing-slug", intent["attempt_id"], reviewer_confirmed=True,
+                evidence="Repeat confirmation.", material_difference_ack=True,
+                observed_recipe_digest=inspected["comparison_digest"])
+            second_dispatch = service.dispatch(plan["plan_id"])
+            events = [json.loads(line) for line in (output / "ui_import_events.jsonl").read_text(encoding="utf-8").splitlines()]
+            linked = [item for item in events if item.get("event") == "reconciled_existing"]
 
         self.assertEqual(absent["creation_status"], "not_proven_absent")
+        self.assertEqual(blocked["creation_status"], "not_verified")
         self.assertEqual(found["creation_status"], "linked_existing")
         self.assertEqual(found["slug"], "existing-slug")
+        self.assertEqual(repeated["creation_status"], "already_linked")
+        self.assertIn(second_dispatch[0]["creation_status"], {"already_created", "protected", "uncertain"})
+        self.assertEqual(len(client.created), 1)
+        self.assertEqual(len(linked), 1)
+        self.assertEqual(linked[0]["attempt_id"], intent["attempt_id"])
+        self.assertIn("approved review revision", linked[0]["reviewer_evidence"])
+
+    def test_reconciliation_fails_closed_on_missing_attempt_or_mismatched_returned_slug(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output, source_root, candidate_id = _approved_fried_rice(Path(tmp))
+            client = FakeMealie(create_error=TimeoutError("synthetic timeout"))
+            service = ImportService(output, source_root=Path(source_root), client=client)
+            plan = service.preview([candidate_id])
+            service.dispatch(plan["plan_id"])
+            missing = service.reconcile_existing(candidate_id, "some-slug", "missing-attempt")
+            events = [json.loads(line) for line in (output / "ui_import_events.jsonl").read_text(encoding="utf-8").splitlines()]
+            attempt_id = next(item["attempt_id"] for item in events if item.get("event") == "intent_started")
+            client.get_recipe = lambda slug: {"id": "valid-id", "slug": "other-slug", "name": "Fried Rice"}
+            wrong = service.reconcile_existing(candidate_id, "some-slug", attempt_id)
+
+        self.assertEqual(missing["creation_status"], "not_verified")
+        self.assertEqual(wrong["creation_status"], "not_verified")
+        self.assertEqual(len(client.created), 1)
+
+    def test_reconciliation_fails_closed_on_duplicate_attempt_intent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output, source_root, candidate_id = _approved_fried_rice(Path(tmp))
+            client = FakeMealie(create_error=TimeoutError("synthetic timeout"))
+            service = ImportService(output, source_root=Path(source_root), client=client)
+            plan = service.preview([candidate_id])
+            service.dispatch(plan["plan_id"])
+            path = output / "ui_import_events.jsonl"
+            events = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+            intent = next(item for item in events if item.get("event") == "intent_started")
+            duplicate = dict(intent)
+            duplicate["event_id"] = "synthetic-duplicate-intent"
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(duplicate) + "\n")
+
+            result = service.reconcile_existing(candidate_id, "existing-slug", intent["attempt_id"])
+
+        self.assertEqual(result["creation_status"], "not_verified")
+        self.assertIn("duplicate", result["reason"])
+        self.assertEqual(len(client.created), 1)
 
     def test_cli_candidate_uses_shared_claim_and_preserves_legacy_complete_flow(self):
         with tempfile.TemporaryDirectory() as tmp:

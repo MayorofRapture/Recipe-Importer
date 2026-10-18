@@ -1,4 +1,5 @@
 import os
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -10,6 +11,7 @@ from import_recipes import StateStore
 from batch_store import BatchStore
 from tests.ui_fixture_factory import write_ui_fixture
 from review_store import ReviewStore
+from recipe_quality import RecipeCandidate, schema_recipe
 from ui_data import load_catalog
 
 PAGE = Path(__file__).resolve().parents[1] / "app_pages" / "import_history.py"
@@ -17,6 +19,133 @@ APP_PATH = Path(__file__).resolve().parents[1] / "streamlit_app.py"
 
 
 class StreamlitImportHistoryTests(unittest.TestCase):
+    def test_uncertain_reconciliation_ui_compares_before_explicit_confirmation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            fixture = write_ui_fixture(root)
+            output = Path(fixture["output"])
+            view = next(item for item in load_catalog(output, root / "sources")
+                        if item.candidate.name == "Fried Rice")
+            store = ReviewStore(output / "review_events.jsonl")
+            saved = store.save_revision(
+                candidate_id=view.candidate_id, source_hash=view.source_hash,
+                extraction_id=view.extraction_id, expected_parent=0,
+                operation_id="uncertain-ui-save", recipe=view.candidate.model_dump(mode="json"),
+                target_bindings=[],
+            )
+            store.approve_revision(
+                candidate_id=view.candidate_id, source_hash=view.source_hash,
+                extraction_id=view.extraction_id, revision=saved["revision"],
+                operation_id="uncertain-ui-approve", source_path=fixture["source"],
+            )
+            from ui_import_service import ImportService
+            service = ImportService(output, source_root=root / "sources")
+            eligible = service.preview([view.candidate_id])["eligible"][0]
+            attempt_id = "synthetic-uncertain-attempt"
+            intent = {
+                "event": "intent_started", "event_id": "synthetic-intent-event",
+                "attempt_id": attempt_id, "candidate_id": view.candidate_id,
+                "source_hash": view.source_hash, "extraction_id": view.extraction_id,
+                "revision": eligible["revision"], "content_sha256": eligible["content_sha256"],
+                "title": eligible["title"], "source_path": eligible["source_path"],
+                "batch_tag": "", "recipe_snapshot": eligible["recipe"],
+            }
+            uncertain = {
+                "event": "create_uncertain", "event_id": "synthetic-uncertain-event",
+                **{key: intent[key] for key in ("attempt_id", "candidate_id", "source_hash",
+                                                 "extraction_id", "revision", "content_sha256", "title")},
+            }
+            with (output / "ui_import_events.jsonl").open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(intent) + "\n")
+                handle.write(json.dumps(uncertain) + "\n")
+            returned = schema_recipe(RecipeCandidate.model_validate(eligible["recipe"]))
+            returned["recipeIngredient"] = ["A different ingredient list"]
+            (output / "fixture_mealie.json").write_text(json.dumps({
+                "recipes": {"synthetic-existing": {
+                    "id": "synthetic-mealie-id", "slug": "synthetic-existing",
+                    "name": eligible["title"], "tags": [], "payload": returned,
+                }}, "tags": {},
+            }), encoding="utf-8")
+
+            with patch.dict(os.environ, {"RECIPE_IMPORTER_OUTPUT_DIR": str(output),
+                                         "RECIPE_IMPORTER_SOURCE_DIR": str(root / "sources"),
+                                         "RECIPE_IMPORTER_FIXTURE_MODE": "1"}):
+                app = AppTest.from_file(str(PAGE)).run(timeout=15)
+                app.text_input(key=f"slug:{view.candidate_id}").set_value("synthetic-existing").run(timeout=15)
+                next(button for button in app.button if button.label == "Inspect existing recipe").click().run(timeout=15)
+                self.assertFalse(app.exception)
+                self.assertTrue(any("Compare the approved recipe" in item.value for item in app.markdown))
+                self.assertTrue(any("Differences found: ingredients" in item.value for item in app.warning))
+                self.assertFalse(any(json.loads(line).get("event") == "reconciled_existing"
+                                     for line in (output / "ui_import_events.jsonl").read_text(encoding="utf-8").splitlines()))
+                evidence = next(item for item in app.text_area
+                                if item.label == "Evidence for linking this Mealie recipe to the uncertain import")
+                app.text_area(key=evidence.key).set_value("Compared the returned contents to the exact approved revision.").run(timeout=15)
+                ack = next(item for item in app.checkbox
+                           if item.label.startswith("I reviewed the ingredient or instruction differences"))
+                app.checkbox(key=ack.key).check().run(timeout=15)
+                next(button for button in app.button if button.label == "Confirm this existing recipe").click().run(timeout=15)
+                app.run(timeout=15)
+                self.assertFalse(app.exception)
+                self.assertTrue(any("Existing recipe linked for this attempt" in item.value
+                                    for item in app.success),
+                                repr(app.session_state.get(f"reconcile_inspection:{view.candidate_id}")))
+
+            events = [json.loads(line) for line in (output / "ui_import_events.jsonl").read_text(encoding="utf-8").splitlines()]
+            linked = next(item for item in events if item.get("event") == "reconciled_existing")
+            self.assertEqual(linked["attempt_id"], attempt_id)
+            self.assertTrue(linked["reviewer_confirmed"])
+            self.assertTrue(linked["material_difference_ack"])
+
+    def test_tag_repair_outcome_survives_rerender_until_dismissed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            fixture = write_ui_fixture(root)
+            output = Path(fixture["output"])
+            view = next(item for item in load_catalog(output, root / "sources")
+                        if item.candidate.name == "Fried Rice")
+            store = ReviewStore(output / "review_events.jsonl")
+            saved = store.save_revision(
+                candidate_id=view.candidate_id, source_hash=view.source_hash,
+                extraction_id=view.extraction_id, expected_parent=0,
+                operation_id="tag-repair-ui-save",
+                recipe=view.candidate.model_dump(mode="json"), target_bindings=[],
+            )
+            store.approve_revision(
+                candidate_id=view.candidate_id, source_hash=view.source_hash,
+                extraction_id=view.extraction_id, revision=saved["revision"],
+                operation_id="tag-repair-ui-approve", source_path=fixture["source"],
+            )
+
+            class FakeMealie:
+                supports_empty_instructions = True
+                def __init__(self): self.tag_error = True
+                def create_recipe(self, recipe): return "tag-repair-slug"
+                def ensure_tag(self, name):
+                    if self.tag_error: raise RuntimeError("synthetic tag failure")
+                    return {"name": name}
+                def add_tag(self, slug, tag): return "tagged"
+
+            client = FakeMealie()
+            service = __import__("ui_import_service").ImportService(
+                output, source_root=root / "sources", client=client)
+            plan = service.preview([view.candidate_id], "Synthetic cookbook")
+            self.assertEqual(service.dispatch(plan["plan_id"])[0]["tag_status"], "failed")
+            client.tag_error = False
+
+            with patch.dict(os.environ, {"RECIPE_IMPORTER_OUTPUT_DIR": str(output),
+                                         "RECIPE_IMPORTER_SOURCE_DIR": str(root / "sources"),
+                                         "RECIPE_IMPORTER_FIXTURE_MODE": "1"}), \
+                    patch("application_services.configured_mealie_client", return_value=client):
+                app = AppTest.from_file(str(PAGE)).run(timeout=15)
+                next(button for button in app.button if button.label == "Retry tag only").click().run(timeout=15)
+                self.assertFalse(app.exception)
+                self.assertTrue(any("Tag repair succeeded" in item.value for item in app.success))
+                app.run(timeout=15)
+                self.assertTrue(any("Tag repair succeeded" in item.value for item in app.success))
+                next(button for button in app.button if button.label == "Dismiss recovery result").click().run(timeout=15)
+                self.assertFalse(any("Tag repair succeeded" in item.value for item in app.success))
+
     def test_current_batch_tag_defaults_into_selected_import_preflight(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

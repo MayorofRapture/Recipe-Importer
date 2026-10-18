@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import re
 import uuid
@@ -15,7 +16,7 @@ from import_protection import (
     protected_identity_groups, read_import_state,
 )
 from recipe_quality import RecipeCandidate, is_complete
-from review_store import ReviewConflict, ReviewStore, _state_lock
+from review_store import ReviewConflict, ReviewStore, _recipe_digest, _state_lock
 from ui_data import RecipeView, load_catalog
 
 
@@ -141,6 +142,7 @@ class ImportService:
                     "approval_method": effective.approval_method,
                     "approval_rationale": effective.approval_rationale,
                     "no_instructions_reason": effective.no_instructions_reason,
+                    "recipe_snapshot": effective.recipe,
                 })
             try:
                 slug = self.client.create_recipe(RecipeCandidate.model_validate(recipe))
@@ -470,6 +472,10 @@ class ImportService:
                     "no_instructions_reason": "",
                 })
                 kind = event.get("event")
+                if kind in {"intent_started", "create_uncertain"}:
+                    for provenance_key in ("attempt_id", "revision", "content_sha256"):
+                        if event.get(provenance_key) is not None:
+                            row[provenance_key] = event[provenance_key]
                 for provenance_key in ("approval_method", "approval_rationale", "no_instructions_reason"):
                     if event.get(provenance_key):
                         row[provenance_key] = str(event[provenance_key])
@@ -524,62 +530,115 @@ class ImportService:
         return self._outcome(candidate_id, title, "tag_repair", tag_status=result["status"],
                              tag_reason=result.get("reason", ""), slug=slug)
 
-    def reconcile_existing(self, candidate_id: str, slug: str) -> dict:
+    def reconcile_existing(self, candidate_id: str, slug: str, attempt_id: str = "", *,
+                           reviewer_confirmed: bool = False, evidence: str = "",
+                           material_difference_ack: bool = False,
+                           observed_recipe_digest: str = "") -> dict:
+        """Inspect one uncertain attempt, then link only after explicit evidence and comparison."""
         self._require_client()
-        candidate_id, slug = str(candidate_id), str(slug).strip()
+        candidate_id, slug, attempt_id = str(candidate_id), str(slug).strip(), str(attempt_id).strip()
         if not slug:
             return self._outcome(candidate_id, "", "not_verified", reason="A Mealie slug is required.")
         with _state_lock(self.review_path):
             events = self._read_events()
-            state = StateStore(self.state_path)
-            record = self._state_for(state, candidate_id)
-            candidate_events = self._candidate_events(events, candidate_id)
-            if not self._is_uncertain(candidate_events, record):
-                return self._outcome(candidate_id, str((record or {}).get("title", "")),
-                                     "not_uncertain", reason="This candidate has no unresolved create attempt.")
-            self._append_locked({
-                "event": "reconcile_started", "schema_version": 1, "event_id": str(uuid.uuid4()),
-                "candidate_id": candidate_id, "slug": slug, "created_at": _now(),
-            })
+            projection, reason = self._uncertain_attempt(events, candidate_id, attempt_id)
+            if projection is None:
+                return self._outcome(candidate_id, "", "not_verified", reason=reason)
+            attempt_id = projection["attempt_id"]
+            existing_link = next((item for item in projection["events"]
+                                  if item.get("event") == "reconciled_existing"), None)
+            if existing_link:
+                return self._outcome(candidate_id, projection["title"], "already_linked",
+                                     slug=str(existing_link.get("slug", "")), attempt_id=attempt_id)
+
         try:
             mealie_recipe = self.client.get_recipe(slug)
         except Exception:
-            return self._outcome(candidate_id, str((record or {}).get("title", "")),
-                                 "not_verified", reason="Mealie could not verify that recipe identity.")
+            return self._outcome(candidate_id, projection["title"], "not_verified",
+                                 reason="Mealie could not verify that selected recipe identity.",
+                                 attempt_id=attempt_id)
         if not mealie_recipe:
             with _state_lock(self.review_path):
                 self._append_locked({
                     "event": "reconcile_not_found", "schema_version": 1,
-                    "event_id": str(uuid.uuid4()), "candidate_id": candidate_id,
-                    "slug": slug, "created_at": _now(),
+                    "event_id": str(uuid.uuid4()), "attempt_id": attempt_id,
+                    "candidate_id": candidate_id, "slug": slug, "created_at": _now(),
                 })
-            return self._outcome(candidate_id, str((record or {}).get("title", "")),
-                                 "not_proven_absent",
-                                 reason="A lookup miss does not prove the recipe was not created.")
-        title = str((record or {}).get("title", ""))
-        if (not mealie_recipe.get("id") or mealie_recipe.get("slug") != slug
-                or self._normalize(str(mealie_recipe.get("name", ""))) != self._normalize(title)):
-            return self._outcome(candidate_id, title, "not_verified",
-                                 reason="The selected slug returned a different recipe title.")
+            return self._outcome(candidate_id, projection["title"], "not_proven_absent",
+                                 reason="A lookup miss does not prove the recipe was not created.",
+                                 attempt_id=attempt_id)
+        if (not isinstance(mealie_recipe, dict) or not mealie_recipe.get("id")
+                or mealie_recipe.get("slug") != slug):
+            return self._outcome(candidate_id, projection["title"], "not_verified",
+                                 reason="Mealie did not return the selected recipe ID and slug.",
+                                 attempt_id=attempt_id)
+
+        comparison = self._compare_reconciliation_recipe(projection["recipe_snapshot"], mealie_recipe)
+        comparison_digest = self._reconciliation_digest(mealie_recipe)
+        if not reviewer_confirmed:
+            return self._outcome(candidate_id, projection["title"], "confirmation_required",
+                                 reason="Compare both recipes and confirm the identity with reviewer evidence.",
+                                 attempt_id=attempt_id, comparison=comparison,
+                                 comparison_digest=comparison_digest, slug=slug)
+        if not str(evidence).strip():
+            return self._outcome(candidate_id, projection["title"], "not_verified",
+                                 reason="Reviewer evidence is required to link this existing recipe.",
+                                 attempt_id=attempt_id, comparison=comparison,
+                                 comparison_digest=comparison_digest, slug=slug)
+        if observed_recipe_digest != comparison_digest:
+            return self._outcome(candidate_id, projection["title"], "not_verified",
+                                 reason="The Mealie recipe changed after it was displayed. Inspect it again before confirming.",
+                                 attempt_id=attempt_id, comparison=comparison,
+                                 comparison_digest=comparison_digest, slug=slug)
+        if comparison["material_differences"] and not material_difference_ack:
+            return self._outcome(candidate_id, projection["title"], "not_verified",
+                                 reason="Ingredient or instruction differences require explicit acknowledgment.",
+                                 attempt_id=attempt_id, comparison=comparison,
+                                 comparison_digest=comparison_digest, slug=slug)
+
         with _state_lock(self.review_path):
+            latest_events = self._read_events()
+            latest, reason = self._uncertain_attempt(latest_events, candidate_id, attempt_id)
+            if latest is None:
+                return self._outcome(candidate_id, projection["title"], "not_verified",
+                                     reason=reason, attempt_id=attempt_id)
+            existing_link = next((item for item in latest["events"]
+                                  if item.get("event") == "reconciled_existing"), None)
+            if existing_link:
+                return self._outcome(candidate_id, projection["title"], "already_linked",
+                                     slug=str(existing_link.get("slug", "")), attempt_id=attempt_id)
             self._append_locked({
                 "event": "reconciled_existing", "schema_version": 1,
-                "event_id": str(uuid.uuid4()), "candidate_id": candidate_id,
-                "slug": slug, "title": title, "source_hash": str((record or {}).get("source_hash", "")),
-                "source_path": str((record or {}).get("file", "")), "created_at": _now(),
+                "event_id": str(uuid.uuid4()), "attempt_id": attempt_id,
+                "candidate_id": candidate_id, "slug": slug,
+                "title": projection["title"], "source_hash": projection["source_hash"],
+                "source_path": projection["source_path"],
+                "extraction_id": projection["extraction_id"],
+                "revision": projection["revision"],
+                "content_sha256": projection["content_sha256"],
+                "batch_tag": projection["batch_tag"],
+                "mealie_recipe_digest": comparison_digest,
+                "reviewer_confirmed": True,
+                "reviewer_evidence": str(evidence).strip()[:1000],
+                "material_difference_ack": bool(material_difference_ack),
+                "created_at": _now(),
             })
         try:
             StateStore(self.state_path).add(
-                candidate_id, "IMPORTED", slug, str((record or {}).get("file", "")), title,
-                identity=candidate_id, source_hash=str((record or {}).get("source_hash", "")),
-                creation_status="linked_existing", tag_status=str((record or {}).get("tag_status", "unknown")),
-                batch_tag=str((record or {}).get("batch_tag", "")),
+                candidate_id, "IMPORTED", slug, projection["source_path"], projection["title"],
+                identity=candidate_id, source_hash=projection["source_hash"],
+                extraction_id=projection["extraction_id"],
+                review_revision=projection["revision"],
+                content_sha256=projection["content_sha256"],
+                creation_status="linked_existing", tag_status="pending" if projection["batch_tag"] else "not_requested",
+                batch_tag=projection["batch_tag"],
             )
         except Exception:
-            return self._outcome(candidate_id, title, "linked_existing",
-                                 reason="Existing recipe was verified; local compatibility history needs repair.",
-                                 slug=slug)
-        return self._outcome(candidate_id, title, "linked_existing", slug=slug)
+            return self._outcome(candidate_id, projection["title"], "linked_existing",
+                                 reason="Existing recipe was verified and durably protected; compatibility history needs repair.",
+                                 slug=slug, attempt_id=attempt_id)
+        return self._outcome(candidate_id, projection["title"], "linked_existing",
+                             slug=slug, attempt_id=attempt_id, comparison=comparison)
 
     def _apply_tag(self, candidate_id: str, title: str, slug: str,
                    tag_name: str, attempt_id: str, client: Any = None) -> dict:
@@ -768,6 +827,162 @@ class ImportService:
     @staticmethod
     def _candidate_events(events: list[dict], candidate_id: str) -> list[dict]:
         return [item for item in events if item.get("candidate_id") == candidate_id]
+
+    def _uncertain_attempt(self, events: list[dict], candidate_id: str,
+                           attempt_id: str = "") -> tuple[dict | None, str]:
+        candidate_events = self._candidate_events(events, candidate_id)
+        attempt_ids = list(dict.fromkeys(
+            str(item.get("attempt_id", "")) for item in candidate_events
+            if item.get("event") == "intent_started" and item.get("attempt_id")
+        ))
+        if attempt_id:
+            if attempt_id not in attempt_ids:
+                return None, "The selected uncertain attempt is missing from durable import history."
+            selected = attempt_id
+        else:
+            unresolved = []
+            for value in attempt_ids:
+                attempt_events = [item for item in candidate_events
+                                  if str(item.get("attempt_id", "")) == value]
+                if any(item.get("event") == "create_uncertain" for item in attempt_events) and not any(
+                    item.get("event") == "reconciled_existing" for item in attempt_events
+                ):
+                    unresolved.append(value)
+            if len(unresolved) != 1:
+                return None, ("Import history does not identify exactly one unresolved uncertain attempt. "
+                              "Review the durable event history before continuing.")
+            selected = unresolved[0]
+
+        attempt_events = [item for item in candidate_events
+                          if str(item.get("attempt_id", "")) == selected]
+        intents = [item for item in attempt_events if item.get("event") == "intent_started"]
+        outcomes = [item for item in attempt_events if item.get("event") in {
+            "create_uncertain", "create_rejected", "creation_confirmed",
+        }]
+        links = [item for item in attempt_events if item.get("event") == "reconciled_existing"]
+        if len(intents) != 1 or len(outcomes) != 1:
+            return None, "The selected import attempt has missing or duplicate create history and is protected."
+        intent, outcome = intents[0], outcomes[0]
+        if outcome.get("event") != "create_uncertain":
+            return None, "The selected attempt is not an unresolved uncertain create."
+        required = ("attempt_id", "candidate_id", "source_hash", "extraction_id",
+                    "revision", "content_sha256", "title")
+        if any(intent.get(key) in (None, "") for key in required):
+            return None, "The selected attempt is missing required identity or revision fields and is protected."
+        for key in ("candidate_id", "source_hash", "extraction_id", "revision",
+                    "content_sha256", "title", "batch_tag"):
+            if key in outcome and key in intent and outcome[key] != intent[key]:
+                return None, f"The selected attempt has conflicting {key} history and is protected."
+        if len(links) > 1:
+            return None, "The selected attempt has duplicate reconciliation history and is protected."
+
+        try:
+            state = StateStore(self.state_path)
+            record = self._state_for(state, candidate_id)
+        except Exception:
+            return None, "Compatibility import history is malformed; the candidate remains protected."
+        if record:
+            if str(record.get("status", "")).upper() == "IMPORTED" and not links:
+                return None, "Compatibility history conflicts with the uncertain attempt; review local history."
+            for key, record_key in (("source_hash", "source_hash"), ("extraction_id", "extraction_id"),
+                                    ("revision", "review_revision"), ("content_sha256", "content_sha256"),
+                                    ("title", "title"), ("batch_tag", "batch_tag")):
+                if intent.get(key) not in (None, "") and record.get(record_key) not in (None, ""):
+                    if str(intent[key]) != str(record[record_key]):
+                        return None, f"Compatibility history conflicts with the attempt's {key}; review local history."
+
+        try:
+            revision_number = int(intent.get("revision", -1))
+        except (TypeError, ValueError):
+            return None, "The selected attempt has an invalid review revision and is protected."
+        try:
+            review_events = [json.loads(line) for line in self.review_path.read_text(encoding="utf-8").splitlines()
+                             if line.strip()] if self.review_path.exists() else []
+            if any(not isinstance(item, dict) for item in review_events):
+                raise ValueError("invalid review history")
+            match = [item for item in review_events
+                     if item.get("event") == "review_revision"
+                     and item.get("candidate_id") == candidate_id
+                     and item.get("source_hash") == intent.get("source_hash")
+                     and item.get("extraction_id") == intent.get("extraction_id")
+                     and int(item.get("revision", -1)) == revision_number
+                     and item.get("content_sha256") == intent.get("content_sha256")]
+        except Exception:
+            return None, "Review revision history is malformed; the uncertain attempt remains protected."
+        if len(match) != 1 or not isinstance(match[0].get("recipe"), dict):
+            return None, "The exact approved recipe snapshot is unavailable for this attempt; identity cannot be verified."
+        snapshot = intent.get("recipe_snapshot")
+        if snapshot is not None and snapshot != match[0]["recipe"]:
+            return None, "The attempted recipe snapshot conflicts with its review revision and is protected."
+        snapshot = match[0]["recipe"]
+        if _recipe_digest(snapshot) != str(intent.get("content_sha256", "")):
+            return None, "The attempted recipe snapshot does not match its recorded content digest and is protected."
+        return {
+            "attempt_id": selected, "events": attempt_events,
+            "source_hash": str(intent.get("source_hash", "")),
+            "extraction_id": str(intent.get("extraction_id", "")),
+            "revision": revision_number,
+            "content_sha256": str(intent.get("content_sha256", "")),
+            "title": str(intent.get("title", "")),
+            "source_path": str(intent.get("source_path", "")),
+            "batch_tag": str(intent.get("batch_tag", "")),
+            "recipe_snapshot": snapshot,
+        }, ""
+
+    @classmethod
+    def _compare_reconciliation_recipe(cls, local_recipe: dict, mealie_recipe: dict) -> dict:
+        local = {
+            "title": str(local_recipe.get("name", "")),
+            "ingredients": cls._string_items(local_recipe.get("ingredients", [])),
+            "instructions": cls._string_items(local_recipe.get("instructions", [])),
+        }
+        returned = {
+            "title": str(mealie_recipe.get("name", "")),
+            "ingredients": cls._string_items(mealie_recipe.get("recipeIngredient", [])),
+            "instructions": cls._string_items(mealie_recipe.get("recipeInstructions", [])),
+        }
+        differences = []
+        if cls._normalize(local["title"]) != cls._normalize(returned["title"]):
+            differences.append("title")
+        if [cls._normalize(item) for item in local["ingredients"]] != [
+                cls._normalize(item) for item in returned["ingredients"]]:
+            differences.append("ingredients")
+        if [cls._normalize(item) for item in local["instructions"]] != [
+                cls._normalize(item) for item in returned["instructions"]]:
+            differences.append("instructions")
+        material = [item for item in differences if item in {"ingredients", "instructions"}]
+        return {"local": local, "mealie": returned, "differences": differences,
+                "material_differences": material}
+
+    @staticmethod
+    def _string_items(value: Any) -> list[str]:
+        if isinstance(value, str):
+            return [value.strip()] if value.strip() else []
+        if isinstance(value, dict):
+            if value.get("text"):
+                return [str(value["text"]).strip()]
+            for key in ("itemListElement", "recipeInstructions", "items"):
+                if key in value:
+                    return ImportService._string_items(value[key])
+            return []
+        if isinstance(value, list):
+            result = []
+            for item in value:
+                result.extend(ImportService._string_items(item))
+            return result
+        return []
+
+    @classmethod
+    def _reconciliation_digest(cls, mealie_recipe: dict) -> str:
+        normalized = {
+            "id": str(mealie_recipe.get("id", "")),
+            "slug": str(mealie_recipe.get("slug", "")),
+            "name": str(mealie_recipe.get("name", "")),
+            "ingredients": cls._string_items(mealie_recipe.get("recipeIngredient", [])),
+            "instructions": cls._string_items(mealie_recipe.get("recipeInstructions", [])),
+        }
+        payload = json.dumps(normalized, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
     @staticmethod
     def _service_protected(events: list[dict]) -> bool:
