@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+import json
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
@@ -9,7 +10,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from import_recipes import file_digest
-from recipe_quality import RecipeCandidate, schema_recipe
+from recipe_quality import ExtractionBatch, RecipeCandidate, Suggestion, schema_recipe
 from review_store import ReviewStore, extraction_identity
 from tests.ui_fixture_factory import write_ui_fixture
 from ui_data import load_catalog
@@ -69,6 +70,142 @@ def _approved_fried_rice(root: Path) -> tuple[Path, str, str]:
 
 
 class UiImportServiceTests(unittest.TestCase):
+    def _linked_extraction_pair(self, root: Path) -> tuple[Path, Path, str, str, Path, str, object, object]:
+        fixture = write_ui_fixture(root)
+        output, source = Path(fixture["output"]), Path(fixture["source"])
+        source_root = source.parent
+        (output / "import_state.jsonl").write_text("", encoding="utf-8")
+        catalog = load_catalog(output, source_root)
+        first = next(view for view in catalog if view.candidate.name == "Fried Rice")
+        reviews = ReviewStore(output / "review_events.jsonl")
+        first_revision = reviews.save_revision(
+            candidate_id=first.candidate_id, source_hash=first.source_hash,
+            extraction_id=first.extraction_id, expected_parent=0,
+            operation_id="linked-import-first-revision",
+            recipe=first.candidate.model_dump(mode="json"),
+            target_bindings=list(first.target_bindings),
+        )
+        reviews.approve_revision(
+            candidate_id=first.candidate_id, source_hash=first.source_hash,
+            extraction_id=first.extraction_id, revision=first_revision["revision"],
+            operation_id="linked-import-first-approval", source_path=source,
+        )
+
+        second_candidate = first.candidate.model_copy(update={"suggestions": [Suggestion(
+            suggestion_id="alternate-yield-proposal", field_path="yield_text",
+            proposed_value="2 servings", rationale="Synthetic alternative extraction proposal.",
+        )]})
+        batch = ExtractionBatch(recipes=[second_candidate])
+        extraction_id = extraction_identity(first.source_hash, batch.model_dump(mode="json"))
+        cache_path = output / "extracted" / f"{first.source_hash}--linked-version.json"
+        second_cache = json.dumps({"schema_version": 2, "source_hash": first.source_hash,
+                                   "batch": batch.model_dump(mode="json")})
+        cache_path.write_text(second_cache, encoding="utf-8")
+        registration = reviews.register_candidates(str(source), first.source_hash,
+                                                   extraction_id, [second_candidate])[0]
+        second_id = registration["candidate_id"]
+        if second_id == first.candidate_id:
+            self.fail("Different extraction suggestions must retain a distinct candidate ID.")
+        if reviews.identity_link_status(second_id, first.source_hash, extraction_id) != "registered":
+            diagnostic = next((item for item in reviews.identity_reconciliation_candidates(first.source_hash)
+                               if item["candidate_id"] == second_id), None)
+            self.assertTrue(diagnostic and diagnostic.get("eligible"), json.dumps(diagnostic, sort_keys=True))
+            reviews.confirm_identity_match(second_id, first.candidate_id)
+
+        bindings = registration["target_bindings"]
+        proposal = next(item for item in bindings if item.get("issue_id") == "alternate-yield-proposal")
+        second_revision = reviews.save_revision(
+            candidate_id=second_id, source_hash=first.source_hash, extraction_id=extraction_id,
+            expected_parent=0, operation_id="linked-import-second-revision",
+            recipe=second_candidate.model_dump(mode="json"), target_bindings=bindings,
+        )
+        reviews.resolve_issue(
+            candidate_id=second_id, source_hash=first.source_hash, extraction_id=extraction_id,
+            revision=second_revision["revision"], issue_id="alternate-yield-proposal",
+            target_id=proposal["target_id"], disposition="not_recipe_content", final_value=None,
+            evidence_reference="Synthetic reviewer declined optional yield proposal.",
+            operation_id="linked-import-second-proposal-decline",
+        )
+        reviews.approve_revision(
+            candidate_id=second_id, source_hash=first.source_hash,
+            extraction_id=extraction_id, revision=second_revision["revision"],
+            operation_id="linked-import-second-approval", source_path=source,
+        )
+        self.assertEqual(reviews.identity_link_status(second_id, first.source_hash, extraction_id), "registered")
+        # Preserve both exact extraction projections for concurrent plans.
+        cache_path.unlink()
+        first_view = next(view for view in load_catalog(output, source_root)
+                          if view.candidate_id == first.candidate_id)
+        cache_path.write_text(second_cache, encoding="utf-8")
+        second_view = next(view for view in load_catalog(output, source_root)
+                           if view.candidate_id == second_id)
+        return output, source_root, first.candidate_id, second_id, cache_path, second_cache, first_view, second_view
+
+    def test_linked_extraction_versions_cannot_create_two_recipes_in_either_order(self):
+        for reverse in (False, True):
+            with self.subTest(reverse=reverse), tempfile.TemporaryDirectory() as tmp:
+                output, source_root, first, second, second_cache_path, second_cache, _, _ = self._linked_extraction_pair(Path(tmp))
+                client = FakeMealie()
+                service = ImportService(output, source_root=source_root, client=client)
+                first_order = [second, first] if reverse else [first, second]
+                outcomes = []
+                if not reverse:
+                    second_cache_path.unlink()
+                for position, candidate_id in enumerate(first_order):
+                    if position == 1:
+                        if reverse:
+                            second_cache_path.unlink()
+                        else:
+                            second_cache_path.write_text(second_cache, encoding="utf-8")
+                    plan = service.preview([candidate_id])
+                    if position == 0:
+                        self.assertEqual(len(plan["eligible"]), 1,
+                                         json.dumps(plan["excluded"], sort_keys=True))
+                        outcomes.extend(service.dispatch(plan["plan_id"]))
+                    else:
+                        self.assertEqual(plan["eligible"], [])
+                        self.assertIn("linked extraction", plan["excluded"][0]["reason"])
+
+                self.assertEqual(len(client.created), 1)
+                self.assertEqual([result["creation_status"] for result in outcomes], ["created"])
+
+    def test_linked_extraction_intent_blocks_concurrent_plan_before_second_create(self):
+        for reverse in (False, True):
+            with self.subTest(reverse=reverse), tempfile.TemporaryDirectory() as tmp:
+                (output, source_root, first, second, _, _, first_view,
+                 second_view) = self._linked_extraction_pair(Path(tmp))
+                plans = [first_view, second_view] if not reverse else [second_view, first_view]
+
+                class PausedMealie(FakeMealie):
+                    def __init__(self):
+                        super().__init__()
+                        self.started = __import__("threading").Event()
+                        self.release = __import__("threading").Event()
+
+                    def create_recipe(self, recipe):
+                        self.started.set()
+                        if not self.release.wait(5):
+                            raise TimeoutError("test create release timed out")
+                        return super().create_recipe(recipe)
+
+                client = PausedMealie()
+                service = ImportService(output, source_root=source_root, client=client)
+                with patch("ui_import_service.load_catalog", return_value=[first_view, second_view]):
+                    plan_ids = [service.preview([view.candidate_id])["plan_id"] for view in plans]
+                    with ThreadPoolExecutor(max_workers=2) as pool:
+                        first_dispatch = pool.submit(service.dispatch, plan_ids[0])
+                        self.assertTrue(client.started.wait(5), "first create intent was not dispatched")
+                        second_dispatch = pool.submit(service.dispatch, plan_ids[1])
+                        second_result = second_dispatch.result(timeout=5)
+                        client.release.set()
+                        first_result = first_dispatch.result(timeout=5)
+
+                outcomes = [first_result[0], second_result[0]]
+                self.assertEqual(len(client.created), 1)
+                self.assertEqual(sum(item["creation_status"] == "created" for item in outcomes), 1)
+                protected = [item for item in outcomes if item["creation_status"] != "created"]
+                self.assertEqual(len(protected), 1)
+                self.assertIn("linked extraction", protected[0]["reason"])
     def test_mealie_empty_instructions_rejection_is_not_reposted_for_same_revision(self):
         with tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parents[1] /
                                          ".superpowers/sdd/2026-10-18-manual-review-missing-instructions-navigation/tmp") as tmp:

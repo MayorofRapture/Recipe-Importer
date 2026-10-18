@@ -2,8 +2,9 @@
 // Synthetic-only Chromium flow for identity reconciliation screens and recovery.
 import { spawn } from 'node:child_process';
 import { mkdtemp, readFile, rm, mkdir, writeFile } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
+import { assertBrowserFixtureAttestation, rejectArbitraryUrl,
+  prepareEvidenceDirectory, startIsolatedBrowserFixture } from './browser_fixture_runner.mjs';
 
 function arg(name, fallback = undefined) {
   const prefix = `--${name}=`;
@@ -11,13 +12,16 @@ function arg(name, fallback = undefined) {
   return found ? found.slice(prefix.length) : fallback;
 }
 
-const url = arg('url');
-const evidenceDir = resolve(arg('evidence-dir', ''));
+rejectArbitraryUrl();
+const evidenceArg = arg('evidence-dir');
 const executable = resolve(arg('executable', join(process.env.LOCALAPPDATA || '', 'ms-playwright',
   'chromium_headless_shell-1200', 'chrome-headless-shell-win64', 'chrome-headless-shell.exe')));
-if (!url || !/^http:\/\/127\.0\.0\.1(?::\d+)?\//.test(url) || !evidenceDir) {
-  throw new Error('Provide a loopback --url and a synthetic --evidence-dir.');
+if (!evidenceArg) {
+  throw new Error('Provide a synthetic --evidence-dir.');
 }
+const evidenceDir = await prepareEvidenceDirectory(evidenceArg);
+const fixture = await startIsolatedBrowserFixture({ scenario: 'identity', requiredCandidates: ['Fried Rice'] });
+const url = fixture.url;
 
 class CDP {
   constructor(ws) {
@@ -100,7 +104,7 @@ async function capture(cdp, name, visibleText) {
   console.error(`Captured ${path}`);
 }
 
-const profile = await mkdtemp(join(tmpdir(), 'recipe-importer-identity-browser-'));
+const profile = await mkdtemp(join(fixture.root, 'browser-profile-'));
 let browser;
 let ws;
 try {
@@ -133,6 +137,7 @@ try {
   await waitFor(cdp, `document.readyState==='complete' && document.body.innerText.includes('Demonstration library')
     && document.body.innerText.includes('Recipe title')
     && document.body.innerText.includes('Recipe identity requires reconciliation')`, 'synthetic identity warning');
+  await assertBrowserFixtureAttestation(cdp, fixture);
   await mkdir(evidenceDir, { recursive: true });
 
   await capture(cdp, '01-identity-warning.png', 'Recipe identity requires reconciliation');
@@ -170,4 +175,5 @@ try {
   browser?.kill();
   await sleep(150);
   await rm(profile, { recursive: true, force: true }).catch(() => {});
+  await fixture.close();
 }

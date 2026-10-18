@@ -3,24 +3,28 @@
 // CDP mouse/keyboard/file APIs, and the same loopback-only request policy.
 import { spawn } from 'node:child_process';
 import { mkdtemp, readFile, rm, mkdir, writeFile } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
+import { assertBrowserFixtureAttestation, rejectArbitraryUrl,
+  prepareEvidenceDirectory, startIsolatedBrowserFixture } from './browser_fixture_runner.mjs';
 
 function arg(name, fallback = undefined) {
   const prefix = `--${name}=`;
   const found = process.argv.slice(2).find((item) => item.startsWith(prefix));
   return found ? found.slice(prefix.length) : fallback;
 }
-const url = arg('url');
-const validFile = resolve(arg('valid-file', ''));
-const invalidFile = resolve(arg('invalid-file', ''));
-const evidence = resolve(arg('evidence-dir', ''));
+rejectArbitraryUrl();
+const evidenceArg = arg('evidence-dir');
 const viewport = (arg('viewport', '1440x900').match(/^(\d+)x(\d+)$/) || []).slice(1).map(Number);
 const executable = resolve(arg('executable', join(process.env.LOCALAPPDATA || '', 'ms-playwright',
   'chromium_headless_shell-1200', 'chrome-headless-shell-win64', 'chrome-headless-shell.exe')));
-if (!url || !/^http:\/\/127\.0\.0\.1(?::\d+)?\//.test(url) || !validFile || !invalidFile || !evidence || viewport.length !== 2) {
-  throw new Error('Provide --url=http://127.0.0.1:PORT/, --valid-file, --invalid-file, --evidence-dir, and optional --viewport=1440x900.');
+if (!evidenceArg || viewport.length !== 2) {
+  throw new Error('Provide --evidence-dir and optional --viewport=1440x900. Upload files are generated inside the isolated fixture.');
 }
+const evidence = await prepareEvidenceDirectory(evidenceArg);
+const fixture = await startIsolatedBrowserFixture({ scenario: 'upload', requiredCandidates: [] });
+const url = fixture.url;
+const validFile = fixture.validFile;
+const invalidFile = fixture.invalidFile;
 
 class CDP {
   constructor(ws) { this.ws = ws; this.id = 0; this.pending = new Map(); ws.addEventListener('message', async (event) => {
@@ -100,7 +104,7 @@ async function key(cdp, value, code, vk, modifiers = 0) {
   await cdp.send('Input.dispatchKeyEvent', { type: 'keyUp', key: value, code, windowsVirtualKeyCode: vk, modifiers });
 }
 
-const profile = await mkdtemp(join(tmpdir(), 'recipe-importer-upload-browser-'));
+const profile = await mkdtemp(join(fixture.root, 'browser-profile-'));
 let browser;
 let ws;
 try {
@@ -130,6 +134,8 @@ try {
   await cdp.send('Page.enable'); await cdp.send('Runtime.enable'); await cdp.send('DOM.enable');
   await cdp.send('Emulation.setDeviceMetricsOverride', { width: viewport[0], height: viewport[1], deviceScaleFactor: 1, mobile: viewport[0] <= 480 });
   await cdp.send('Page.navigate', { url });
+  await waitFor(cdp, `document.body.innerText.includes('Demonstration library')`, 'isolated application');
+  await assertBrowserFixtureAttestation(cdp, fixture);
   await waitFor(cdp, `document.readyState==='complete' && /Batch name/.test(document.body.innerText)`, 'Upload form');
   const artifacts = [];
 
@@ -159,7 +165,7 @@ try {
   const priorDocumentStart = await evaluate(cdp, 'performance.timeOrigin');
   await cdp.send('Page.reload');
   await waitFor(cdp, `performance.timeOrigin>${priorDocumentStart}`, 'browser reload completion');
-  await waitFor(cdp, `([...document.querySelectorAll('input')].some(e=>e.value.includes('Synthetic demo from synthetic-recipe')) || document.body.innerText.includes('Synthetic demo from synthetic-recipe')) && /Review queue/.test(document.body.innerText)`, 'restored saved draft after reload');
+  await waitFor(cdp, `!!document.querySelector('input[aria-label="Recipe title"]') && /Save draft/.test(document.body.innerText) && /synthetic-recipe.png/.test(document.body.innerText)`, 'restored saved draft after reload');
   artifacts.push(await screenshot(cdp, 'review-draft-restored-1440x900.png'));
   await clickText(cdp, 'Approve & next');
   await waitFor(cdp, `/You.ve reached the end|queue is clear|No recipes match these filters|Open Import & history/.test(document.body.innerText)`, 'explicit approval');
@@ -191,4 +197,5 @@ try {
   ws.close();
 } finally {
   browser?.kill(); await sleep(150); await rm(profile, { recursive: true, force: true }).catch(() => {});
+  await fixture.close();
 }

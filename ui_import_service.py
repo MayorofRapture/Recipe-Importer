@@ -10,6 +10,10 @@ from pathlib import Path
 from typing import Any
 
 from import_recipes import StateStore, file_digest
+from import_protection import (
+    ImportProtectionError, candidate_identity_group, protected_candidate_ids_from_records,
+    protected_identity_groups, read_import_state,
+)
 from recipe_quality import RecipeCandidate, is_complete
 from review_store import ReviewConflict, ReviewStore, _state_lock
 from ui_data import RecipeView, load_catalog
@@ -60,9 +64,10 @@ class ImportService:
         with _state_lock(self.review_path):
             review._reload()
             events = self._read_events()
+            protection = self._protection_snapshot(review, events)
             for candidate_id in selected:
                 view = views.get(candidate_id)
-                reason, recipe = self._eligibility(review, events, view)
+                reason, recipe = self._eligibility(review, events, view, protection)
                 if reason:
                     excluded.append({"candidate_id": candidate_id, "reason": reason})
                     continue
@@ -104,7 +109,13 @@ class ImportService:
             with _state_lock(self.review_path):
                 review._reload()
                 events = self._read_events()
-                reason, recipe = self._eligibility(review, events, view)
+                try:
+                    protection = self._protection_snapshot(review, events)
+                except ImportProtectionError:
+                    outcomes.append(self._outcome(candidate_id, planned.get("title", ""),
+                                                  "uncertain", reason="Import history is unreadable; candidate remains protected."))
+                    continue
+                reason, recipe = self._eligibility(review, events, view, protection)
                 if reason:
                     blocked_status = self._blocked_status(events, candidate_id)
                     outcomes.append(self._outcome(candidate_id, planned.get("title", ""),
@@ -228,6 +239,11 @@ class ImportService:
         with _state_lock(self.review_path):
             review._reload()
             events = self._read_events()
+            try:
+                protection = self._protection_snapshot(review, events)
+            except ImportProtectionError:
+                return {"status": "uncertain", "slug": "", "tag_status": "not_attempted",
+                        "reason": "Import history is unreadable; candidate remains protected."}
             registration = next((item for item in review.registrations.get(candidate_id, [])
                                  if item.get("source_hash") == source_hash
                                  and item.get("extraction_id") == extraction_id), None)
@@ -269,7 +285,13 @@ class ImportService:
                     return {"status": "not_sent", "slug": "", "tag_status": "not_attempted",
                             "reason": "Mealie rejected an empty-instructions recipe for this exact revision. Edit the recipe or verify endpoint support before another create attempt."}
                 try:
-                    protected = review._protected_import_outcome(registration)
+                    group = candidate_identity_group(review, candidate_id, source_hash, extraction_id)
+                    if group and group in protection["protected_groups"]:
+                        return {"status": "already_done", "slug": "", "tag_status": "not_attempted",
+                                "reason": "A linked extraction already has a protected Mealie outcome."}
+                    protected = review._protected_import_outcome(
+                        registration, state_records=protection["state_records"],
+                        protected_ids=protection["protected_ids"])
                 except ReviewConflict:
                     return {"status": "uncertain", "slug": "", "tag_status": "not_attempted",
                             "reason": "Import history is unreadable; candidate remains protected."}
@@ -281,7 +303,9 @@ class ImportService:
                     return {"status": "not_sent", "slug": "", "tag_status": "not_attempted",
                             "reason": "Recipe is incomplete."}
                 try:
-                    protected = review._protected_import_outcome(registration)
+                    protected = review._protected_import_outcome(
+                        registration, state_records=protection["state_records"],
+                        protected_ids=protection["protected_ids"])
                 except ReviewConflict:
                     return {"status": "uncertain", "slug": "", "tag_status": "not_attempted",
                             "reason": "Import history is unreadable; candidate remains protected."}
@@ -613,7 +637,8 @@ class ImportService:
         }
 
     def _eligibility(self, review: ReviewStore, events: list[dict],
-                     view: RecipeView | None) -> tuple[str, dict | None]:
+                     view: RecipeView | None,
+                     protection: dict | None = None) -> tuple[str, dict | None]:
         if view is None:
             return "Candidate is no longer available.", None
         if view.revision < 1:
@@ -646,8 +671,19 @@ class ImportService:
             return "Candidate registration is unavailable.", None
         if review.identity_link_status(view.candidate_id, view.source_hash, view.extraction_id) != "registered":
             return "Candidate identity needs reconciliation.", None
+        if protection is None:
+            try:
+                protection = self._protection_snapshot(review, events)
+            except ImportProtectionError:
+                return "Import history is unreadable; candidate remains protected.", None
+        group = candidate_identity_group(review, view.candidate_id, view.source_hash,
+                                         view.extraction_id)
+        if group and group in protection["protected_groups"]:
+            return "A linked extraction already has a protected Mealie outcome.", None
         try:
-            protected = review._protected_import_outcome(registration)
+            protected = review._protected_import_outcome(
+                registration, state_records=protection["state_records"],
+                protected_ids=protection["protected_ids"])
         except ReviewConflict:
             return "Import history is unreadable; candidate remains protected.", None
         if protected:
@@ -657,6 +693,16 @@ class ImportService:
             return ("A prior create attempt is uncertain; check Mealie before retrying."
                     if status == "uncertain" else "Candidate was already created; use tag repair if needed."), None
         return "", effective.recipe
+
+    def _protection_snapshot(self, review: ReviewStore, events: list[dict]) -> dict:
+        """Read protection ledgers once while the review lock is held."""
+        state_records = read_import_state(self.state_path)
+        protected_ids = protected_candidate_ids_from_records(state_records, events)
+        return {
+            "state_records": state_records,
+            "protected_ids": protected_ids,
+            "protected_groups": protected_identity_groups(review, protected_ids),
+        }
 
     @staticmethod
     def _empty_instruction_rejection(events: list[dict], candidate_id: str,

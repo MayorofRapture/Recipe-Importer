@@ -4,11 +4,15 @@ import os
 from pathlib import Path
 
 st.set_page_config(page_title="Recipe-Importer", page_icon=":material/menu_book:", layout="wide")
-from runtime_safety import FixtureModeError, fixture_mode, fixture_output_dir
+from runtime_safety import (FixtureModeError, fixture_mode, fixture_output_dir,
+                            validate_browser_fixture_environment)
 
 fixture_library = None
+browser_fixture_attestation = None
 if fixture_mode():
     try:
+        if os.environ.get("RECIPE_IMPORTER_BROWSER_FIXTURE") == "1":
+            browser_fixture_attestation = validate_browser_fixture_environment()
         fixture_library = fixture_output_dir()
     except FixtureModeError as exc:
         st.error(str(exc), icon=":material/lock:")
@@ -16,6 +20,8 @@ if fixture_mode():
 
 if fixture_mode():
     st.caption("Demonstration library · simulated services only")
+if browser_fixture_attestation:
+    st.caption(f"Isolated browser fixture: {browser_fixture_attestation}")
 
 if "initial_destination" not in st.session_state:
     library = fixture_library or Path(os.environ.get("RECIPE_IMPORTER_OUTPUT_DIR", "output"))

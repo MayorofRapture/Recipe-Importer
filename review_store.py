@@ -394,7 +394,8 @@ class ReviewStore:
             raise ReviewConflict("durable review event readback did not match the appended event")
         return readback
 
-    def _protected_import_outcome(self, registration: dict) -> dict | None:
+    def _protected_import_outcome(self, registration: dict, *, state_records: list[dict] | None = None,
+                                  protected_ids: set[str] | None = None) -> dict | None:
         from import_protection import ImportProtectionError, protected_candidate_ids
 
         state_path = self.state_path
@@ -411,13 +412,18 @@ class ReviewStore:
             and item.get("extraction_id") == registration.get("extraction_id")
             and re.sub(r"\s+", " ", str(item.get("candidate", {}).get("name", "")).strip().casefold()) == title
         }) > 1
-        try:
-            if self.state_path.exists():
-                ui_count("ledger_reads")
-            records = ([json.loads(line) for line in state_path.read_text(encoding="utf-8").splitlines()
-                        if line.strip()] if state_path.exists() else [])
-        except (OSError, json.JSONDecodeError) as exc:
-            raise ReviewConflict("import state is unreadable; approval is protected pending reconciliation") from exc
+        if state_records is None:
+            try:
+                if self.state_path.exists():
+                    ui_count("ledger_reads")
+                records = ([json.loads(line) for line in state_path.read_text(encoding="utf-8").splitlines()
+                            if line.strip()] if state_path.exists() else [])
+                if any(not isinstance(record, dict) for record in records):
+                    raise ValueError("invalid import state record")
+            except (OSError, json.JSONDecodeError, ValueError) as exc:
+                raise ReviewConflict("import state is unreadable; approval is protected pending reconciliation") from exc
+        else:
+            records = state_records
         for record in records:
             if record.get("status") not in {"IMPORTED", "UNCERTAIN"}:
                 continue
@@ -430,10 +436,13 @@ class ReviewStore:
             if (source_hash and key.startswith(source_hash + ":") and title and record_title == title
                     and (not duplicate_registered_title or not record_identity or ambiguous_legacy_identity)):
                 return record
-        try:
-            protected = protected_candidate_ids(self.path.parent, state_path=state_path)
-        except ImportProtectionError as exc:
-            raise ReviewConflict(str(exc)) from exc
+        if protected_ids is None:
+            try:
+                protected = protected_candidate_ids(self.path.parent, state_path=state_path)
+            except ImportProtectionError as exc:
+                raise ReviewConflict(str(exc)) from exc
+        else:
+            protected = protected_ids
         if aliases.intersection(protected):
             return {"status": "UNCERTAIN", "identity": registration.get("candidate_id", ""),
                     "protection_source": "durable_import_intent"}

@@ -1,4 +1,5 @@
 import os
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -9,6 +10,30 @@ from runtime_safety import FixtureModeError, fixture_output_dir, fixture_source_
 
 
 class RuntimeSafetyTests(unittest.TestCase):
+    @staticmethod
+    def _browser_fixture(root: Path) -> dict[str, str]:
+        import json
+        import secrets
+
+        output, sources = root / "output", root / "sources"
+        output.mkdir(parents=True)
+        sources.mkdir()
+        run_id, nonce = "test-run", secrets.token_hex(16)
+        marker = {"kind": "synthetic-browser-fixture", "run_id": run_id, "nonce": nonce}
+        (root / ".recipe-importer-browser-fixture.json").write_text(
+            json.dumps(marker), encoding="utf-8")
+        (output / ".fixture-library").write_text(json.dumps(marker), encoding="utf-8")
+        (sources / ".fixture-sources").write_text(json.dumps(marker), encoding="utf-8")
+        return {
+            "RECIPE_IMPORTER_FIXTURE_MODE": "1",
+            "RECIPE_IMPORTER_BROWSER_FIXTURE": "1",
+            "RECIPE_IMPORTER_FIXTURE_ROOT": str(root.resolve()),
+            "RECIPE_IMPORTER_OUTPUT_DIR": str(output.resolve()),
+            "RECIPE_IMPORTER_SOURCE_DIR": str(sources.resolve()),
+            "RECIPE_IMPORTER_FIXTURE_RUN_ID": run_id,
+            "RECIPE_IMPORTER_FIXTURE_NONCE": nonce,
+        }
+
     def test_mealie_default_client_is_blocked_before_any_request(self):
         from mealie_client import MealieClient
         with patch.dict(os.environ, {"RECIPE_IMPORTER_FIXTURE_MODE": "1"}):
@@ -50,6 +75,103 @@ class RuntimeSafetyTests(unittest.TestCase):
                     fixture_output_dir()
                 (output / ".fixture-library").write_text("synthetic test library", encoding="utf-8")
                 self.assertEqual(fixture_output_dir(), output.resolve())
+
+    def test_fixture_output_rejects_nested_path_inside_production_output(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            output = root / "output" / "nested-fixture"
+            output.mkdir(parents=True)
+            (output / ".fixture-library").write_text("synthetic", encoding="utf-8")
+            with patch("runtime_safety.Path.cwd", return_value=root):
+                with patch.dict(os.environ, {"RECIPE_IMPORTER_FIXTURE_MODE": "1",
+                                             "RECIPE_IMPORTER_OUTPUT_DIR": str(output)}, clear=False):
+                    with self.assertRaises(FixtureModeError):
+                        fixture_output_dir()
+
+    def test_fixture_output_rejects_ancestor_of_production_output(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / ".fixture-library").write_text("synthetic", encoding="utf-8")
+            with patch("runtime_safety.Path.cwd", return_value=root):
+                with patch.dict(os.environ, {"RECIPE_IMPORTER_FIXTURE_MODE": "1",
+                                             "RECIPE_IMPORTER_OUTPUT_DIR": str(root)}, clear=False):
+                    with self.assertRaises(FixtureModeError):
+                        fixture_output_dir()
+
+    def test_fixture_output_rejects_symlink_into_production_output(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            production = root / "production-output"
+            production.mkdir()
+            output = production / "nested-fixture"
+            output.mkdir()
+            (output / ".fixture-library").write_text("synthetic", encoding="utf-8")
+            alias = root / "alias"
+            try:
+                alias.symlink_to(production, target_is_directory=True)
+            except (OSError, NotImplementedError) as exc:
+                self.skipTest(f"directory symlinks are unavailable: {exc}")
+            with patch("runtime_safety.Path.cwd", return_value=root):
+                with patch.dict(os.environ, {"RECIPE_IMPORTER_FIXTURE_MODE": "1",
+                                             "RECIPE_IMPORTER_OUTPUT_DIR": str(alias / "nested-fixture")}, clear=False):
+                    with self.assertRaises(FixtureModeError):
+                        fixture_output_dir()
+
+    def test_fixture_output_rejects_junction_into_production_output(self):
+        if os.name != "nt":
+            self.skipTest("Windows junctions are only available on Windows")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            production = root / "production-output"
+            production.mkdir()
+            (production / "nested-fixture").mkdir()
+            (production / "nested-fixture" / ".fixture-library").write_text(
+                "synthetic", encoding="utf-8")
+            alias = root / "alias"
+            made = subprocess.run(
+                ["cmd.exe", "/c", "mklink", "/J", str(alias), str(production)],
+                capture_output=True, text=True, check=False,
+            )
+            if made.returncode:
+                self.skipTest(f"junction creation is unavailable: {made.stderr or made.stdout}")
+            with patch("runtime_safety.Path.cwd", return_value=root):
+                with patch.dict(os.environ, {"RECIPE_IMPORTER_FIXTURE_MODE": "1",
+                                             "RECIPE_IMPORTER_OUTPUT_DIR": str(alias / "nested-fixture")}, clear=False):
+                    with self.assertRaises(FixtureModeError):
+                        fixture_output_dir()
+
+    def test_browser_fixture_requires_matching_runtime_attestation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env = self._browser_fixture(Path(tmp))
+            with patch.dict(os.environ, env, clear=True):
+                from runtime_safety import validate_browser_fixture_environment
+                self.assertEqual(validate_browser_fixture_environment(), "test-run:" + env[
+                    "RECIPE_IMPORTER_FIXTURE_NONCE"])
+
+    def test_browser_fixture_rejects_missing_or_forged_attestation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env = self._browser_fixture(Path(tmp))
+            (Path(tmp) / "sources" / ".fixture-sources").unlink()
+            with patch.dict(os.environ, env, clear=True):
+                from runtime_safety import validate_browser_fixture_environment
+                with self.assertRaises(FixtureModeError):
+                    validate_browser_fixture_environment()
+            with tempfile.TemporaryDirectory() as second:
+                forged = self._browser_fixture(Path(second))
+                forged["RECIPE_IMPORTER_FIXTURE_NONCE"] = "caller-supplied"
+                with patch.dict(os.environ, forged, clear=True):
+                    from runtime_safety import validate_browser_fixture_environment
+                    with self.assertRaises(FixtureModeError):
+                        validate_browser_fixture_environment()
+
+    def test_browser_fixture_rejects_provider_credentials(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env = self._browser_fixture(Path(tmp))
+            env["MEALIE_TOKEN"] = "synthetic-secret"
+            with patch.dict(os.environ, env, clear=True):
+                from runtime_safety import validate_browser_fixture_environment
+                with self.assertRaisesRegex(FixtureModeError, "credentials"):
+                    validate_browser_fixture_environment()
 
     def test_fixture_mode_never_falls_back_to_default_output_directory(self):
         prior = os.environ.pop("RECIPE_IMPORTER_OUTPUT_DIR", None)

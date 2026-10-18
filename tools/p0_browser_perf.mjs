@@ -2,14 +2,15 @@
 // Persistent local-only Chromium session for repeatable P0 interaction timings.
 import { spawn } from 'node:child_process';
 import { mkdtemp, readFile, rm, mkdir, writeFile } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
+import { assertBrowserFixtureAttestation, rejectArbitraryUrl,
+  prepareEvidenceFile, startIsolatedBrowserFixture } from './browser_fixture_runner.mjs';
 
 function arg(name, fallback) {
   const prefix = `--${name}=`;
   return process.argv.slice(2).find((value) => value.startsWith(prefix))?.slice(prefix.length) ?? fallback;
 }
-const url = arg('url', '');
+rejectArbitraryUrl();
 const action = arg('action', 'tabs');
 const direction = arg('direction', 'next');
 const targets = arg('targets', '').split(',').filter(Boolean);
@@ -17,21 +18,23 @@ const iterations = Number(arg('iterations', '5'));
 const startupOnly = arg('startup-only', 'false') === 'true';
 const evidencePath = arg('evidence', '');
 const screenshotPath = arg('screenshot', '');
-const portPattern = /^http:\/\/127\.0\.0\.1:(\d+)(?:\/review)?\/?$/;
-if (!portPattern.test(url) || !['tabs', 'bulk', 'navigate', 'jump', 'save'].includes(action)
+const evidenceOutput = evidencePath ? await prepareEvidenceFile(evidencePath) : '';
+const screenshotOutput = screenshotPath ? await prepareEvidenceFile(screenshotPath) : '';
+if (!['tabs', 'bulk', 'navigate', 'jump', 'save'].includes(action)
     || (action === 'navigate' && !['next', 'previous'].includes(direction))
     || (action === 'jump' && targets.length !== iterations)
     || !Number.isInteger(iterations) || iterations < 1 || iterations > 10) {
-  throw new Error('Use --url=http://127.0.0.1:PORT/ --action=tabs|bulk|navigate|save [--iterations=5].');
+  throw new Error('Use --action=tabs|bulk|navigate|jump|save [--iterations=5]. The harness owns its isolated app.');
 }
-const port = Number(url.match(portPattern)[1]);
-if (port < 8920) throw new Error('P0 harness only accepts isolated ports 8920 and above.');
+const fixture = await startIsolatedBrowserFixture({ scenario: 'performance',
+  requiredCandidates: ['Fried Rice', ...targets] });
+const url = fixture.url;
 const recipeFieldPattern = /^(Ingredient\s+\d+|Step\s+\d+)$/i;
 if (!recipeFieldPattern.test('Ingredient 1') || !recipeFieldPattern.test('Step 2')
     || recipeFieldPattern.test('Bulk instructions')) throw new Error('Recipe selector regex self-check failed.');
 const executable = resolve(arg('executable', join(process.env.LOCALAPPDATA || '', 'ms-playwright',
   'chromium_headless_shell-1200', 'chrome-headless-shell-win64', 'chrome-headless-shell.exe')));
-const profile = await mkdtemp(join(tmpdir(), 'p0-browser-'));
+const profile = await mkdtemp(join(fixture.root, 'browser-profile-'));
 let browser;
 browser = spawn(executable, [
   '--headless=new', '--disable-gpu', '--disable-dev-shm-usage', '--disable-background-networking',
@@ -130,7 +133,7 @@ async function readCounters(cdp) {
   return evaluate(cdp, `(()=>{const e=[...document.querySelectorAll('[data-testid="stJson"]')].find(x=>x.innerText.includes('full_page_executions'));const text=e?.innerText||'';const counts={};for(const line of text.split('\\n')){const match=line.match(/^\\s*"([^"]+)":\\s*(\\d+)/);if(match)counts[match[1]]=Number(match[2])}return {counts,raw:text}})()`);
 }
 async function ensureCountersOpen(cdp) {
-  const state = await evaluate(cdp, `(()=>{const e=[...document.querySelectorAll('[data-testid="stExpander"]')].find(x=>x.innerText.includes('Performance counters'));return e?{open:e.innerText.includes('full_page_executions'),box:(()=>{const r=e.getBoundingClientRect();return{x:r.x+r.width/2,y:r.y+r.height/2}})()}:null})()`);
+  const state = await evaluate(cdp, `(()=>{const e=[...document.querySelectorAll('[data-testid="stExpander"]')].find(x=>x.innerText.includes('Performance counters')&&x.getClientRects().length);if(!e)return null;const h=e.querySelector('summary,[data-testid="stExpanderToggleButton"]')||e;const r=h.getBoundingClientRect();return{open:e.innerText.includes('full_page_executions'),box:{x:r.x+r.width/2,y:r.y+r.height/2}}})()`);
   if (!state) throw new Error('UI diagnostics were enabled but the Performance counters expander was not rendered.');
   if (!state.open) { await click(cdp, state.box); await waitFor(cdp, `!![...document.querySelectorAll('[data-testid="stJson"]')].find(x=>x.innerText.includes('full_page_executions'))`, 'visible UI diagnostic counters', 10000); }
 }
@@ -155,6 +158,7 @@ try {
   await cdp.send('Page.navigate', { url });
   await waitFor(cdp, `(document.readyState==='complete'&&!!document.querySelector('[data-testid="stApp"]'))`, 'Streamlit shell');
   await waitFor(cdp, `${gateExpression}.usable`, 'populated selected recipe and source scan');
+  await assertBrowserFixtureAttestation(cdp, fixture);
   const coldStartupMs = Date.now() - startupAt;
   const measuredGate = await gate(cdp);
   const sourceGate = startupOnly
@@ -269,11 +273,12 @@ try {
     const countersHeader = await evaluate(cdp, `(()=>{const e=[...document.querySelectorAll('[data-testid="stExpander"]')].find(x=>x.innerText.includes('Performance counters'));const h=e?.querySelector('summary,[data-testid="stExpanderToggleButton"]');const r=h?.getBoundingClientRect();if(!r)return null;const x=r.x+r.width/2,y=r.y+r.height/2,hit=document.elementFromPoint(x,y);return{x,y,open:!!e.querySelector('[data-testid="stJson"]'),hitInside:!!(hit&&(hit===h||h.contains(hit)))}})()`);
     if (countersHeader?.open&&countersHeader.hitInside) await click(cdp, countersHeader);
     const screenshot = await cdp.send('Page.captureScreenshot', { format: 'png', captureBeyondViewport: false });
-    const path = resolve(screenshotPath); await mkdir(dirname(path), { recursive: true });
+    const path = screenshotOutput;
     await writeFile(path, Buffer.from(screenshot.data, 'base64')); result.screenshot = path;
   }
-  if (evidencePath) { const path = resolve(evidencePath); await mkdir(dirname(path), { recursive: true }); await writeFile(path, JSON.stringify(result, null, 2), 'utf8'); result.evidence = path; }
+  if (evidenceOutput) { const path = evidenceOutput; await writeFile(path, JSON.stringify(result, null, 2), 'utf8'); result.evidence = path; }
   console.log(JSON.stringify(result, null, 2));
 } finally {
   ws?.close(); browser.kill(); await sleep(150); await rm(profile, { recursive: true, force: true }).catch(() => {});
+  await fixture.close();
 }

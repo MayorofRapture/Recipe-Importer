@@ -2,8 +2,9 @@
 // Synthetic-only Review acceptance flow using cached Chromium and loopback CDP.
 import { spawn } from 'node:child_process';
 import { mkdtemp, readFile, rm, mkdir, writeFile } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
+import { assertBrowserFixtureAttestation, rejectArbitraryUrl,
+  prepareEvidenceDirectory, startIsolatedBrowserFixture } from './browser_fixture_runner.mjs';
 
 function arg(name, fallback = undefined) {
   const prefix = `--${name}=`;
@@ -11,16 +12,19 @@ function arg(name, fallback = undefined) {
   return found ? found.slice(prefix.length) : fallback;
 }
 
-const url = arg('url');
+rejectArbitraryUrl();
 const candidate = arg('candidate', 'Cranberry & Caramel Date Bars');
-const evidenceDir = resolve(arg('evidence-dir', ''));
+const evidenceArg = arg('evidence-dir');
 const editValue = arg('edited-value', '10 bars');
 const instructionValue = arg('instructions', 'Combine the ingredients.\n\nBake until set.');
 const executable = resolve(arg('executable', join(process.env.LOCALAPPDATA || '', 'ms-playwright',
   'chromium_headless_shell-1200', 'chrome-headless-shell-win64', 'chrome-headless-shell.exe')));
-if (!url || !/^http:\/\/127\.0\.0\.1(?::\d+)?\//.test(url) || !evidenceDir) {
-  throw new Error('Provide --url=http://127.0.0.1:PORT/ and --evidence-dir for synthetic browser evidence.');
+if (!evidenceArg) {
+  throw new Error('Provide --evidence-dir for synthetic browser evidence.');
 }
+const evidenceDir = await prepareEvidenceDirectory(evidenceArg);
+const fixture = await startIsolatedBrowserFixture({ scenario: 'review', requiredCandidates: [candidate] });
+const url = fixture.url;
 
 class CDP {
   constructor(ws) { this.ws = ws; this.id = 0; this.pending = new Map(); ws.addEventListener('message', async (event) => {
@@ -50,6 +54,18 @@ async function waitFor(cdp, expression, description, timeout = 30000) {
     await sleep(250);
   }
   throw new Error(`Timed out waiting for ${description}: ${await evaluate(cdp, 'document.body.innerText.slice(0,1600)').catch(() => 'page unavailable')}`);
+}
+async function waitForStable(cdp, expression, description, stableMs = 600, timeout = 30000) {
+  const deadline = Date.now() + timeout;
+  let matchedAt = 0;
+  while (Date.now() < deadline) {
+    if (await evaluate(cdp, expression).catch(() => false)) {
+      if (!matchedAt) matchedAt = Date.now();
+      if (Date.now() - matchedAt >= stableMs) return;
+    } else matchedAt = 0;
+    await sleep(100);
+  }
+  throw new Error(`Timed out waiting for stable ${description}: ${await evaluate(cdp, 'document.body.innerText.slice(0,1600)').catch(() => 'page unavailable')}`);
 }
 async function clickVisibleText(cdp, text, selector = 'button,a,[role="button"]') {
   const point = await evaluate(cdp, `(() => {
@@ -131,7 +147,7 @@ async function screenshot(cdp, name) {
   return path;
 }
 
-const profile = await mkdtemp(join(tmpdir(), 'recipe-review-acceptance-'));
+const profile = await mkdtemp(join(fixture.root, 'browser-profile-'));
 let browser;
 try {
   browser = spawn(executable, [
@@ -160,13 +176,15 @@ try {
   await cdp.send('Emulation.setDeviceMetricsOverride', { width: 1440, height: 900, deviceScaleFactor: 1, mobile: false });
   const navigationStarted = Date.now();
   await cdp.send('Page.navigate', { url });
-  await waitFor(cdp, `document.readyState==='complete'&&!!document.querySelector('[data-testid="stApp"]')&&!!document.querySelector('input[aria-label="Recipe title"]')`, 'initial Review editor', 180000);
+  await waitFor(cdp, `document.readyState==='complete'&&!!document.querySelector('[data-testid="stApp"]')&&[...document.querySelectorAll('input[aria-label="Recipe title"]')].some(e=>e.getClientRects().length)`, 'initial Review editor', 45000);
   await waitFor(cdp, `(()=>{const i=[...document.images].find(x=>x.alt.startsWith('Recipe source page'));return !!i&&i.complete&&i.naturalWidth>100&&![...document.querySelectorAll('[data-testid*="skeleton" i],[class*="skeleton" i')].length})()`, 'settled source scan and editor', 60000);
+  await assertBrowserFixtureAttestation(cdp, fixture);
   const timings = { firstReviewSettledMs: Date.now() - navigationStarted };
   const evidence = { screenshots: [await screenshot(cdp, 'browser-review-after-precise-1440x900.png')], timings };
   if (arg('inspect') === 'true') {
     console.log(JSON.stringify(await evaluate(cdp, `JSON.stringify({body:document.body.innerText.slice(0,2400),controls:[...document.querySelectorAll('input,textarea,button,[role="tab"]')].map(e=>({tag:e.tagName,role:e.getAttribute('role'),aria:e.getAttribute('aria-label'),text:e.innerText?.trim().slice(0,80),value:e.value?.slice(0,100),disabled:e.disabled})).filter(x=>x.aria||x.text)})`), null, 2));
     ws.close(); browser.kill(); await sleep(150); await rm(profile, { recursive: true, force: true }).catch(() => {});
+    await fixture.close();
     process.exit(0);
   }
 
@@ -197,17 +215,16 @@ try {
   await clickVisibleText(cdp, 'Queue');
   await waitFor(cdp, `!!document.querySelector('input[aria-label="Jump to recipe"]')`, 'recipe queue controls');
   await clickComboOption(cdp, 'Jump to recipe', candidate);
-  await waitFor(cdp, `document.querySelector('input[aria-label="Recipe title"]')?.value===${JSON.stringify(candidate)}`, 'selected proposal candidate');
+  await waitForStable(cdp, `[...document.querySelectorAll('input[aria-label="Recipe title"]')].some(e=>e.getClientRects().length&&e.value===${JSON.stringify(candidate)})`, 'selected proposal candidate');
   await ensureExpanderOpen(cdp, 'Issues and source notes');
   await clickVisibleText(cdp, 'Ingredients', '[role="tab"]');
   await waitFor(cdp, `document.body.innerText.includes('1 cup dates')&&document.body.innerText.includes('1/2 cup dates')`, 'ingredient proposals');
-  await clickProposalAction(cdp, '1 cup dates', 'Reject');
-  await waitFor(cdp, `!document.body.innerText.includes('1 cup dates')`, 'rejected critical proposal');
-  await waitFor(cdp, `document.body.innerText.includes('quantity is unclear')&&document.body.innerText.includes('Rejecting a proposal alone never clears')`, 'critical source issue remains after rejection');
+  await clickProposalAction(cdp, '1 cup dates', 'Reject; keep issue open');
+  await waitFor(cdp, `document.body.innerText.includes('Rejected')&&document.body.innerText.includes('Rejecting this proposal leaves the source issue unresolved')`, 'rejected critical proposal and unresolved source issue');
   evidence.screenshots.push(await screenshot(cdp, 'browser-review-after-critical-proposal-reject-1440x900.png'));
-  await clickProposalAction(cdp, '1/2 cup dates', 'Edit suggestion');
-  await waitFor(cdp, `!!document.querySelector('textarea[aria-label="Edit suggestion"]')`, 'proposal editor');
-  await fillLabel(cdp, 'Edit suggestion', '1 1/2 cups dates');
+  await clickProposalAction(cdp, '1/2 cup dates', 'Edit and use');
+  await waitFor(cdp, `!!document.querySelector('textarea[aria-label="Edit and use"]')`, 'proposal editor');
+  await fillLabel(cdp, 'Edit and use', '1 1/2 cups dates');
   await clickVisibleText(cdp, 'Use edited version');
   await waitFor(cdp, `!document.body.innerText.includes('1/2 cup dates')`, 'edited ingredient proposal');
   await clickProposalAction(cdp, '12 bars', 'Use suggestion');
@@ -216,7 +233,7 @@ try {
 
   await clickVisibleText(cdp, 'Queue');
   await clickComboOption(cdp, 'Jump to recipe', 'Fried Rice');
-  await waitFor(cdp, `document.querySelector('input[aria-label="Recipe title"]')?.value==='Fried Rice'`, 'complete recipe for approval');
+  await waitFor(cdp, `[...document.querySelectorAll('input[aria-label="Recipe title"]')].some(e=>e.getClientRects().length&&e.value==='Fried Rice')`, 'complete recipe for approval');
   evidence.screenshots.push(await screenshot(cdp, 'browser-review-ready-for-approval-1440x900.png'));
   await clickVisibleText(cdp, 'Instructions', '[role="tab"]');
   await waitFor(cdp, `!!document.querySelector('textarea[aria-label="Step 1"]')`, 'Instructions before bulk apply');
@@ -248,4 +265,5 @@ try {
   ws.close();
 } finally {
   browser?.kill(); await sleep(150); await rm(profile, { recursive: true, force: true }).catch(() => {});
+  await fixture.close();
 }
