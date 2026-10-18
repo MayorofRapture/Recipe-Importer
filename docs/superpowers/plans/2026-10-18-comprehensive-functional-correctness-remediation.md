@@ -90,10 +90,10 @@
 
 **Files:** `reconciliation_service.py`, `review_store.py` only if required, `tests/test_reconciliation.py`, `tests/test_review_reconciliation.py`.
 
-- [ ] Add fault injection before first write, after first durable write, during second write/readback, before termination, and on retry after partial completion.
-- [ ] Reproduce duplicate/rejected mapping retry and identify whether existing operation IDs already recover each write.
-- [ ] Implement the smallest idempotent recovery boundary; reuse operation IDs and verify exact revision content, parent, source, extraction lineage, identity, and import protection before finishing a partial mapping.
-- [ ] Verify concurrent retries, restart visibility, no duplicate revisions/candidates, and legacy history compatibility.
+- [x] Add fault injection before the first write, after the first durable write, during revision readback, after durable lineage write, and on retry after partial completion.
+- [x] Reproduce stale mapping retry; the existing operation ID recovered the revision only when the service allowed the exact partial write to finish.
+- [x] Implement idempotent recovery that verifies exact revision content, parent, source, extraction lineage, bindings, identity, and import protection; make UI operation IDs stable across reruns.
+- [x] Verify durable restart visibility, no duplicate revisions/candidates, and legacy history compatibility in the reconciliation suite.
 
 ## Task 7: F8 compatibility gate and F9 capability assessment
 

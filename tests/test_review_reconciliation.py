@@ -4,6 +4,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from recipe_quality import ExtractionBatch, RecipeCandidate, Suggestion
 from review_store import (
@@ -382,6 +383,164 @@ class ReviewReconciliationTests(unittest.TestCase):
         self.assertEqual(active_target.revision, 2)
         self.assertEqual(active_target.candidate.instructions, new.instructions)
         self.assertTrue(lineage_recorded)
+
+    def test_retry_recovers_mapping_after_revision_write_without_duplicate_revision(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = write_ui_fixture(Path(tmp))
+            output = Path(fixture["output"])
+            target = next(view for view in load_catalog(output) if view.candidate.name == "Fried Rice")
+            new = RecipeCandidate(name="Fried Rice", ingredients=["4 cups rice"],
+                                  instructions=["Steam the retry rice."])
+            service = RetryService(output, extractor=lambda *_: ExtractionBatch(recipes=[new]))
+            attempt = service.start_attempt(str(fixture["digest"]), mode="local_ocr")
+            new_id = service.compare(attempt["attempt_id"])["new_candidates"][0]["candidate_id"]
+            with patch.object(ReviewStore, "record_reconciliation",
+                              side_effect=OSError("fault after durable revision")):
+                with self.assertRaisesRegex(OSError, "durable revision"):
+                    service.apply_mapping(attempt["attempt_id"], new_id, target.candidate_id,
+                                          ["instructions"], 0, "recover-map", "Source sequence was reviewed.")
+            partial = next(view for view in load_catalog(output) if view.candidate_id == target.candidate_id)
+            self.assertEqual(partial.revision, 1)
+            self.assertEqual(partial.candidate.instructions, ["Steam the retry rice."])
+            self.assertFalse(any(event.get("event") == "candidate_reconciliation"
+                                 for event in ReviewStore(output / "review_events.jsonl").events))
+
+            result = service.apply_mapping(
+                attempt["attempt_id"], new_id, target.candidate_id,
+                ["instructions"], 0, "recover-map", "Source sequence was reviewed.")
+            final = next(view for view in load_catalog(output) if view.candidate_id == target.candidate_id)
+            reviews = ReviewStore(output / "review_events.jsonl")
+            revisions = [event for event in reviews.revisions[target.candidate_id]
+                         if event.get("operation_id") == "recover-map"]
+            lineage = [event for event in reviews.events
+                       if event.get("event") == "candidate_reconciliation"
+                       and event.get("operation_id") == "recover-map:lineage"]
+
+        self.assertEqual(result["revision"], 1)
+        self.assertEqual(final.revision, 1)
+        self.assertEqual(len(revisions), 1)
+        self.assertEqual(len(lineage), 1)
+        self.assertEqual(lineage[0]["new_candidate_id"], new_id)
+
+    def test_mapping_failure_before_first_write_leaves_no_effective_mapping(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = write_ui_fixture(Path(tmp))
+            output = Path(fixture["output"])
+            target = next(view for view in load_catalog(output) if view.candidate.name == "Fried Rice")
+            retry = RecipeCandidate(name="Fried Rice", ingredients=["4 cups rice"],
+                                    instructions=["Steam the retry rice."])
+            service = RetryService(output, extractor=lambda *_: ExtractionBatch(recipes=[retry]))
+            attempt = service.start_attempt(str(fixture["digest"]), mode="local_ocr")
+            new_id = service.compare(attempt["attempt_id"])["new_candidates"][0]["candidate_id"]
+
+            with patch.object(ReviewStore, "save_revision", side_effect=OSError("fault before first write")):
+                with self.assertRaisesRegex(OSError, "before first write"):
+                    service.apply_mapping(attempt["attempt_id"], new_id, target.candidate_id,
+                                          ["instructions"], 0, "no-write-map", "Source sequence was reviewed.")
+            reviews = ReviewStore(output / "review_events.jsonl")
+            revisions = [event for event in reviews.revisions.get(target.candidate_id, [])
+                         if event.get("operation_id") == "no-write-map"]
+            lineage = [event for event in reviews.events
+                       if event.get("operation_id") == "no-write-map:lineage"]
+
+        self.assertEqual(revisions, [])
+        self.assertEqual(lineage, [])
+
+    def test_mapping_recovers_after_revision_append_readback_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = write_ui_fixture(Path(tmp))
+            output = Path(fixture["output"])
+            target = next(view for view in load_catalog(output) if view.candidate.name == "Fried Rice")
+            retry = RecipeCandidate(name="Fried Rice", ingredients=["4 cups rice"],
+                                    instructions=["Steam the retry rice."])
+            service = RetryService(output, extractor=lambda *_: ExtractionBatch(recipes=[retry]))
+            attempt = service.start_attempt(str(fixture["digest"]), mode="local_ocr")
+            new_id = service.compare(attempt["attempt_id"])["new_candidates"][0]["candidate_id"]
+            with patch.object(ReviewStore, "_readback", side_effect=OSError("fault during revision readback")):
+                with self.assertRaisesRegex(OSError, "revision readback"):
+                    service.apply_mapping(attempt["attempt_id"], new_id, target.candidate_id,
+                                          ["instructions"], 0, "readback-recover-map",
+                                          "Source sequence was reviewed.")
+
+            result = service.apply_mapping(
+                attempt["attempt_id"], new_id, target.candidate_id,
+                ["instructions"], 0, "readback-recover-map", "Source sequence was reviewed.")
+            reviews = ReviewStore(output / "review_events.jsonl")
+            revisions = [event for event in reviews.revisions[target.candidate_id]
+                         if event.get("operation_id") == "readback-recover-map"]
+            lineage = [event for event in reviews.events
+                       if event.get("operation_id") == "readback-recover-map:lineage"]
+
+        self.assertEqual(result["revision"], 1)
+        self.assertEqual(len(revisions), 1)
+        self.assertEqual(len(lineage), 1)
+
+    def test_retry_after_lineage_readback_failure_returns_existing_mapping(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = write_ui_fixture(Path(tmp))
+            output = Path(fixture["output"])
+            target = next(view for view in load_catalog(output) if view.candidate.name == "Fried Rice")
+            new = RecipeCandidate(name="Fried Rice", ingredients=["4 cups rice"],
+                                  instructions=["Steam the retry rice."])
+            service = RetryService(output, extractor=lambda *_: ExtractionBatch(recipes=[new]))
+            attempt = service.start_attempt(str(fixture["digest"]), mode="local_ocr")
+            new_id = service.compare(attempt["attempt_id"])["new_candidates"][0]["candidate_id"]
+            original = ReviewStore.record_reconciliation
+
+            def write_then_interrupt(store, **kwargs):
+                result = original(store, **kwargs)
+                if kwargs["operation_id"] == "readback-map:lineage":
+                    raise OSError("fault after durable lineage")
+                return result
+
+            with patch.object(ReviewStore, "record_reconciliation", write_then_interrupt):
+                with self.assertRaisesRegex(OSError, "durable lineage"):
+                    service.apply_mapping(attempt["attempt_id"], new_id, target.candidate_id,
+                                          ["instructions"], 0, "readback-map", "Source sequence was reviewed.")
+            result = service.apply_mapping(
+                attempt["attempt_id"], new_id, target.candidate_id,
+                ["instructions"], 0, "readback-map", "Source sequence was reviewed.")
+            reviews = ReviewStore(output / "review_events.jsonl")
+            revisions = [event for event in reviews.revisions[target.candidate_id]
+                         if event.get("operation_id") == "readback-map"]
+            lineage = [event for event in reviews.events
+                       if event.get("event") == "candidate_reconciliation"
+                       and event.get("operation_id") == "readback-map:lineage"]
+
+        self.assertEqual(result["revision"], 1)
+        self.assertEqual(len(revisions), 1)
+        self.assertEqual(len(lineage), 1)
+
+    def test_declared_new_retry_completes_missing_lineage_without_duplicate_registration(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture, service = self._retry(Path(tmp), [RecipeCandidate(
+                name="Independent soup", ingredients=["1 cup beans"], instructions=["Simmer."],
+            )])
+            output = Path(fixture["output"])
+            (output / "import_state.jsonl").unlink()
+            attempt = service.start_attempt(str(fixture["digest"]), mode="local_ocr")
+            new_id = service.compare(attempt["attempt_id"])["new_candidates"][0]["candidate_id"]
+            with patch.object(ReviewStore, "record_reconciliation",
+                              side_effect=OSError("fault after durable registration")):
+                with self.assertRaisesRegex(OSError, "durable registration"):
+                    service.apply_mapping(attempt["attempt_id"], new_id, None,
+                                          ["name", "ingredients", "instructions"], 0,
+                                          "recover-new", "Independent heading and ingredient group.")
+
+            result = service.apply_mapping(
+                attempt["attempt_id"], new_id, None,
+                ["name", "ingredients", "instructions"], 0,
+                "recover-new", "Independent heading and ingredient group.")
+            reviews = ReviewStore(output / "review_events.jsonl")
+            registrations = [event for event in reviews.registrations[new_id]
+                             if event.get("operation_id") == f"reconciled-register:{attempt['attempt_id']}:{new_id}"]
+            lineage = [event for event in reviews.events
+                       if event.get("event") == "candidate_reconciliation"
+                       and event.get("operation_id") == "recover-new"]
+
+        self.assertEqual(result["decision"], "declared_new")
+        self.assertEqual(len(registrations), 1)
+        self.assertEqual(len(lineage), 1)
 
     def test_stale_revision_and_protected_target_cannot_be_mapped_or_declared_new(self):
         with tempfile.TemporaryDirectory() as tmp:

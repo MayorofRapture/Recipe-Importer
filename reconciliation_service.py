@@ -290,10 +290,16 @@ class RetryService:
             raise ReconciliationError(str(exc)) from exc
         if target.protected or target.candidate_id in protected:
             raise ReconciliationError("Imported or uncertain candidates cannot be remapped or bypassed.")
-        if target.revision != int(expected_revision):
-            raise ReconciliationError("The draft changed after comparison; reload and compare again.")
         if comparison["source_changed"]:
             raise ReconciliationError("Source scan bytes changed after the active extraction. Keep this mapping held until the changed source lineage is explicitly reviewed.")
+        if target.revision != int(expected_revision):
+            recovered = self._recover_partial_mapping(
+                attempt_id, new, target, selected, int(expected_revision),
+                str(operation_id), str(evidence),
+            )
+            if recovered is not None:
+                return recovered
+            raise ReconciliationError("The draft changed after comparison; reload and compare again.")
         recipe = RecipeCandidate.model_validate(target.candidate.model_dump(mode="json"))
         for field in selected:
             setattr(recipe, field, getattr(new_recipe, field))
@@ -323,6 +329,80 @@ class RetryService:
         return {"decision": "mapped", "candidate_id": target.candidate_id,
                 "revision": revision_event["revision"], "event_id": lineage["event_id"],
                 "selected_sections": selected, "approved": False}
+
+    def _recover_partial_mapping(self, attempt_id: str, new: dict, target: RecipeView,
+                                 sections: list[str], expected_revision: int,
+                                 operation_id: str, evidence: str) -> dict | None:
+        """Finish the lineage write when this operation's exact revision was already committed."""
+        reviews = ReviewStore(self.review_path)
+        writes = [event for event in reviews.revisions.get(target.candidate_id, [])
+                  if event.get("operation_id") == operation_id]
+        if not writes:
+            return None
+        if len(writes) != 1:
+            raise ReconciliationError("This mapping operation has duplicate revision history and remains protected.")
+        written = writes[0]
+        if (written.get("source_hash") != target.source_hash
+                or written.get("extraction_id") != target.extraction_id
+                or int(written.get("parent_revision", -1)) != expected_revision
+                or int(written.get("revision", -1)) != expected_revision + 1):
+            raise ReconciliationError("The saved mapping revision conflicts with the requested source lineage.")
+        registration = next((item for item in reviews.registrations.get(target.candidate_id, [])
+                             if item.get("source_hash") == target.source_hash
+                             and item.get("extraction_id") == target.extraction_id), None)
+        if not registration:
+            raise ReconciliationError("The mapping's source registration is unavailable; recovery is blocked.")
+        if expected_revision == 0:
+            base_recipe = registration.get("candidate")
+            base_bindings = list(registration.get("target_bindings", []))
+        else:
+            parents = [item for item in reviews.revisions.get(target.candidate_id, [])
+                       if item.get("source_hash") == target.source_hash
+                       and item.get("extraction_id") == target.extraction_id
+                       and int(item.get("revision", -1)) == expected_revision]
+            if len(parents) != 1:
+                raise ReconciliationError("The mapping parent revision is missing or ambiguous; recovery is blocked.")
+            base_recipe = parents[0].get("recipe")
+            base_bindings = list(parents[0].get("target_bindings", []))
+        if not isinstance(base_recipe, dict):
+            raise ReconciliationError("The mapping parent recipe is unavailable; recovery is blocked.")
+        expected_recipe = RecipeCandidate.model_validate(base_recipe)
+        retry_recipe = RecipeCandidate.model_validate(new["candidate"])
+        for field in sections:
+            setattr(expected_recipe, field, getattr(retry_recipe, field))
+        expected_recipe_payload = expected_recipe.model_dump(mode="json")
+        expected_bindings = [item for item in base_bindings
+                             if not (item.get("field") in sections
+                                     or item.get("field_path_at_extraction", "").split("[", 1)[0] in sections)]
+        for source_target in registration.get("target_bindings", []):
+            if source_target.get("target_kind") != "field":
+                continue
+            matches = [item for item in expected_bindings
+                       if item.get("target_id") == source_target.get("target_id")]
+            if matches and any(item.get("field") != source_target.get("field") for item in matches):
+                raise ReconciliationError("The partial mapping conflicts with immutable source field bindings.")
+            if not matches:
+                expected_bindings.append({key: source_target[key] for key in (
+                    "target_id", "target_kind", "field", "original_value",
+                )})
+        if (written.get("recipe") != expected_recipe_payload
+                or written.get("target_bindings") != expected_bindings):
+            raise ReconciliationError("The saved mapping revision does not match the requested retry sections.")
+        try:
+            lineage = ReviewStore(self.review_path).record_reconciliation(
+                candidate_id=target.candidate_id, source_hash=target.source_hash,
+                extraction_id=target.extraction_id, attempt_id=attempt_id,
+                new_candidate_id=new["candidate_id"], new_source_hash=new["source_hash"],
+                new_extraction_id=new["extraction_id"], target_candidate_id=target.candidate_id,
+                decision="mapped", sections=sections, evidence=evidence,
+                revision=expected_revision + 1, operation_id=f"{operation_id}:lineage",
+            )
+        except ReviewConflict as exc:
+            raise ReconciliationError(str(exc)) from exc
+        return {"decision": "mapped", "candidate_id": target.candidate_id,
+                "revision": expected_revision + 1, "event_id": lineage["event_id"],
+                "selected_sections": sections, "approved": False,
+                "recovered_partial_mapping": True}
 
     def defer(self, attempt_id: str, new_candidate_id: str,
               operation_id: str, evidence: str) -> dict:

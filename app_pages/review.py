@@ -1198,7 +1198,7 @@ def _render_reconciliation(service, attempt_id: str, active_views) -> bool:
                     try:
                         result = service.apply_mapping(
                             attempt_id, new_id, target_id, sections, selected_view.revision,
-                            f"ui-reconciliation:{attempt_id}:{new_id}:{uuid.uuid4()}", evidence,
+                            f"ui-reconciliation:{attempt_id}:{new_id}:{target_id}:{','.join(sorted(sections))}", evidence,
                         )
                         mapped_ids[new_id] = (
                             f"Draft updated to revision {result['revision']}; approval is required again."
@@ -1219,7 +1219,7 @@ def _render_reconciliation(service, attempt_id: str, active_views) -> bool:
                     try:
                         result = service.apply_mapping(
                             attempt_id, new_id, None, sections, 0,
-                            f"ui-reconciliation-new:{attempt_id}:{new_id}:{uuid.uuid4()}", evidence,
+                            f"ui-reconciliation-new:{attempt_id}:{new_id}", evidence,
                         )
                         mapped_ids[new_id] = "New recipe identity recorded separately; review and approval are still required."
                         st.rerun()
