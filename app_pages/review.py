@@ -566,6 +566,15 @@ def _render_manual_approval(view, buffer) -> None:
             st.warning("Outstanding critical findings must be explicitly resolved before approval.")
             for finding in view.critical_findings:
                 st.caption(f"{finding.field_path}: {finding.detail}")
+        if view.revision == 0:
+            st.warning("Save a review revision before manual approval. Reopen this preview after the saved revision is loaded, then acknowledge that exact recipe.")
+            if st.button("Save revision for manual review",
+                         key=f"save_manual_revision:{view.candidate_id}"):
+                _save(view, buffer, advance=False)
+                st.rerun(scope="app")
+            st.button("Approve manually & next", key=f"approve_manual:{view.candidate_id}",
+                      disabled=True, type="primary", width="stretch")
+            return
         if view.protected:
             st.warning("This recipe has a protected Mealie outcome and cannot be approved again.")
             return

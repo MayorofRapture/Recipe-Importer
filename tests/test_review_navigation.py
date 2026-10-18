@@ -222,6 +222,49 @@ class ReviewNavigationTests(unittest.TestCase):
         self.assertFalse(app.exception)
         self.assertFalse(app.exception)
 
+    def test_manual_approval_requires_saved_revision_one_then_approves_exact_digest(self):
+        output = Path(self.fixture["output"])
+        source = Path(self.fixture["source"])
+        view = next(item for item in load_catalog(output) if item.candidate.name == "Fried Rice")
+        self.assertEqual(view.revision, 0)
+        source.unlink()
+
+        app = AppTest.from_file(str(APP_PATH)).run(timeout=10)
+        next(item for item in app.selectbox if item.label == "Show").set_value("All recipes").run(timeout=10)
+        next(item for item in app.selectbox if item.label == "Jump to recipe").set_value(
+            view.candidate_id).run(timeout=10)
+        self.assertTrue(any("save a review revision" in item.value.casefold()
+                            for item in app.warning if hasattr(item, "value")))
+        self.assertTrue(any(item.key == f"save_manual_revision:{view.candidate_id}"
+                            for item in app.button))
+        approve = next(item for item in app.button if item.key == f"approve_manual:{view.candidate_id}")
+        self.assertTrue(approve.disabled)
+        self.assertEqual([item for item in ReviewStore(output / "review_events.jsonl").events
+                          if item.get("event") == "review_approval" and item.get("candidate_id") == view.candidate_id], [])
+
+        next(item for item in app.button if item.key == f"save_manual_revision:{view.candidate_id}").click().run(timeout=10)
+        saved = next(item for item in load_catalog(output) if item.candidate_id == view.candidate_id)
+        self.assertEqual(saved.revision, 1)
+        self.assertFalse(any("save a review revision" in item.value.casefold()
+                             for item in app.warning if hasattr(item, "value")))
+        ack = next(item for item in app.checkbox if item.label.startswith("I have reviewed the recipe"))
+        app.checkbox(key=ack.key).check().run(timeout=10)
+        rationale = next(item for item in app.text_area
+                         if item.label == "Why are you approving this recipe without its original source?")
+        app.text_area(key=rationale.key).set_value("Reviewed the saved recipe without the scan.").run(timeout=10)
+        approve = next(item for item in app.button if item.key == f"approve_manual:{view.candidate_id}")
+        self.assertFalse(approve.disabled)
+        approve.click().run(timeout=10)
+
+        approvals = [item for item in ReviewStore(output / "review_events.jsonl").events
+                     if item.get("event") == "review_approval" and item.get("candidate_id") == view.candidate_id]
+        self.assertEqual(len(approvals), 1)
+        self.assertEqual(approvals[0]["revision"], 1)
+        self.assertEqual(approvals[0]["content_sha256"], saved.content_digest)
+        self.assertEqual(approvals[0]["approval_method"], "manual_source_unavailable")
+        self.assertTrue(approvals[0]["reviewer_acknowledged"])
+        self.assertFalse(app.exception)
+
     def test_add_instructions_navigation_is_consumed_once_and_keeps_editor_buffer(self):
         output = Path(self.fixture["output"])
         source = Path(self.fixture["source"])

@@ -53,9 +53,9 @@
 
 **Files:** `app_pages/review.py`, `tests/test_review_navigation.py`, `tests/test_review_authority.py`.
 
-- [ ] Reproduce the revision-zero manual-approval form and failed approval action.
-- [ ] Require an explicit save/reload of revision one before showing usable manual-approval controls.
-- [ ] Verify acknowledgment/rationale bind to revision and digest, reset after edits, and stale concurrent approval is blocked.
+- [x] Reproduce the revision-zero manual-approval form; existing form exposed acknowledgment before any durable recipe revision.
+- [x] Require an explicit save/reload of revision one before showing usable manual-approval controls.
+- [x] Verify acknowledgment/rationale bind to revision and digest, reset after edits, and stale concurrent approval is blocked by the existing exact revision revalidation.
 
 ## Task 3: F2 failed extraction-job retry
 
