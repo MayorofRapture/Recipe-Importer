@@ -196,6 +196,12 @@ try {
   console.log(JSON.stringify({ completed: true, artifacts, final: accessible }, null, 2));
   ws.close();
 } finally {
-  browser?.kill(); await sleep(150); await rm(profile, { recursive: true, force: true }).catch(() => {});
+  if (browser && browser.exitCode === null) {
+    if (process.platform === 'win32') {
+      const { spawnSync } = await import('node:child_process');
+      spawnSync('taskkill.exe', ['/PID', String(browser.pid), '/T', '/F'], { windowsHide: true });
+    } else browser.kill('SIGTERM');
+  }
+  await sleep(150); await rm(profile, { recursive: true, force: true }).catch(() => {});
   await fixture.close();
 }
