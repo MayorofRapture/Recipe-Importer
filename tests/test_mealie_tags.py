@@ -88,7 +88,10 @@ class MealieTagTests(unittest.TestCase):
             def add_tag(self, slug, tag):
                 if self.failed:
                     self.failed = False
-                    raise RuntimeError("tag service unavailable")
+                    # A definite rejection is safe to retry automatically on
+                    # the next run; an outcome-unknown error needs explicit
+                    # read-before-write reconciliation instead.
+                    raise RuntimeError("HTTP 400")
                 return "tagged"
 
         with tempfile.TemporaryDirectory() as tmp:

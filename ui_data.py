@@ -114,16 +114,16 @@ def load_catalog(output_dir: Path, source_root: Path | None = None, *,
     output_dir = Path(output_dir)
     caches = _load_caches(output_dir / "extracted")
     reviews = ReviewStore(output_dir / "review_events.jsonl")
-    cached_extractions = {
-        (source_hash, extraction_identity(source_hash, batch.model_dump(mode="json")))
-        for source_hash, batch in caches
-    }
+    cached_sources = {source_hash for source_hash, _batch in caches}
     registered_batches: dict[tuple[str, str], list[dict]] = {}
     for event in reviews.events:
         if event.get("event") != "candidate_registration" or not isinstance(event.get("candidate"), dict):
             continue
         key = (str(event.get("source_hash", "")), str(event.get("extraction_id", "")))
-        if key[0] and key[1] and key not in cached_extractions:
+        # Reconstruct immutable registrations only when there is no cache for
+        # this source at all. A changed cache is a newer extraction; appending
+        # the older registered batch beside it would resurrect stale candidates.
+        if key[0] and key[1] and key[0] not in cached_sources:
             batch = registered_batches.setdefault(key, [])
             if not any(item.get("candidate_id") == event.get("candidate_id") for item in batch):
                 batch.append(event)
