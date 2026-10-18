@@ -302,19 +302,13 @@ class ReviewStore:
                     self.candidate_decisions.setdefault(identity, []).append(ReviewDecision(
                         "", event["status"], event.get("final_value"), event.get("timestamp", "")
                     ))
-                if kind == "candidate_identity_link" and event.get("decision") in {
-                    "confirmed_unique_content_match", "confirmed_user_selected_match",
-                    "automatic_unique_content_match",
-                }:
-                    self._identity_link_group_index[(str(identity), str(event.get("source_hash", "")),
-                                                     str(event.get("extraction_id", "")))] = str(
-                        event.get("identity_group_id", ""))
                 history_kinds = {"review_revision": "revisions", "review_approval": "approvals",
                                  "decision": "suggestion_decisions", "candidate_decision": "review_decisions",
                                  "dynamic_suggestion": "generated_proposals",
                                  "dynamic_suggestion_decision": "proposal_decisions"}
                 if kind in history_kinds:
                     self._candidate_history_index.setdefault(identity, Counter())[history_kinds[kind]] += 1
+        self._index_valid_identity_links()
         path_sources: dict[str, set[str]] = {}
         for source, items in self._source_registration_index.items():
             for item in items:
@@ -448,6 +442,7 @@ class ReviewStore:
         event = self._base_event("candidate_identity_link", candidate_id, source_hash,
                                  extraction_id, operation_id)
         event.update({"previous_candidate_id": str(previous["candidate_id"]),
+                      "previous_extraction_id": str(previous.get("extraction_id", "")),
                       "identity_group_id": identity_group_id,
                       "logical_identity_digest": identity_digest,
                       "comparison_version": 1, "decision": decision})
@@ -728,19 +723,104 @@ class ReviewStore:
                 _pending_events.extend(pending_events)
             return output
 
+    def _index_valid_identity_links(self) -> None:
+        accepted = {"confirmed_unique_content_match", "confirmed_user_selected_match",
+                    "automatic_unique_content_match"}
+        grouped: dict[tuple[str, str, str], list[dict]] = {}
+        event_ids = Counter(str(item.get("event_id", "")) for item in self.events)
+        operation_ids = Counter(str(item.get("operation_id", "")) for item in self.events)
+        for event in self.events:
+            if event.get("event") not in {"candidate_identity_link", "candidate_identity_review"}:
+                continue
+            if event.get("event") != "candidate_identity_link" or event.get("decision") not in accepted:
+                continue
+            key = (str(event.get("candidate_id", "")), str(event.get("source_hash", "")),
+                   str(event.get("extraction_id", "")))
+            grouped.setdefault(key, []).append(event)
+
+        for key, events in grouped.items():
+            candidate_id, source_hash, extraction_id = key
+            if (len(events) != 1 or not all(key)
+                    or not events[0].get("event_id") or event_ids[events[0]["event_id"]] != 1
+                    or not events[0].get("operation_id") or operation_ids[events[0]["operation_id"]] != 1):
+                continue
+            event = events[0]
+            if (event.get("schema_version") != 1 or event.get("comparison_version") != 1
+                    or not event.get("identity_group_id") or not event.get("logical_identity_digest")):
+                continue
+            current = [item for item in self.registrations.get(candidate_id, [])
+                       if item.get("source_hash") == source_hash
+                       and item.get("extraction_id") == extraction_id]
+            if len(current) != 1 or current[0].get("identity_status") != "needs_reconciliation":
+                continue
+            held = current[0]
+            digest = logical_recipe_identity(held.get("candidate", {}))
+            if (held.get("logical_identity_digest")
+                    and held.get("logical_identity_digest") != digest):
+                continue
+            if digest != event.get("logical_identity_digest"):
+                continue
+            if (event.get("decision") == "confirmed_user_selected_match"
+                    and not str(event.get("evidence", "")).strip()):
+                continue
+            previous_id = str(event.get("previous_candidate_id", ""))
+            previous_extraction_id = str(event.get("previous_extraction_id", ""))
+            previous = [item for item in self.registrations.get(previous_id, [])
+                        if item.get("source_hash") == source_hash
+                        and (not previous_extraction_id
+                             or item.get("extraction_id") == previous_extraction_id)
+                        and (item.get("logical_identity_digest")
+                             or logical_recipe_identity(item.get("candidate", {}))) == digest]
+            if len(previous) != 1 or previous_id == candidate_id:
+                continue
+            prior = previous[0]
+            prior_digest = logical_recipe_identity(prior.get("candidate", {}))
+            if (prior.get("logical_identity_digest")
+                    and prior.get("logical_identity_digest") != prior_digest):
+                continue
+            if prior_digest != digest:
+                continue
+            prior_key = (previous_id, source_hash, str(prior.get("extraction_id", "")))
+            if prior.get("identity_status") == "registered":
+                prior_group = str(prior.get("identity_group_id") or previous_id)
+            elif (prior.get("identity_status") == "needs_reconciliation"
+                  and self._identity_link_group_index.get(prior_key)):
+                prior_group = self._identity_link_group_index[prior_key]
+            else:
+                continue
+            if str(event["identity_group_id"]) != prior_group:
+                continue
+            self._identity_link_group_index[key] = prior_group
+
+    def _effective_identity_authority(
+        self, candidate_id: str, source_hash: str, extraction_id: str, *,
+        registration: dict | None = None, check_import_protection: bool = False,
+    ) -> tuple[dict | None, str, bool]:
+        """Resolve one exact registration and its durable link; keep import protection separate."""
+        matches = [item for item in self.registrations.get(candidate_id, [])
+                   if item.get("source_hash") == source_hash
+                   and item.get("extraction_id") == extraction_id]
+        if registration is not None:
+            matches = [item for item in matches if item is registration]
+        if len(matches) != 1:
+            return None, "needs_reconciliation", False
+        exact = matches[0]
+        status = str(exact.get("identity_status", "needs_reconciliation"))
+        key = (candidate_id, source_hash, extraction_id)
+        if status == "needs_reconciliation" and self._identity_link_group_index.get(key):
+            status = "registered"
+        protected = bool(check_import_protection and status == "registered"
+                         and self._protected_import_outcome(exact))
+        return exact, status, protected
+
     def identity_link_status(self, candidate_id: str, source_hash: str, extraction_id: str) -> str:
-        return ("registered" if self._identity_link_group_index.get(
-            (candidate_id, source_hash, extraction_id)) else "needs_reconciliation")
+        return self._effective_identity_authority(candidate_id, source_hash, extraction_id)[1]
 
     def identity_reconciliation_candidates(self, source_hash: str | None = None) -> list[dict]:
         """Read-only diagnostic projection for held versioned registrations."""
         registrations = [item for events in self.registrations.values() for item in events
                          if item.get("event") == "candidate_registration"]
-        links = {(item.get("candidate_id"), item.get("source_hash"), item.get("extraction_id"))
-                 for item in self.events if item.get("event") == "candidate_identity_link"
-                 and item.get("decision") in {"confirmed_unique_content_match",
-                                               "confirmed_user_selected_match",
-                                               "automatic_unique_content_match"}}
+        links = set(self._identity_link_group_index)
         by_source_digest: dict[tuple[str, str], list[dict]] = {}
         by_source_title: dict[tuple[str, str], list[dict]] = {}
         by_extraction_digest: dict[tuple[str, str, str], list[dict]] = {}
@@ -864,6 +944,9 @@ class ReviewStore:
                 if (existing.get("event") != "candidate_identity_link"
                         or existing.get("previous_candidate_id") != previous_candidate_id):
                     raise ReviewConflict("identity confirmation operation ID was already used")
+                if self.identity_link_status(held_candidate_id, str(existing.get("source_hash", "")),
+                                             str(existing.get("extraction_id", ""))) != "registered":
+                    raise ReviewConflict("saved identity link is incomplete or conflicts with its registrations")
                 return existing
             proposal = next((item for item in self.identity_reconciliation_candidates()
                              if item.get("candidate_id") == held_candidate_id), None)
@@ -871,18 +954,31 @@ class ReviewStore:
                 raise ReviewConflict("this identity match is no longer safe to confirm")
             safe_pair = (proposal.get("previous_candidate_id") == previous_candidate_id
                          and proposal.get("eligible"))
-            selected_match = next((item for item in proposal.get("possible_matches", [])
-                                   if item.get("candidate_id") == previous_candidate_id
-                                   and not item.get("differences")
-                                   and item.get("identity_status") == "registered"), None)
+            selected_matches = [item for item in proposal.get("possible_matches", [])
+                                if item.get("candidate_id") == previous_candidate_id
+                                and not item.get("differences")
+                                and item.get("identity_status") == "registered"]
+            selected_match = selected_matches[0] if len(selected_matches) == 1 else None
             user_selected = bool(selected_match and evidence.strip() and not proposal.get("protected"))
             if not (safe_pair or user_selected):
                 raise ReviewConflict("this identity match is no longer safe to confirm")
+            expected_previous_extraction = (
+                str(proposal.get("previous_extraction_id") or "") if safe_pair
+                else str(selected_match.get("extraction_id") or "")
+            )
             event = self._base_event("candidate_identity_link", held_candidate_id,
                                      proposal["source_hash"], proposal["extraction_id"], operation_id)
-            previous = next((item for item in self.registrations.get(previous_candidate_id, [])
-                             if item.get("source_hash") == proposal["source_hash"]), {})
+            previous_matches = [item for item in self.registrations.get(previous_candidate_id, [])
+                                if item.get("source_hash") == proposal["source_hash"]
+                                and logical_recipe_identity(item.get("candidate", {}))
+                                == proposal["identity_digest"]
+                                and (not expected_previous_extraction
+                                     or item.get("extraction_id") == expected_previous_extraction)]
+            if len(previous_matches) != 1:
+                raise ReviewConflict("the selected prior registration is ambiguous or no longer matches")
+            previous = previous_matches[0]
             event.update({"previous_candidate_id": previous_candidate_id,
+                          "previous_extraction_id": str(previous.get("extraction_id", "")),
                           "identity_group_id": str(previous.get("identity_group_id") or previous_candidate_id),
                           "logical_identity_digest": proposal["identity_digest"],
                           "comparison_version": 1,
@@ -1186,12 +1282,11 @@ class ReviewStore:
         ).hexdigest()
         with _state_lock(self.path):
             self._reload()
-            registration = next((item for item in self.registrations.get(candidate_id, [])
-                                 if item.get("source_hash") == source_hash
-                                 and item.get("extraction_id") == extraction_id), None)
-            if not registration or registration.get("identity_status") != "registered":
+            registration, identity_status, protected = self._effective_identity_authority(
+                candidate_id, source_hash, extraction_id, check_import_protection=True)
+            if not registration or identity_status != "registered":
                 raise ReviewConflict("candidate identity is not ready for a suggestion request")
-            if self._protected_import_outcome(registration):
+            if protected:
                 raise ReviewConflict("protected recipes cannot request generated suggestions")
             latest = max((item for item in self.revisions.get(candidate_id, [])
                           if item.get("source_hash") == source_hash
@@ -1601,12 +1696,12 @@ class ReviewStore:
                 raise ReviewConflict("proposal already has a recorded decision")
             if proposal.get("status") not in {"pending", "stale"}:
                 raise ReviewConflict("proposal is not available for explicit rebase")
-            registration = next((item for item in self.registrations.get(candidate_id, [])
-                                 if item.get("source_hash") == proposal.get("source_hash")
-                                 and item.get("extraction_id") == proposal.get("extraction_id")), None)
-            if not registration or registration.get("identity_status") != "registered":
+            registration, identity_status, protected = self._effective_identity_authority(
+                candidate_id, str(proposal.get("source_hash", "")),
+                str(proposal.get("extraction_id", "")), check_import_protection=True)
+            if not registration or identity_status != "registered":
                 raise ReviewConflict("candidate identity is not ready for rebase")
-            if self._protected_import_outcome(registration):
+            if protected:
                 raise ReviewConflict("protected recipes cannot apply generated suggestions")
             latest = max((item for item in self.revisions.get(candidate_id, [])
                           if item.get("source_hash") == proposal["source_hash"]
@@ -1830,9 +1925,9 @@ class ReviewStore:
                          revision: int, operation_id: str, source_path: str | Path) -> dict:
         with _state_lock(self.path):
             self._reload()
-            if not any(item.get("source_hash") == source_hash
-                       and item.get("extraction_id") == extraction_id
-                       for item in self.registrations.get(candidate_id, [])):
+            registration, identity_status, _ = self._effective_identity_authority(
+                candidate_id, source_hash, extraction_id)
+            if not registration:
                 raise ReviewConflict("candidate must be registered before approval")
             snapshot = next((item for item in self.revisions.get(candidate_id, [])
                              if int(item["revision"]) == revision
@@ -1846,11 +1941,12 @@ class ReviewStore:
             if (snapshot.get("content_digest_version") != 1
                     or _recipe_digest(snapshot["recipe"]) != snapshot.get("content_sha256")):
                 raise ReviewConflict("review revision content digest does not match its recipe snapshot")
-            registration = next((item for item in self.registrations.get(candidate_id, [])
-                                 if item.get("extraction_id") == extraction_id), None)
-            if not registration or registration.get("source_hash") != source_hash:
-                raise ReviewConflict("approval source hash does not match its registration")
-            if registration and registration.get("identity_status") != "registered":
+            if identity_status != "registered":
+                raise ReviewConflict("candidate identity requires explicit reconciliation")
+            registration, identity_status, protected = self._effective_identity_authority(
+                candidate_id, source_hash, extraction_id, registration=registration,
+                check_import_protection=True)
+            if not registration or identity_status != "registered":
                 raise ReviewConflict("candidate identity requires explicit reconciliation")
             resolutions = [item for item in self.resolutions.get(candidate_id, [])
                            if item.get("source_hash") == source_hash
@@ -1909,7 +2005,7 @@ class ReviewStore:
             prior = self._existing_operation(operation_id, "review_approval", expected)
             if prior:
                 return prior
-            if self._protected_import_outcome(registration):
+            if protected:
                 raise ReviewConflict("candidate has a protected import outcome and cannot receive new approval")
             try:
                 actual_source_hash = hashlib.sha256(Path(source_path).read_bytes()).hexdigest()
@@ -1943,8 +2039,8 @@ class ReviewStore:
             return EffectiveReview(candidate_id, legacy_candidate.model_dump(mode="json"), 0, "",
                                    False, False, ())
         latest = max(revisions, key=lambda item: int(item["revision"]))
-        registration = next((item for item in self.registrations.get(candidate_id, [])
-                             if item.get("extraction_id") == extraction_id), None)
+        registration, identity_status, _ = self._effective_identity_authority(
+            candidate_id, source_hash, extraction_id)
         current_resolutions = [item for item in self.resolutions.get(candidate_id, [])
                                if item.get("source_hash") == source_hash
                                and item.get("extraction_id") == extraction_id
@@ -1967,7 +2063,7 @@ class ReviewStore:
             and legacy_draft.saved_at > approval.get("timestamp", "")
         )
         approved = bool(approval and snapshot_integrity_valid and not legacy_draft_conflict and registration
-                        and registration.get("identity_status") == "registered")
+                        and identity_status == "registered")
         recipe = latest["recipe"]
         recipe = json.loads(json.dumps(recipe, ensure_ascii=False))
         try:

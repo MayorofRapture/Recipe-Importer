@@ -75,6 +75,17 @@ async function clickText(cdp, label) {
   await cdp.send('Input.dispatchMouseEvent', { type: 'mousePressed', ...point, button: 'left', clickCount: 1 });
   await cdp.send('Input.dispatchMouseEvent', { type: 'mouseReleased', ...point, button: 'left', clickCount: 1 });
 }
+async function clickLastText(cdp, label) {
+  const point = await evaluate(cdp, `(() => {
+    const nodes=[...document.querySelectorAll('button')].filter(e=>e.innerText.trim()===${JSON.stringify(label)}
+      && !e.disabled && e.getAttribute('aria-disabled')!=='true' && e.getClientRects().length);
+    const node=nodes.at(-1); if(!node)return null; node.scrollIntoView({block:'center'});
+    const r=node.getBoundingClientRect(); return {x:r.x+r.width/2,y:r.y+r.height/2};
+  })()`);
+  if (!point) throw new Error(`Enabled browser button not found: ${label}`);
+  await cdp.send('Input.dispatchMouseEvent', { type: 'mousePressed', ...point, button: 'left', clickCount: 1 });
+  await cdp.send('Input.dispatchMouseEvent', { type: 'mouseReleased', ...point, button: 'left', clickCount: 1 });
+}
 async function capture(cdp, name, visibleText) {
   await evaluate(cdp, `(() => {
     const text=${JSON.stringify(visibleText)};
@@ -119,7 +130,8 @@ try {
   await cdp.send('Runtime.enable');
   await cdp.send('Emulation.setDeviceMetricsOverride', { width: 1440, height: 1100, deviceScaleFactor: 1, mobile: false });
   await cdp.send('Page.navigate', { url });
-  await waitFor(cdp, `document.readyState==='complete' && document.body.innerText.includes('Recipe title')
+  await waitFor(cdp, `document.readyState==='complete' && document.body.innerText.includes('Demonstration library')
+    && document.body.innerText.includes('Recipe title')
     && document.body.innerText.includes('Recipe identity requires reconciliation')`, 'synthetic identity warning');
   await mkdir(evidenceDir, { recursive: true });
 
@@ -138,8 +150,21 @@ try {
   await capture(cdp, '04-resolved-with-review-blocker.png', '1 suggestion awaiting review');
   const body = await evaluate(cdp, 'document.body.innerText');
   if (!body.includes('Approve & next')) throw new Error('Review controls did not return after identity confirmation.');
-  console.log(JSON.stringify({ screenshots: 5, identityResolved: true, suggestionStillPending: true,
-    batchCountShown }));
+  await clickLastText(cdp, 'Review');
+  await waitFor(cdp, `document.body.innerText.includes('Accept inferred suggestion')`,
+    'the linked extraction suggestion controls');
+  await clickText(cdp, 'Accept inferred suggestion');
+  await waitFor(cdp, `(() => [...document.querySelectorAll('button')].some(e=>e.innerText.trim()==='Approve & next'
+    && !e.disabled && e.getAttribute('aria-disabled')!=='true'))()`, 'enabled approval after explicit suggestion review');
+  await capture(cdp, '06-linked-review-ready-for-approval.png', 'Approve & next');
+  await clickText(cdp, 'Approve & next');
+  await sleep(800);
+  const afterApproval = await evaluate(cdp, 'document.body.innerText');
+  if (/approval was not recorded|candidate identity requires explicit reconciliation/i.test(afterApproval)) {
+    throw new Error('Browser approval did not pass the backend identity gate.');
+  }
+  console.log(JSON.stringify({ screenshots: 6, identityResolved: true, suggestionExplicitlyAccepted: true,
+    approvalClicked: true, approvalErrorShown: false, batchCountShown }));
 } finally {
   ws?.close();
   browser?.kill();

@@ -104,6 +104,69 @@ class StreamlitReconciliationTests(unittest.TestCase):
         self.assertEqual(sum(item.get("event") == "candidate_identity_link"
                              and item.get("candidate_id") == "held-identity-v2" for item in events), 1)
 
+    def test_reconciled_recipe_can_resolve_suggestion_and_complete_approval_in_review(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = write_ui_fixture(Path(tmp))
+            output = Path(fixture["output"])
+            (output / "import_state.jsonl").unlink()
+            existing = next(view for view in load_catalog(output)
+                            if view.candidate.name == "Fried Rice")
+            updated = existing.candidate.model_copy(update={"suggestions": [Suggestion(
+                suggestion_id="approval-flow-proposal", field_path="instructions[0]",
+                proposed_value="Fold in the egg gently.", rationale="Possible omitted detail.",
+            )]})
+            extraction_id = extraction_identity(existing.source_hash, {
+                "recipes": [updated.model_dump(mode="json")], "general_warnings": [],
+            })
+            (output / "extracted" / f"{existing.source_hash}--approved-v2.json").write_text(
+                json.dumps({"source_hash": existing.source_hash,
+                            "batch": {"recipes": [updated.model_dump(mode="json")]}}),
+                encoding="utf-8",
+            )
+            bindings = ReviewStore(output / "target-bindings.jsonl").register_candidates(
+                str(fixture["source"]), existing.source_hash, extraction_id, [updated]
+            )[0]["target_bindings"]
+            payload = _candidate_payload(updated)
+            event = ReviewStore(output / "review_events.jsonl")._base_event(
+                "candidate_registration", "held-approval-flow", existing.source_hash,
+                extraction_id, "synthetic-held-approval-flow",
+            )
+            event.update({"source": str(fixture["source"]),
+                          "fingerprint": hashlib.sha256(_canonical(payload).encode()).hexdigest(),
+                          "identity_status": "needs_reconciliation", "legacy_id": "",
+                          "title_legacy_id": "", "legacy_aliases": [], "candidate": payload,
+                          "target_bindings": bindings})
+            with (output / "review_events.jsonl").open("a", encoding="utf-8") as ledger:
+                ledger.write(json.dumps(event) + "\n")
+            environment = patch.dict(os.environ, {
+                "RECIPE_IMPORTER_OUTPUT_DIR": str(output),
+                "RECIPE_IMPORTER_SOURCE_DIR": str(Path(fixture["source"]).parent),
+            }, clear=False)
+            environment.start()
+            self.addCleanup(environment.stop)
+            app = AppTest.from_file(str(APP_PATH)).run(timeout=15)
+            picker = next(item for item in app.selectbox if item.label == "Jump to recipe")
+            picker.select("held-approval-flow").run(timeout=15)
+            next(button for button in app.button if button.label == "Resolve identity").click().run(timeout=15)
+            next(button for button in app.button if button.label == "Confirm identity match").click().run(timeout=15)
+            approve = next(button for button in app.button if button.label == "Approve & next")
+            self.assertTrue(approve.disabled)
+            next(button for button in app.button if button.label == "Review").click().run(timeout=15)
+            next(button for button in app.button if button.label == "Accept inferred suggestion").click().run(timeout=15)
+            approve = next(button for button in app.button if button.label == "Approve & next")
+            self.assertFalse(approve.disabled)
+            approve.click().run(timeout=15)
+            projected = next(view for view in load_catalog(output)
+                             if view.candidate_id == "held-approval-flow")
+            approval_events = [item for item in ReviewStore(output / "review_events.jsonl").events
+                               if item.get("event") == "review_approval"
+                               and item.get("candidate_id") == "held-approval-flow"]
+
+        self.assertFalse(app.exception)
+        self.assertTrue(projected.import_ready)
+        self.assertTrue(projected.identity_status == "registered")
+        self.assertEqual(len(approval_events), 1)
+
     def test_identity_panel_batch_count_and_confirmation_use_only_safe_matches(self):
         with tempfile.TemporaryDirectory() as tmp:
             fixture = write_ui_fixture(Path(tmp))

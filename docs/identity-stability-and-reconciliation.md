@@ -14,6 +14,12 @@ Automatic links require one authoritative match in the current extraction, one u
 
 Older registrations do not need migration. The read-only reconciliation projection computes the versioned digest from each stored candidate when the digest is absent. A user confirmation appends a relationship event and leaves all prior JSONL registrations, fingerprints, revisions, decisions, and approvals untouched. Confirmation is idempotent across retries and application restarts. Deferral is also recorded append-only.
 
+## Effective identity authorization
+
+Review operations resolve identity from the exact candidate ID, source hash, and extraction ID. A held registration is treated as registered only when one durable link points to a registered prior candidate for the same source and authoritative-content digest. Missing, conflicting, malformed, or cross-extraction links remain blocked. This check runs against a freshly reloaded ledger under the mutation lock.
+
+Identity links do not transfer approvals. Approval still binds the current candidate and extraction to its exact saved revision, content digest, verified source bytes, and required issue and suggestion decisions. Protected or uncertain Mealie outcomes continue to block new approvals and generated-suggestion operations independently of identity status.
+
 ## Review behavior and limits
 
 The Resolve identity panel shows the candidate, source reference, extraction versions, authoritative differences, suggestion and diagnostic differences, review activity, and source import protection. It offers batch confirmation only for the exact count of independently eligible matches. Protected or ambiguous records are excluded. After linking, all remaining source, quality, and proposal blockers continue to apply.
