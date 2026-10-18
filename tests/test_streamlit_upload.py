@@ -27,6 +27,32 @@ def _png() -> bytes:
 
 
 class StreamlitUploadTests(unittest.TestCase):
+    def test_failed_worker_job_exposes_retry_and_preserved_unfinished_count(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "output"
+            output.mkdir()
+            (output / ".fixture-library").write_text("synthetic test library", encoding="utf-8")
+            with patch.dict(os.environ, {
+                "RECIPE_IMPORTER_OUTPUT_DIR": str(output),
+                "RECIPE_IMPORTER_SOURCE_DIR": "",
+                "RECIPE_IMPORTER_FIXTURE_MODE": "1",
+            }):
+                batch = BatchStore(output).create("Retry failed job")
+                BatchStore(output).stage(batch["batch_id"], "retry.png", _png())
+                service = JobService(output, extractor=lambda source, mode, config: [])
+                job = service.start(batch["batch_id"], "local_ocr")
+                service._mutate_job(job["job_id"],
+                                    lambda current: ui_job_service._mark_job_failed(current, "synthetic worker launch failure"))
+
+                app = AppTest.from_file(str(PAGE)).run(timeout=15)
+
+            self.assertFalse(app.exception)
+            self.assertTrue(any(item.label == "Resume unfinished files" for item in app.button))
+            self.assertTrue(any("1 files unfinished" in item.value for item in app.caption))
+            self.assertTrue(any("Completed file results and extraction history are preserved" in item.value
+                                for item in app.info))
+            self.assertTrue(any("synthetic worker launch failure" in item.value for item in app.warning))
+
     def test_reupload_restores_missing_source_and_opens_existing_batch(self):
         with tempfile.TemporaryDirectory() as tmp:
             output = Path(tmp) / "output"

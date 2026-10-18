@@ -40,17 +40,24 @@ def _render_job_panel(output_path: Path, batch_id: str) -> None:
     total = int(progress.get("total", 0))
     completed = int(progress.get("completed", 0))
     st.progress(completed / total if total else 0.0, text=f"{completed} of {total} files finished")
+    unfinished = sum(1 for source in job.get("sources", [])
+                     if source.get("status") in {"waiting", "processing", "failed", "quota_paused"})
     st.caption(
         f"{job.get('candidate_count', 0)} recipes ready for review · "
         f"{job.get('failure_count', 0)} files need attention"
     )
+    if job.get("status") in {"failed", "completed_with_errors"}:
+        st.caption(f"{unfinished} files unfinished. Completed extraction results are preserved.")
+        st.info("Completed file results and extraction history are preserved. Retry processes only unfinished files.")
+    if job.get("status") == "failed" and job.get("error"):
+        st.warning(f"Extraction stopped: {job['error']}")
     if job.get("quota_paused"):
         st.warning("Gemini has reached an available request allowance. Completed files are saved; resume later to continue unresolved files.")
     if job.get("status") in {"queued", "waiting_for_worker", "running", "pausing"}:
         if st.button("Pause after current file", key=f"pause_{job['job_id']}"):
             service.pause(job["job_id"])
             st.rerun()
-    elif job.get("status") in {"paused", "quota_paused", "completed_with_errors"}:
+    elif job.get("status") in {"paused", "quota_paused", "completed_with_errors", "failed"}:
         if st.button("Resume unfinished files", key=f"resume_{job['job_id']}"):
             service.resume(job["job_id"])
             st.rerun()
@@ -151,7 +158,7 @@ def _job_summary(job: dict) -> str:
     if status == "completed_with_errors":
         return "Extraction finished; some files need attention. Resume to retry only unfinished files."
     if status == "failed":
-        return "Extraction could not start. Check the details below, then try again."
+        return "Extraction stopped before all files finished. Check the failure details, then retry unfinished files."
     return "All files finished extraction. Review the candidates before approval."
 
 

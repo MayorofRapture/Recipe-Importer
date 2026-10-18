@@ -153,10 +153,28 @@ class JobService:
         job = self.snapshot(job_id)
         if job is None:
             raise ValueError("Job was not found.")
-        if job["status"] in {"completed", "failed"}:
+        if job["status"] == "completed":
             return job
         if self.extractor is None and _fixture_mode():
             raise RuntimeError("Fixture mode requires an explicitly injected fake extractor; live services and workers are disabled.")
+
+        if job["status"] in {"failed", "completed_with_errors"}:
+            # Terminal worker failure and partial source failure are retryable
+            # through the same durable job. The job lock prevents a retry from
+            # racing a worker that is still unwinding after a failed status write.
+            try:
+                with _file_lock(self.root / "locks" / f"job-{job_id}.lock", blocking=False):
+                    self._mutate_job(job_id, _recover_interrupted)
+                    self._mutate_job(job_id, _prepare_resume)
+            except _LockBusy:
+                return self.snapshot(job_id) or job
+            current = self.snapshot(job_id) or job
+            if current.get("status") == "queued":
+                try:
+                    self._launch_worker(job_id)
+                except Exception as exc:
+                    self._mutate_job(job_id, lambda value: _mark_job_failed(value, _redact(exc, self.config)))
+            return self.snapshot(job_id) or current
 
         if job["status"] in {"running", "pausing", "queued", "waiting_for_worker"}:
             # A process can die after persisting "running". The per-job OS lock
@@ -177,7 +195,7 @@ class JobService:
             return self.snapshot(job_id) or current
 
         def resume_job(current: dict) -> None:
-            if current["status"] == "completed" or current["status"] == "failed":
+            if current["status"] == "completed":
                 return
             for source in current["sources"]:
                 if source["status"] in {"failed", "quota_paused"}:
@@ -468,7 +486,7 @@ def _recover_interrupted(job: dict) -> None:
 
 
 def _prepare_resume(job: dict) -> None:
-    if job["status"] in {"completed", "failed"}:
+    if job["status"] == "completed":
         return
     for source in job.get("sources", []):
         if source["status"] in {"failed", "quota_paused"}:
@@ -477,9 +495,12 @@ def _prepare_resume(job: dict) -> None:
     job["pause_requested"] = False
     job["quota_paused"] = False
     job["quota_note"] = ""
-    job["status"] = "queued"
-    job["updated_at"] = _now()
     job["completed_at"] = None
+    if any(source["status"] == "waiting" for source in job.get("sources", [])):
+        job["status"] = "queued"
+    else:
+        _finish_job(job)
+    job["updated_at"] = _now()
 
 
 def _begin_source(job: dict, source_id: str, started_at: str) -> None:

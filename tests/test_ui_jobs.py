@@ -12,7 +12,7 @@ from PIL import Image
 import io
 
 import ui_job_service
-from batch_store import BatchStore
+from batch_store import BatchStore, _file_lock
 from fixture_extraction import create_fixture_extractor
 from recipe_quality import ExtractionBatch, RecipeCandidate
 from ui_job_service import JobService
@@ -296,6 +296,68 @@ class JobServiceTests(unittest.TestCase):
         self.assertEqual(snapshot["failure_count"], 1)
         self.assertEqual([item["status"] for item in snapshot["sources"]], ["failed", "completed"])
         self.assertEqual(snapshot["sources"][0]["error"], "safe synthetic failure")
+
+    def test_failed_worker_launch_can_resume_existing_job_without_new_upload(self):
+        batch = _batch(self.store, "Worker launch retry", _png())
+        service = JobService(self.output, extractor=_recipe_rows)
+        with patch.object(service, "_launch_worker", side_effect=OSError("synthetic launch failure")):
+            failed = service.start(batch["batch_id"], "local_ocr")
+        source_id = failed["sources"][0]["source_id"]
+        self.assertEqual(failed["status"], "failed")
+        self.assertEqual(failed["sources"][0]["status"], "waiting")
+
+        resumed = service.resume(failed["job_id"])
+        completed = service.run_pending(failed["job_id"])
+
+        self.assertEqual(resumed["status"], "queued")
+        self.assertEqual(completed["status"], "completed")
+        self.assertEqual(completed["sources"][0]["source_id"], source_id)
+        self.assertEqual(completed["sources"][0]["attempt_count"], 1)
+
+    def test_failed_job_retry_does_not_launch_while_a_worker_holds_job_lease(self):
+        batch = _batch(self.store, "Retry lease", _png())
+        service = JobService(self.output, extractor=_recipe_rows)
+        job = service.start(batch["batch_id"], "local_ocr")
+        service._mutate_job(job["job_id"],
+                            lambda current: ui_job_service._mark_job_failed(current, "synthetic failure"))
+
+        with _file_lock(service.root / "locks" / f"job-{job['job_id']}.lock"):
+            with patch.object(service, "_launch_worker") as launch:
+                resumed = service.resume(job["job_id"])
+
+        self.assertEqual(resumed["status"], "failed")
+        launch.assert_not_called()
+
+    def test_resume_retries_only_failed_sources_after_partial_completion(self):
+        batch = _batch(self.store, "Partial retry", _png((1, 1, 1)), _png((2, 2, 2)))
+        calls: list[str] = []
+        fail_first_source_once = {"enabled": True}
+
+        def extractor(source, mode, config):
+            calls.append(source["source_id"])
+            if fail_first_source_once["enabled"]:
+                fail_first_source_once["enabled"] = False
+                raise RuntimeError("synthetic first attempt failure")
+            return _recipe_rows(source, mode, config)
+
+        service = JobService(self.output, extractor=extractor)
+        job = service.start(batch["batch_id"], "local_ocr")
+        first = service.run_pending(job["job_id"])
+        successful_id = next(source["source_id"] for source in first["sources"]
+                             if source["status"] == "completed")
+        failed_id = next(source["source_id"] for source in first["sources"]
+                         if source["status"] == "failed")
+
+        resumed = service.resume(job["job_id"])
+        retried = service.run_pending(job["job_id"])
+
+        self.assertEqual(resumed["status"], "queued")
+        self.assertEqual(retried["status"], "completed")
+        self.assertEqual(retried["sources"][0]["attempt_count"], 2)
+        self.assertEqual(retried["sources"][1]["attempt_count"], 1)
+        self.assertEqual(calls, [failed_id, successful_id, failed_id])
+        self.assertEqual({source["source_id"] for source in retried["sources"]},
+                         {failed_id, successful_id})
 
     def test_fixture_extraction_can_run_on_background_thread(self):
         batch = _batch(self.store, "Fixture background", _png())

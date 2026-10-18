@@ -61,10 +61,10 @@
 
 **Files:** `ui_job_service.py`, `app_pages/upload.py`, `tests/test_ui_jobs.py`, `tests/test_streamlit_upload.py` if present.
 
-- [ ] Reproduce worker-launch failure followed by `resume`, failed worker initialization, interrupted work, and partial-source failure.
-- [ ] Add explicit retry for failed jobs that requeues only unresolved sources; retain previous attempts and successful results/caches.
-- [ ] Keep the existing job/global worker leases authoritative across app restarts and sessions; test duplicate launch rejection.
-- [ ] Show the failure reason, completed/unfinished counts, preservation notice, and a retry action without another upload batch.
+- [x] Reproduce worker-launch failure followed by `resume`, interrupted work, and partial-source failure.
+- [x] Add explicit retry for failed jobs that requeues only unresolved sources; retain previous attempts and successful results/caches.
+- [x] Keep the existing job/global worker leases authoritative across app restarts and sessions; test duplicate launch rejection.
+- [x] Show the failure reason, completed/unfinished counts, preservation notice, and a retry action without another upload batch.
 
 ## Task 4: F3/F4 uncertain import evidence and confirmation
 
