@@ -114,6 +114,30 @@ def load_catalog(output_dir: Path, source_root: Path | None = None, *,
     output_dir = Path(output_dir)
     caches = _load_caches(output_dir / "extracted")
     reviews = ReviewStore(output_dir / "review_events.jsonl")
+    cached_extractions = {
+        (source_hash, extraction_identity(source_hash, batch.model_dump(mode="json")))
+        for source_hash, batch in caches
+    }
+    registered_batches: dict[tuple[str, str], list[dict]] = {}
+    for event in reviews.events:
+        if event.get("event") != "candidate_registration" or not isinstance(event.get("candidate"), dict):
+            continue
+        key = (str(event.get("source_hash", "")), str(event.get("extraction_id", "")))
+        if key[0] and key[1] and key not in cached_extractions:
+            batch = registered_batches.setdefault(key, [])
+            if not any(item.get("candidate_id") == event.get("candidate_id") for item in batch):
+                batch.append(event)
+    for (source_hash, extraction_id), registrations in registered_batches.items():
+        try:
+            batch = ExtractionBatch.model_validate({
+                "recipes": [item["candidate"] for item in registrations],
+            })
+            if extraction_identity(source_hash, batch.model_dump(mode="json")) == extraction_id:
+                caches.append((source_hash, batch))
+        except Exception:
+            # The saved registration is useful for audit, but only a verifiable
+            # complete extraction batch can reconstruct an import candidate.
+            continue
     state = StateStore(output_dir / "import_state.jsonl")
     try:
         protected_ids = protected_candidate_ids(output_dir)

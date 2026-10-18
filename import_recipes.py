@@ -1346,6 +1346,8 @@ def main() -> int:
     parser.add_argument("--review-suggestion")
     parser.add_argument("--review-status", choices=["pending", "approved", "edited", "rejected"])
     parser.add_argument("--review-value")
+    parser.add_argument("--candidate-ids",
+                        help="Comma-separated exact candidate IDs to scope --import-approved")
     args = parser.parse_args()
     api_key = os.getenv("GEMINI_API_KEY", "").strip()
     token = os.getenv("MEALIE_TOKEN", "").strip()
@@ -1575,6 +1577,56 @@ def main() -> int:
         )
         print("Tag backfill:", result)
         return 1 if any(value == "failed" for value in result.values()) else 0
+    if args.import_approved:
+        candidate_ids = list(dict.fromkeys(
+            item.strip() for item in str(args.candidate_ids or "").split(",") if item.strip()
+        ))
+        if not candidate_ids:
+            parser.error("--import-approved requires explicit --candidate-ids")
+        if not token or not url:
+            parser.error("--import-approved requires MEALIE_TOKEN and MEALIE_URL")
+        try:
+            preflight_mealie(url, token)
+            source_root = Path(args.source).expanduser()
+            service = __import__("ui_import_service").ImportService(
+                work, source_root=source_root if source_root.is_dir() else None,
+                client=MealieClient(url, token),
+            )
+            plan = service.preview(candidate_ids, args.batch_tag)
+            eligible = plan["eligible"]
+            if not eligible:
+                print("No selected candidate has a currently approved, import-eligible revision.", file=sys.stderr)
+                for item in plan.get("excluded", []):
+                    print(f"{item['candidate_id']}: {item['reason']}", file=sys.stderr)
+                return 1
+            print("Approved revisions selected:")
+            for item in eligible:
+                print(f"{item['candidate_id']} · revision {item['revision']} · {item['title']}")
+            for item in plan.get("excluded", []):
+                print(f"Excluded {item['candidate_id']}: {item['reason']}", file=sys.stderr)
+            outcomes = service.dispatch(plan["plan_id"])
+        except (OSError, RuntimeError, ValueError) as exc:
+            parser.error(f"Approved import could not start: {exc}")
+        rows = [{
+            "candidate_id": item.get("candidate_id", ""), "title": item.get("title", ""),
+            "creation_status": item.get("creation_status", ""), "slug": item.get("slug", ""),
+            "tag_status": item.get("tag_status", ""), "note": item.get("reason", ""),
+        } for item in outcomes]
+        report = work / "last_run_report.csv"
+        with report.open("w", encoding="utf-8-sig", newline="") as fh:
+            writer = csv.DictWriter(fh, fieldnames=[
+                "candidate_id", "title", "creation_status", "slug", "tag_status", "note",
+            ], extrasaction="ignore")
+            writer.writeheader()
+            writer.writerows(rows)
+        counts: dict[str, int] = {}
+        for row in rows:
+            status = str(row["creation_status"])
+            counts[status] = counts.get(status, 0) + 1
+        print("Approved import summary:", counts)
+        print(f"Report: {report}")
+        return 1 if any(row["creation_status"] in {"not_sent", "uncertain", "rejected"}
+                        for row in rows) else 0
     mode = ("extract-only" if args.extract_only else
             "legacy-auto-import" if args.legacy_auto_import else
             "approved-revision import" if args.import_approved else
