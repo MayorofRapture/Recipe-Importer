@@ -1373,6 +1373,8 @@ def main() -> int:
     if args.repair_failed_tags and (args.review_id or args.review_suggestion or args.review_status
                                     or args.review_value or args.backfill_tag or args.backfill_slugs):
         parser.error("--repair-failed-tags cannot be combined with review or backfill operations")
+    if args.candidate_ids and not args.import_approved:
+        parser.error("--candidate-ids is only valid with --import-approved")
     if args.ocr_only and args.ocr_structure:
         parser.error("--ocr-only and --ocr-structure are mutually exclusive")
     if args.ocr_only:
@@ -1583,6 +1585,10 @@ def main() -> int:
         ))
         if not candidate_ids:
             parser.error("--import-approved requires explicit --candidate-ids")
+        if args.limit < 0:
+            parser.error("--limit must be >= 0")
+        if args.limit:
+            candidate_ids = candidate_ids[:args.limit]
         if not token or not url:
             parser.error("--import-approved requires MEALIE_TOKEN and MEALIE_URL")
         try:
