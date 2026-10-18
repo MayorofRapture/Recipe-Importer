@@ -341,7 +341,19 @@ def refresh_buffer_after_decision(candidate_id: str) -> None:
     buffer = st.session_state.setdefault("review_buffers", {}).get(candidate_id)
     if buffer is None:
         return
+    if buffer_is_dirty(view, buffer):
+        if int(buffer.get("_revision", view.revision)) != view.revision:
+            st.session_state.review_transition_error = (
+                "A newer saved revision is available. Your unsaved edits remain selected; reload and compare before saving."
+            )
+        return
     buffer["mode"] = "structured"
+    for field in ("name", "yield_text", "description"):
+        value = getattr(view.candidate, field) or ""
+        buffer[field] = value
+        widget_key = f"recipe_{field}:{candidate_id}"
+        if widget_key in st.session_state:
+            st.session_state[widget_key] = value
     buffer["structured_ingredients"] = list(view.candidate.ingredients)
     buffer["structured_instructions"] = list(view.candidate.instructions)
     buffer["ingredient_ids"] = row_ids_for(

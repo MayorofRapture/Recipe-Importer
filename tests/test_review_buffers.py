@@ -11,7 +11,7 @@ from unittest.mock import patch
 from streamlit.testing.v1 import AppTest
 
 from tests.ui_fixture_factory import write_ui_fixture
-from app_pages.common import switch_buffer_mode
+from app_pages.common import buffer_is_dirty, switch_buffer_mode
 from ui_review_state import row_ids_for
 from review_store import ReviewStore
 from ui_data import load_catalog
@@ -24,6 +24,79 @@ APP_PATH = Path(__file__).resolve().parents[1] / "streamlit_app.py"
 
 
 class ReviewBufferTests(unittest.TestCase):
+    def test_accepted_optional_scalar_proposal_survives_rerender_tab_switch_and_second_save(self):
+        proposals = {
+            "name": "Renamed Optional Sample",
+            "yield_text": "12 servings",
+            "description": "A reviewer-approved description.",
+        }
+        for field, proposed in proposals.items():
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as tmp:
+                fixture = write_ui_fixture(Path(tmp))
+                candidate_id = _replace_fixture_candidate_with_optional_proposal(fixture, field, proposed)
+                env = patch.dict(os.environ, {
+                    "RECIPE_IMPORTER_OUTPUT_DIR": str(fixture["output"]),
+                    "RECIPE_IMPORTER_SOURCE_DIR": str(Path(tmp, "sources")),
+                }, clear=False)
+                env.start()
+                self.addCleanup(env.stop)
+                app = AppTest.from_file(str(APP_PATH)).run(timeout=10)
+                next(item for item in app.selectbox if item.label == "Show").set_value("All recipes").run(timeout=10)
+                next(item for item in app.selectbox if item.label == "Jump to recipe").set_value(
+                    "Optional Field Sample").run(timeout=10)
+
+                next(item for item in app.button
+                     if item.key == f"use:issues:{candidate_id}:{field}-proposal").click().run(timeout=10)
+                self.assertFalse(app.exception)
+
+                app.session_state[f"recipe_sections:{candidate_id}"] = "Instructions"
+                app.run(timeout=10)
+                next(item for item in app.button if item.key == f"save:{candidate_id}").click().run(timeout=10)
+
+                view = next(item for item in load_catalog(Path(fixture["output"]), Path(tmp, "sources"))
+                            if item.candidate_id == candidate_id)
+                self.assertEqual(getattr(view.candidate, field), proposed)
+                self.assertEqual(view.revision, 1)
+
+                restarted = AppTest.from_file(str(APP_PATH)).run(timeout=10)
+                recipe_title = proposed if field == "name" else "Optional Field Sample"
+                next(item for item in restarted.selectbox if item.label == "Jump to recipe").set_value(
+                    recipe_title).run(timeout=10)
+                widgets = {item.label: item.value for item in [*restarted.text_input, *restarted.text_area]}
+                self.assertEqual(widgets["Recipe title"], recipe_title)
+                self.assertEqual(widgets["Yield"], proposed if field == "yield_text" else "")
+                self.assertEqual(widgets["Description"], proposed if field == "description" else "")
+
+    def test_refresh_after_read_only_decision_keeps_unrelated_unsaved_scalar(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = write_ui_fixture(Path(tmp))
+            env = patch.dict(os.environ, {
+                "RECIPE_IMPORTER_OUTPUT_DIR": str(fixture["output"]),
+                "RECIPE_IMPORTER_SOURCE_DIR": str(Path(tmp, "sources")),
+            }, clear=False)
+            env.start()
+            self.addCleanup(env.stop)
+            app = AppTest.from_file(str(APP_PATH)).run(timeout=10)
+            next(item for item in app.selectbox if item.label == "Show").set_value("All recipes").run(timeout=10)
+            next(item for item in app.selectbox if item.label == "Jump to recipe").set_value(
+                "Fried Rice").run(timeout=10)
+            candidate_id = app.session_state["review_selection"]
+            next(item for item in app.text_input if item.label == "Recipe title").set_value(
+                "Unsaved independent title").run(timeout=10)
+            buffer = app.session_state["review_buffers"][candidate_id]
+            view = next(item for item in load_catalog(Path(fixture["output"]), Path(tmp, "sources"))
+                        if item.candidate_id == candidate_id)
+            self.assertTrue(buffer_is_dirty(view, buffer))
+            app.session_state["review_refresh_candidate"] = candidate_id
+            app.run(timeout=10)
+
+            current = next(item for item in app.text_input if item.label == "Recipe title")
+            self.assertEqual(current.value, "Unsaved independent title")
+            self.assertEqual(app.session_state["review_buffers"][candidate_id]["_revision"], 0)
+            view = next(item for item in load_catalog(Path(fixture["output"]), Path(tmp, "sources"))
+                        if item.candidate_id == candidate_id)
+            self.assertTrue(buffer_is_dirty(view, app.session_state["review_buffers"][candidate_id]))
+
     def test_jump_and_filter_each_reuse_the_page_catalog(self):
         with tempfile.TemporaryDirectory() as tmp:
             fixture = write_ui_fixture(Path(tmp))
@@ -359,6 +432,34 @@ def _replace_fixture_candidates_with_independent_proposals(fixture) -> None:
     store.register_candidates(str(source), digest,
                               extraction_identity(digest, batch.model_dump(mode="json")),
                               batch.recipes)
+
+
+def _replace_fixture_candidate_with_optional_proposal(fixture, field: str, proposed: str) -> str:
+    source = Path(fixture["source"])
+    digest = str(fixture["digest"])
+    output = Path(fixture["output"])
+    candidate = RecipeCandidate(
+        name="Optional Field Sample",
+        ingredients=["1 cup flour"],
+        instructions=["Mix and bake."],
+        suggestions=[Suggestion(
+            suggestion_id=f"{field}-proposal", field_path=field,
+            proposed_value=proposed, rationale="Synthetic optional-field proposal.",
+            uncertainty="Not printed in the source.",
+        )],
+    )
+    batch = ExtractionBatch(recipes=[candidate])
+    (output / "extracted" / f"{digest}.json").write_text(json.dumps({
+        "schema_version": 2, "source_hash": digest, "batch": batch.model_dump(mode="json"),
+    }, ensure_ascii=False), encoding="utf-8")
+    (output / "review_events.jsonl").write_text("", encoding="utf-8")
+    store = ReviewStore(output / "review_events.jsonl")
+    candidate_id = candidate_identity(digest, candidate)
+    store.add_candidate(str(source), candidate_id, candidate)
+    store.register_candidates(str(source), digest,
+                              extraction_identity(digest, batch.model_dump(mode="json")),
+                              batch.recipes)
+    return candidate_id
 
 
 if __name__ == "__main__":
