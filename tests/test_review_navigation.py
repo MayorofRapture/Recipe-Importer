@@ -333,6 +333,10 @@ class ReviewNavigationTests(unittest.TestCase):
         app = AppTest.from_file(str(APP_PATH)).run(timeout=10)
         next(item for item in app.selectbox if item.label == "Show").set_value("All recipes").run(timeout=10)
         next(item for item in app.selectbox if item.label == "Jump to recipe").set_value(view.candidate_id).run(timeout=10)
+        self.assertFalse(any(item.label.startswith("I have reviewed the recipe") for item in app.checkbox))
+        next(item for item in app.button if item.key == f"save_manual_revision:{view.candidate_id}").click().run(timeout=10)
+        view = next(item for item in load_catalog(output) if item.candidate_id == view.candidate_id)
+        self.assertEqual(view.revision, 1)
         ack = next(item for item in app.checkbox if item.label.startswith("I have reviewed the recipe"))
         app.checkbox(key=ack.key).check().run(timeout=10)
         self.assertTrue(next(item for item in app.checkbox

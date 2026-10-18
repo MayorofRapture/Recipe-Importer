@@ -342,11 +342,21 @@ def refresh_buffer_after_decision(candidate_id: str) -> None:
     if buffer is None:
         return
     if buffer_is_dirty(view, buffer):
-        if int(buffer.get("_revision", view.revision)) != view.revision:
-            st.session_state.review_transition_error = (
-                "A newer saved revision is available. Your unsaved edits remain selected; reload and compare before saving."
-            )
-        return
+        buffered_candidate, _warnings = candidate_from_buffer(view, buffer)
+        editable_fields = ("name", "ingredients", "instructions", "yield_text", "description", "notes")
+        if all(getattr(buffered_candidate, field) == getattr(view.candidate, field)
+               for field in editable_fields):
+            # A just-accepted decision can advance the saved revision while the
+            # editor already contains exactly that decision. Adopt the new
+            # baseline, but preserve any actual local edits.
+            buffer["_revision"] = view.revision
+            buffer["_saved_signature"] = _buffer_signature(view, buffer)
+        else:
+            if int(buffer.get("_revision", view.revision)) != view.revision:
+                st.session_state.review_transition_error = (
+                    "A newer saved revision is available. Your unsaved edits remain selected; reload and compare before saving."
+                )
+            return
     buffer["mode"] = "structured"
     for field in ("name", "yield_text", "description"):
         value = getattr(view.candidate, field) or ""

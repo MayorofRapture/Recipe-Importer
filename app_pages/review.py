@@ -566,8 +566,14 @@ def _render_manual_approval(view, buffer) -> None:
             st.warning("Outstanding critical findings must be explicitly resolved before approval.")
             for finding in view.critical_findings:
                 st.caption(f"{finding.field_path}: {finding.detail}")
+        candidate, _ = candidate_from_buffer(view, buffer)
+        saved_candidate = view.candidate.model_dump(mode="json")
+        buffer_matches = candidate.model_dump(mode="json") == saved_candidate
         if view.revision == 0:
-            st.warning("Save a review revision before manual approval. Reopen this preview after the saved revision is loaded, then acknowledge that exact recipe.")
+            if buffer_matches:
+                st.warning("Save a review revision before manual approval. Reopen this preview after the saved revision is loaded, then acknowledge that exact recipe.")
+            else:
+                st.warning("The editor has unsaved changes. Save them as the first review revision before opening manual approval.")
             if st.button("Save revision for manual review",
                          key=f"save_manual_revision:{view.candidate_id}"):
                 _save(view, buffer, advance=False)
@@ -578,12 +584,9 @@ def _render_manual_approval(view, buffer) -> None:
         if view.protected:
             st.warning("This recipe has a protected Mealie outcome and cannot be approved again.")
             return
-        candidate, _ = candidate_from_buffer(view, buffer)
         blockers = [item for item in _approval_blockers(view, candidate) if item.code != "source"]
         if blockers:
             st.caption("Resolve the other approval blockers first: " + "; ".join(item.label for item in blockers))
-        saved_candidate = view.candidate.model_dump(mode="json")
-        buffer_matches = candidate.model_dump(mode="json") == saved_candidate
         if not buffer_matches:
             st.warning("The editor has unsaved changes. This preview shows the saved revision only; save the draft to review and approve its new revision.")
             if st.button("Save draft and reopen approval preview",
