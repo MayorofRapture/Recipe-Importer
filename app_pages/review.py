@@ -547,14 +547,17 @@ def _render_manual_approval(view, buffer) -> None:
     with st.container(border=True):
         st.markdown("**Manually verify the current recipe**")
         st.caption("This approval records that you reviewed the recipe as written. It does not verify the transcription against the original scan.")
-        st.markdown(f"**{view.candidate.name or 'Untitled recipe'}**")
-        st.write("**Ingredients**")
-        st.write(view.candidate.ingredients or ["No ingredients recorded"])
-        st.write("**Instructions**")
-        st.write(view.candidate.instructions or ["No instructions recorded"])
-        if view.candidate.notes:
-            st.write("**Notes**")
-            st.write(view.candidate.notes)
+        st.markdown(f"**Saved revision {view.revision}: {view.candidate.name or 'Untitled recipe'}**")
+        st.write("**Description**", view.candidate.description or "Not recorded")
+        st.write("**Yield**", view.candidate.yield_text or "Not recorded")
+        for label, values, empty in (
+            ("Ingredients", view.candidate.ingredients, "No ingredients recorded"),
+            ("Instructions", view.candidate.instructions, "No instructions recorded"),
+            ("Notes", view.candidate.notes, "No notes recorded"),
+        ):
+            st.markdown(f"**{label}**")
+            st.text("\n".join(values) if values else empty)
+        st.write("**Warnings**", view.candidate.warnings or ["No warnings recorded"])
         if view.candidate.uncertainties:
             st.warning("Uncertainties: " + " · ".join(view.candidate.uncertainties))
         if view.critical_findings:
@@ -568,19 +571,63 @@ def _render_manual_approval(view, buffer) -> None:
         blockers = [item for item in _approval_blockers(view, candidate) if item.code != "source"]
         if blockers:
             st.caption("Resolve the other approval blockers first: " + "; ".join(item.label for item in blockers))
-        ack_key = f"manual_approval_ack:{view.candidate_id}:{view.revision}"
-        rationale_key = f"manual_approval_rationale:{view.candidate_id}:{view.revision}"
+        saved_candidate = view.candidate.model_dump(mode="json")
+        buffer_matches = candidate.model_dump(mode="json") == saved_candidate
+        if not buffer_matches:
+            st.warning("The editor has unsaved changes. This preview shows the saved revision only; save the draft to review and approve its new revision.")
+            if st.button("Save draft and reopen approval preview",
+                         key=f"save_manual_preview:{view.candidate_id}"):
+                _save(view, buffer, advance=False)
+                st.rerun(scope="app")
+        context = st.session_state.get("manual_approval_context")
+        if context != (view.candidate_id, view.revision, view.content_digest):
+            st.session_state.manual_approval_context = (
+                view.candidate_id, view.revision, view.content_digest)
+            st.session_state.manual_approval_nonce = uuid.uuid4().hex
+        nonce = st.session_state.manual_approval_nonce
+        ack_key = f"manual_approval_ack:{view.candidate_id}:{view.revision}:{view.content_digest}:{nonce}"
+        rationale_key = f"manual_approval_rationale:{view.candidate_id}:{view.revision}:{view.content_digest}:{nonce}"
         acknowledged = st.checkbox(
             "I have reviewed the recipe as currently written. I understand that the original source is unavailable and that this approval does not verify the transcription against the original document.",
             key=ack_key,
+            disabled=not buffer_matches,
         )
         rationale = st.text_area("Why are you approving this recipe without its original source?",
-                                 key=rationale_key, height=90)
+                                 key=rationale_key, height=90, disabled=not buffer_matches)
         if st.button("Approve manually & next", key=f"approve_manual:{view.candidate_id}",
-                     disabled=bool(blockers) or not acknowledged or not rationale.strip(),
+                     disabled=bool(blockers) or not buffer_matches or not acknowledged or not rationale.strip(),
                      type="primary", width="stretch"):
-            _approve(view, buffer, approval_method="manual_source_unavailable",
-                     reviewer_acknowledged=acknowledged, review_rationale=rationale)
+            try:
+                store = review_store()
+                store._reload()
+                latest = max((item for item in store.revisions.get(view.candidate_id, [])
+                              if item.get("source_hash") == view.source_hash
+                              and item.get("extraction_id") == view.extraction_id),
+                             key=lambda item: int(item["revision"]), default=None)
+                if (latest is None or int(latest["revision"]) != view.revision
+                        or latest.get("content_sha256") != view.content_digest
+                        or latest.get("recipe") != saved_candidate
+                        or candidate.model_dump(mode="json") != saved_candidate):
+                    raise ValueError("The saved revision changed or the editor no longer matches this preview. Refresh and review the latest saved revision.")
+                store.approve_revision(
+                    candidate_id=view.candidate_id, source_hash=view.source_hash,
+                    extraction_id=view.extraction_id, revision=view.revision,
+                    operation_id=(f"ui-manual-approve:{view.candidate_id}:{view.extraction_id}:"
+                                  f"{view.revision}:{view.content_digest}"),
+                    source_path=view.source_path,
+                    approval_method="manual_source_unavailable",
+                    reviewer_acknowledged=acknowledged, review_rationale=rationale,
+                )
+                _advance_queue(1)
+            except Exception as exc:
+                st.error(f"Manual approval was not recorded. The saved revision remains selected: {exc}")
+
+
+def _navigate_to_manual_instructions(candidate_id: str) -> None:
+    if st.session_state.get(f"instruction_handling:{candidate_id}") != "Add instructions manually":
+        return
+    st.session_state[f"recipe_sections:{candidate_id}"] = "Instructions"
+    st.session_state[f"recipe_section_saved:{candidate_id}"] = "Instructions"
 
 
 def _render_no_instructions_control(view, buffer) -> None:
@@ -595,10 +642,11 @@ def _render_no_instructions_control(view, buffer) -> None:
         index=3,
         key=f"instruction_handling:{view.candidate_id}",
         label_visibility="collapsed",
+        on_change=_navigate_to_manual_instructions,
+        args=(view.candidate_id,),
     )
     if choice == "Add instructions manually":
-        st.session_state[f"review_pending_section:{view.candidate_id}"] = "Instructions"
-        st.rerun(scope="app")
+        st.info("The Instructions section is open. Add the preparation steps in the editor above.")
     elif choice == "Request AI-suggested instructions":
         _render_suggestion_request_controls(view)
     elif choice == "Confirm that no instructions are needed":
@@ -1417,7 +1465,7 @@ def _render_editor_fragment(view, buffer) -> None:
     sync_buffer(view, buffer)
     _render_editor(view, buffer)
     if diagnostics is not None:
-        with st.expander("Performance counters"):
+        with st.expander("Performance counters", expanded=True):
             st.caption(runtime_marker(st.context.url))
             st.json(dict(diagnostics))
 

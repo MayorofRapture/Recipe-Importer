@@ -44,7 +44,7 @@
 - [x] Test prepared plans, sequential and concurrent service instances, CLI/UI paths, legacy protected aliases, uncertain outcomes, durable intents, known rejection, malformed history, and ambiguous link holds through the focused and full suites.
 - [x] Add one indexed group-aware protection projection and consult it under `_state_lock` immediately before each durable intent; preflight stays read-only and dispatch recomputes under lock.
 - [x] Measure the projection against the same synthetic pair with and without the validated link: median 9,987 ns linked vs 10,750 ns unlinked across 7 x 20,000 calls. This microbenchmark is within noise and shows no material linked-case overhead.
-- [ ] Commit and push Gate A after final staged review.
+- [x] Commit and push Gate A after final staged review (`c789b4e`).
 
 ## Gate B — Trustworthy review
 
@@ -62,11 +62,11 @@
 - [x] Exercise the browser workflow on the owned synthetic app and retain sanitized screenshots under `.test-tmp`.
 
 - [x] Run focused/full tests, Python compilation, CLI help, JavaScript syntax checks, and diff checks.
-- [ ] Commit and push Gate B separately.
+- [x] Commit and push Gate B as the separately scoped follow-up commit.
 
 ## Integrated verification and delivery
 
 - [x] Run isolation, linked import/concurrency, manual-approval, and instructions-navigation tests plus full offline unittest suite (416 tests passed, 1 skipped).
 - [x] Run targeted Python compilation, CLI `--help`, JavaScript syntax checks, and `git diff --check`.
 - [x] Compare production review/import ledger hashes before and after browser testing; both are byte-for-byte unchanged. Ancillary output ledger timestamps predate this run.
-- [ ] Report benchmark results, F2 reproduction outcome, browser/accessibility/live-service limits, commit SHAs, and PR #3 status after both commits are pushed.
+- [x] Report benchmark results, F2 reproduction outcome, browser/accessibility/live-service limits, commit SHAs, and PR #3 status after both commits are pushed.

@@ -204,8 +204,13 @@ class ReviewNavigationTests(unittest.TestCase):
         self.assertEqual(current.no_instructions_reason, "Dry ingredient blend")
         self.assertEqual(app.session_state["review_selection"], view.candidate_id)
 
-        app.checkbox(key=f"manual_approval_ack:{view.candidate_id}:{current.revision}").check().run(timeout=10)
-        app.text_area(key=f"manual_approval_rationale:{view.candidate_id}:{current.revision}").set_value(
+        self.assertTrue(any("Saved revision" in item.value and "Fried Rice" in item.value
+                            for item in app.markdown))
+        ack = next(item for item in app.checkbox if item.label.startswith("I have reviewed the recipe"))
+        app.checkbox(key=ack.key).check().run(timeout=10)
+        rationale = next(item for item in app.text_area
+                         if item.label == "Why are you approving this recipe without its original source?")
+        app.text_area(key=rationale.key).set_value(
             "Reviewed the current recipe without the original scan.").run(timeout=10)
         next(item for item in app.button if item.key == f"approve_manual:{view.candidate_id}").click().run(timeout=10)
         approvals = [item for item in ReviewStore(output / "review_events.jsonl").events
@@ -215,6 +220,94 @@ class ReviewNavigationTests(unittest.TestCase):
         self.assertEqual(approvals[0]["source_hash"], view.source_hash)
         self.assertTrue(approvals[0]["reviewer_acknowledged"])
         self.assertFalse(app.exception)
+        self.assertFalse(app.exception)
+
+    def test_add_instructions_navigation_is_consumed_once_and_keeps_editor_buffer(self):
+        output = Path(self.fixture["output"])
+        source = Path(self.fixture["source"])
+        view = next(item for item in load_catalog(output) if item.candidate.name == "Fried Rice")
+        buffer = buffer_for(view)
+        buffer["structured_instructions"] = []
+        buffer["raw_instructions"] = ""
+        save_draft(view, buffer)
+
+        app = AppTest.from_file(str(APP_PATH)).run(timeout=10)
+        next(item for item in app.selectbox if item.label == "Show").set_value("All recipes").run(timeout=10)
+        next(item for item in app.selectbox if item.label == "Jump to recipe").set_value(view.candidate_id).run(timeout=10)
+        app.radio(key=f"instruction_handling:{view.candidate_id}").set_value(
+            "Request AI-suggested instructions").run(timeout=10)
+        self.assertEqual(app.session_state[f"recipe_sections:{view.candidate_id}"], "Ingredients")
+        app.radio(key=f"instruction_handling:{view.candidate_id}").set_value(
+            "Add instructions manually").run(timeout=10)
+        self.assertEqual(app.session_state[f"recipe_sections:{view.candidate_id}"], "Instructions")
+        self.assertNotIn(f"review_pending_section:{view.candidate_id}", app.session_state)
+        self.assertTrue(any("Instructions section is open" in item.value for item in app.info))
+        self.assertFalse(app.exception)
+
+        next(item for item in app.button if item.key == f"add_step:{view.candidate_id}").click().run(timeout=10)
+        step = next(item for item in app.text_area if item.label == "Step 1")
+        app.text_area(key=step.key).set_value("Synthetic unsaved preparation step.").run(timeout=10)
+        self.assertIn("Synthetic unsaved preparation step.", app.session_state["review_buffers"][view.candidate_id]["structured_instructions"])
+
+        next(item for item in app.selectbox if item.label == "Show").set_value("All recipes").run(timeout=10)
+        self.assertEqual(app.session_state[f"recipe_sections:{view.candidate_id}"], "Instructions")
+        self.assertIn("Synthetic unsaved preparation step.", app.session_state["review_buffers"][view.candidate_id]["structured_instructions"])
+        self.assertFalse(app.exception)
+
+    def test_manual_approval_blocks_an_unsaved_buffer_even_with_a_persisted_preview(self):
+        output = Path(self.fixture["output"])
+        source = Path(self.fixture["source"])
+        view = next(item for item in load_catalog(output) if item.candidate.name == "Fried Rice")
+        source.unlink()
+        app = AppTest.from_file(str(APP_PATH)).run(timeout=10)
+        next(item for item in app.selectbox if item.label == "Show").set_value("All recipes").run(timeout=10)
+        next(item for item in app.selectbox if item.label == "Jump to recipe").set_value(view.candidate_id).run(timeout=10)
+        self.assertTrue(any("Saved revision" in item.value for item in app.markdown))
+
+        buffers = dict(app.session_state["review_buffers"])
+        buffer = dict(buffers[view.candidate_id])
+        buffer.update({"name": "Unsaved manual title", "yield_text": "4 servings",
+                       "description": "Unsaved manual description", "recipe_notes": "Unsaved note",
+                       "structured_ingredients": ["4 cups synthetic rice", "2 synthetic eggs"],
+                       "structured_instructions": ["Unsaved first step", "Unsaved second step"]})
+        buffers[view.candidate_id] = buffer
+        app.session_state["review_buffers"] = buffers
+        app.run(timeout=10)
+
+        self.assertTrue(any("unsaved changes" in item.value.casefold() for item in app.warning))
+        approve = next(item for item in app.button if item.key == f"approve_manual:{view.candidate_id}")
+        self.assertTrue(approve.disabled)
+        approvals = [item for item in ReviewStore(output / "review_events.jsonl").events
+                     if item.get("event") == "review_approval" and item.get("candidate_id") == view.candidate_id]
+        self.assertEqual(approvals, [])
+        self.assertFalse(app.exception)
+
+    def test_manual_approval_acknowledgment_resets_when_saved_revision_changes(self):
+        output = Path(self.fixture["output"])
+        source = Path(self.fixture["source"])
+        view = next(item for item in load_catalog(output) if item.candidate.name == "Fried Rice")
+        source.unlink()
+        app = AppTest.from_file(str(APP_PATH)).run(timeout=10)
+        next(item for item in app.selectbox if item.label == "Show").set_value("All recipes").run(timeout=10)
+        next(item for item in app.selectbox if item.label == "Jump to recipe").set_value(view.candidate_id).run(timeout=10)
+        ack = next(item for item in app.checkbox if item.label.startswith("I have reviewed the recipe"))
+        app.checkbox(key=ack.key).check().run(timeout=10)
+        self.assertTrue(next(item for item in app.checkbox
+                             if item.label.startswith("I have reviewed the recipe")).value)
+
+        revised = view.candidate.model_copy(update={"description": "A different saved revision."})
+        ReviewStore(output / "review_events.jsonl").save_revision(
+            candidate_id=view.candidate_id, source_hash=view.source_hash,
+            extraction_id=view.extraction_id, expected_parent=view.revision,
+            operation_id="test-manual-approval-ack-revision-change",
+            recipe=revised.model_dump(mode="json"), target_bindings=list(view.target_bindings),
+        )
+        app.run(timeout=10)
+        reset_ack = next(item for item in app.checkbox
+                         if item.label.startswith("I have reviewed the recipe"))
+        self.assertFalse(reset_ack.value)
+        self.assertTrue(next(item for item in app.button
+                             if item.key == f"approve_manual:{view.candidate_id}").disabled)
         self.assertFalse(app.exception)
 
 
