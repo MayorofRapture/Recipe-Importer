@@ -32,7 +32,7 @@
 - [x] Preserve pre-existing untracked `.vscode/`.
 - [x] Run baseline `.venv\\Scripts\\python.exe -m unittest discover -s tests -v`: 416 passed, 1 capability skip.
 - [x] Record protected ledger hashes and current Python/package/Node versions.
-- [ ] Run baseline broad browser acceptance and capture the precise drift point.
+- [x] Capture the broad-flow drift point: after the first review revision, an unrelated row proposal was reported unavailable; preserve this as an AppTest regression and verify the repaired synthetic browser journey. A separate browser run against the old baseline commit was not used because its harness lacked the current fixture identity attestation.
 
 ## Gate C
 
@@ -59,7 +59,7 @@
 ## Final checks and delivery
 
 - [x] Full offline unittest suite (419 tests, 1 capability skip), Python compilation, CLI help, JS syntax, Node tests, isolated broad browser run, and `git diff --check`.
-- [ ] Clean checkout verification.
+- [x] Clean checkout verification: 419 tests, 1 capability skip, compile, CLI, JS syntax, and fixture runner all passed with no `.env`, production histories, or pre-existing ignored test folders.
 - [ ] CI workflow runtime validation (GitHub Actions run pending push).
 - [x] Compare protected output hashes before/after.
 - [ ] Commit test portability/CI, browser/docs, and roadmap as separate coherent commits where practical; push without rewriting history or merging PR #3.
