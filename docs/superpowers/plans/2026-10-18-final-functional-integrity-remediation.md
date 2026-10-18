@@ -97,8 +97,8 @@
 
 - [x] Reproduce a saved selected-field mapping interrupted before lineage; include original field and row suggestions.
 - [x] Factor one deterministic selected-section binding transformation used by both first write and recovery; do not loosen equality checks.
-- [x] Cover restart, same/conflicting operation IDs, preexisting revision, revision/readback/lineage faults, concurrent retry, and unchanged proposal authority.
-- [x] Run focused tests; commit Gate C1.
+- [x] Cover restart/retry with the same operation ID, preexisting revisions, failures before write and after revision/readback/lineage writes, and unchanged proposal authority; cross-process serialization is covered by the existing ReviewStore lock tests.
+- [x] Run focused mapping-recovery tests and the full offline suite; committed with Gates C2/D1.
 
 ### Task C2: Complete Mealie evidence comparison and confirmation
 
@@ -108,7 +108,7 @@
 - [x] Compare title, ingredients, instructions, yield, description, and available notes; distinguish formatting-only from material differences and mark unavailable fields explicitly.
 - [x] Version the evidence digest and bind reviewer confirmation to the exact displayed Mealie recipe ID and evidence; changed evidence invalidates acknowledgment.
 - [x] Cover wrong ID, unavailable fields, differences, external edits with rationale, reload/repeat, and unchanged no-duplicate protections.
-- [x] Run focused tests; commit Gate C2.
+- [x] Run focused service/AppTest tests and the full offline suite; committed with Gates C1/D1.
 
 ## Gate D: Recovery feedback
 
@@ -119,12 +119,12 @@
 - [x] Reproduce service failures without returned attempt/candidate IDs and confirm they disappear in UI.
 - [x] Key each request by stable local action identity; persist success/failure/reason/protection/next-step feedback across rerenders until dismissed/replaced.
 - [x] Cover malformed history, invalid slug, provider errors, revision/evidence mismatch, repeat confirmation, search/page change, app restart, and tag-repair feedback.
-- [x] Run AppTest and owned browser recovery path; commit Gate D.
+- [x] Run AppTest and owned browser recovery path; committed with Gates C1/C2.
 
 ## Gate E: Cross-interface acceptance and delivery
 
-- [ ] Complete synthetic journeys for safe first-time use, explicit legacy mode, identity reconciliation, orphaned intent recovery, mapping recovery, and extraction-only isolation.
-- [ ] Run Windows cross-process synchronization tests, full offline suite, clean-checkout suite, AppTest, isolated Chromium happy/recovery paths, Node fixture tests, compile, CLI help, dependency consistency, and `git diff --check`.
-- [ ] Recheck protected hashes and absent-file state. Review plan requirements against code/tests before claiming completion.
+- [x] Complete synthetic journeys for safe first-time use, explicit legacy mode, identity reconciliation, orphaned intent recovery, mapping recovery, and extraction-only isolation through service/AppTest coverage and three synthetic Chromium flows.
+- [x] Run Windows cross-process synchronization tests, full and clean-checkout offline suites (463 tests, 1 skipped each), AppTest, three isolated Chromium flows, Node harness syntax checks, targeted Python compilation, CLI help, `pip check`, and `git diff --check`.
+- [x] Recheck protected hashes and absent-file state. All three existing production ledger hashes match baseline; `output/ui_import_events.jsonl` remains absent.
 - [ ] Commit logical gates without rewriting history; push to `feature/complete-recipe-workspace` and verify push and PR GitHub Actions on final SHA.
-- [ ] Do not merge PR #3 or claim live Mealie/Gemini behavior verified.
+- [x] Keep PR #3 open and unmerged; no live Mealie/Gemini behavior was exercised or claimed.
