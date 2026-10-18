@@ -476,6 +476,12 @@ class ImportService:
                     for provenance_key in ("attempt_id", "revision", "content_sha256"):
                         if event.get(provenance_key) is not None:
                             row[provenance_key] = event[provenance_key]
+                    if event.get("extraction_id"):
+                        row["extraction_id"] = str(event["extraction_id"])
+                    if event.get("event") == "intent_started":
+                        row["attempt_status"] = "orphaned"
+                        row["provider_response_evidence"] = ""
+                        row["attempt_snapshot"] = event.get("recipe_snapshot")
                 for provenance_key in ("approval_method", "approval_rationale", "no_instructions_reason"):
                     if event.get(provenance_key):
                         row[provenance_key] = str(event[provenance_key])
@@ -487,11 +493,16 @@ class ImportService:
                     "created", "confirmed", "linked_existing", "already_created",
                 }:
                     row["creation_status"] = "uncertain"
+                    row["attempt_status"] = "uncertain"
                     row["slug"] = str(event.get("slug", row.get("slug", "")))
+                    row["provider_response_evidence"] = self._provider_evidence(event)
                 elif kind == "create_rejected":
                     row["creation_status"] = "rejected"
+                    row["attempt_status"] = "rejected"
+                    row["provider_response_evidence"] = self._provider_evidence(event)
                 elif kind in {"creation_confirmed", "reconciled_existing"}:
                     row["creation_status"] = "created" if kind == "creation_confirmed" else "linked_existing"
+                    row["attempt_status"] = "confirmed" if kind == "creation_confirmed" else "reconciled"
                     row["slug"] = str(event.get("slug", row.get("slug", "")))
                     row["tag_status"] = "pending" if event.get("batch_tag") else "not_requested"
                     row["batch_tag"] = str(event.get("batch_tag", row.get("batch_tag", "")))
@@ -844,12 +855,17 @@ class ImportService:
             for value in attempt_ids:
                 attempt_events = [item for item in candidate_events
                                   if str(item.get("attempt_id", "")) == value]
-                if any(item.get("event") == "create_uncertain" for item in attempt_events) and not any(
-                    item.get("event") == "reconciled_existing" for item in attempt_events
-                ):
+                terminal = [item for item in attempt_events if item.get("event") in {
+                    "create_uncertain", "create_rejected", "creation_confirmed",
+                }]
+                links = [item for item in attempt_events if item.get("event") == "reconciled_existing"]
+                if not terminal and not links:
+                    unresolved.append(value)
+                elif (len(terminal) == 1 and terminal[0].get("event") == "create_uncertain"
+                      and not links):
                     unresolved.append(value)
             if len(unresolved) != 1:
-                return None, ("Import history does not identify exactly one unresolved uncertain attempt. "
+                return None, ("Import history does not identify exactly one unresolved intent or uncertain attempt. "
                               "Review the durable event history before continuing.")
             selected = unresolved[0]
 
@@ -860,18 +876,27 @@ class ImportService:
             "create_uncertain", "create_rejected", "creation_confirmed",
         }]
         links = [item for item in attempt_events if item.get("event") == "reconciled_existing"]
-        if len(intents) != 1 or len(outcomes) != 1:
-            return None, "The selected import attempt has missing or duplicate create history and is protected."
-        intent, outcome = intents[0], outcomes[0]
-        if outcome.get("event") != "create_uncertain":
+        if len(intents) != 1 or len(outcomes) > 1:
+            return None, "The selected import attempt has missing, duplicate, or contradictory create history and is protected."
+        intent = intents[0]
+        outcome = outcomes[0] if outcomes else None
+        if outcome and outcome.get("event") not in {"create_uncertain", "reconciled_existing"}:
             return None, "The selected attempt is not an unresolved uncertain create."
+        if len(links) == 1 and outcome is not None and outcome.get("event") != "create_uncertain":
+            return None, "The selected attempt has contradictory creation and reconciliation history."
+        if outcome is None and links:
+            outcome_status = "reconciled"
+        else:
+            outcome_status = ("orphaned" if outcome is None else
+                              "uncertain" if outcome.get("event") == "create_uncertain" else
+                              "reconciled" if links else "uncertain")
         required = ("attempt_id", "candidate_id", "source_hash", "extraction_id",
                     "revision", "content_sha256", "title")
         if any(intent.get(key) in (None, "") for key in required):
             return None, "The selected attempt is missing required identity or revision fields and is protected."
         for key in ("candidate_id", "source_hash", "extraction_id", "revision",
                     "content_sha256", "title", "batch_tag"):
-            if key in outcome and key in intent and outcome[key] != intent[key]:
+            if outcome and key in outcome and key in intent and outcome[key] != intent[key]:
                 return None, f"The selected attempt has conflicting {key} history and is protected."
         if len(links) > 1:
             return None, "The selected attempt has duplicate reconciliation history and is protected."
@@ -926,8 +951,24 @@ class ImportService:
             "title": str(intent.get("title", "")),
             "source_path": str(intent.get("source_path", "")),
             "batch_tag": str(intent.get("batch_tag", "")),
+            "created_at": str(intent.get("created_at", "")),
+            "outcome_status": outcome_status,
+            "provider_response_evidence": self._provider_evidence(outcome) if outcome else "",
             "recipe_snapshot": snapshot,
         }, ""
+
+    @staticmethod
+    def _provider_evidence(event: dict | None) -> str:
+        if not event:
+            return ""
+        values = []
+        if event.get("category"):
+            values.append(str(event["category"]))
+        if event.get("http_status") is not None:
+            values.append(f"HTTP {event['http_status']}")
+        if event.get("slug"):
+            values.append(f"slug {event['slug']}")
+        return "; ".join(values)
 
     @classmethod
     def _compare_reconciliation_recipe(cls, local_recipe: dict, mealie_recipe: dict) -> dict:

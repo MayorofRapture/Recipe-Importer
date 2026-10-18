@@ -154,7 +154,17 @@ else:
                     st.session_state.pop(repair_result_key, None)
                     st.rerun()
             if uncertain:
+                if item.get("attempt_status") == "orphaned":
+                    st.warning("The create intent was saved, but no result was recorded. Mealie may still have received the request; do not retry this recipe.")
                 st.caption("Creation is blocked until reconciliation. A missing search result is not proof of absence.")
+                if item.get("attempt_id"):
+                    st.caption(
+                        f"Attempt {item['attempt_id']} · source {item.get('source_hash', '')} · "
+                        f"extraction {item.get('extraction_id', '')} · revision {item.get('revision', '')} · "
+                        f"content {item.get('content_sha256', '')} · intent {item.get('timestamp', '')}"
+                    )
+                if item.get("provider_response_evidence"):
+                    st.caption(f"Provider response evidence: {item['provider_response_evidence']}")
                 slug = st.text_input("Existing Mealie recipe slug", key=f"slug:{identity}")
                 inspection_key = f"reconcile_inspection:{identity}"
                 if st.button("Inspect existing recipe", key=f"inspect_reconcile:{identity}",

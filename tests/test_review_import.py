@@ -1,7 +1,10 @@
+import csv
+import io
 import json
 import os
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
@@ -11,6 +14,171 @@ from review_store import ReviewStore
 
 
 class ReviewImportTests(unittest.TestCase):
+    def test_review_only_mode_does_not_import_an_unreviewed_complete_candidate(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "toast.jpg"
+            source.write_bytes(b"synthetic toast")
+            digest = __import__("hashlib").sha256(source.read_bytes()).hexdigest()
+            cache = root / "extracted"
+            cache.mkdir()
+            candidate = RecipeCandidate(name="Toast", ingredients=["bread"], instructions=["Toast."])
+            (cache / f"{digest}.json").write_text(
+                ExtractionBatch(recipes=[candidate]).model_dump_json(), encoding="utf-8")
+            imported = []
+
+            with patch("import_recipes.import_mealie",
+                       side_effect=lambda recipe, *_: imported.append(recipe) or "toast"):
+                rows = process_file(
+                    source, digest, {"api_key": "", "mealie_url": "", "mealie_token": "",
+                                    "model": "primary"}, None, StateStore(root / "state.jsonl"),
+                    cache, False, legacy_auto_import=False,
+                )
+
+        self.assertEqual([row["status"] for row in rows], ["EXTRACTED_ONLY"])
+        self.assertIn("--legacy-auto-import", rows[0]["note"])
+        self.assertEqual(imported, [])
+
+    def test_explicit_legacy_auto_import_keeps_legacy_create_behavior(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "toast.jpg"
+            source.write_bytes(b"synthetic toast")
+            digest = __import__("hashlib").sha256(source.read_bytes()).hexdigest()
+            cache = root / "extracted"
+            cache.mkdir()
+            candidate = RecipeCandidate(name="Toast", ingredients=["bread"], instructions=["Toast."])
+            (cache / f"{digest}.json").write_text(
+                ExtractionBatch(recipes=[candidate]).model_dump_json(), encoding="utf-8")
+            imported = []
+
+            with patch("import_recipes.import_mealie",
+                       side_effect=lambda recipe, *_: imported.append(recipe) or "toast"):
+                rows = process_file(
+                    source, digest, {"api_key": "", "mealie_url": "http://mealie",
+                                    "mealie_token": "token", "model": "primary"}, None,
+                    StateStore(root / "state.jsonl"), cache, False,
+                    legacy_auto_import=True,
+                )
+
+        self.assertEqual([row["status"] for row in rows], ["IMPORTED"])
+        self.assertEqual([recipe.name for recipe in imported], ["Toast"])
+
+    def test_exact_approved_revision_remains_importable_without_legacy_mode(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "toast.jpg"
+            source.write_bytes(b"synthetic toast")
+            digest = __import__("hashlib").sha256(source.read_bytes()).hexdigest()
+            cache = root / "extracted"
+            cache.mkdir()
+            candidate = RecipeCandidate(name="Toast", ingredients=["bread"], instructions=["Toast."])
+            batch = ExtractionBatch(recipes=[candidate])
+            (cache / f"{digest}.json").write_text(batch.model_dump_json(), encoding="utf-8")
+            reviews = ReviewStore(root / "review.jsonl")
+            registration = reviews.register_candidates(
+                str(source), digest,
+                __import__("review_store").extraction_identity(digest, batch.model_dump(mode="json")),
+                batch.recipes,
+            )[0]
+            revision = reviews.save_revision(
+                candidate_id=registration["candidate_id"], source_hash=digest,
+                extraction_id=registration["extraction_id"], expected_parent=0,
+                operation_id="approved-review-revision", recipe=candidate.model_dump(mode="json"),
+                target_bindings=registration["target_bindings"],
+            )
+            reviews.approve_revision(
+                candidate_id=registration["candidate_id"], source_hash=digest,
+                extraction_id=registration["extraction_id"], revision=revision["revision"],
+                operation_id="approved-review-revision-approval", source_path=str(source),
+            )
+            imported = []
+
+            with patch("import_recipes.import_mealie",
+                       side_effect=lambda recipe, *_: imported.append(recipe) or "toast"):
+                rows = process_file(
+                    source, digest, {"api_key": "", "mealie_url": "http://mealie",
+                                    "mealie_token": "token", "model": "primary"}, None,
+                    StateStore(root / "state.jsonl"), cache, False, review_store=reviews,
+                    legacy_auto_import=False, approved_only=True,
+                )
+
+        self.assertEqual([row["status"] for row in rows], ["IMPORTED"])
+        self.assertEqual([recipe.name for recipe in imported], ["Toast"])
+
+    def test_cli_default_is_review_only_and_does_not_initialize_mealie(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "recipes"
+            source.mkdir()
+            scan = source / "toast.jpg"
+            scan.write_bytes(b"synthetic toast")
+            digest = __import__("hashlib").sha256(scan.read_bytes()).hexdigest()
+            work = root / "output"
+            (work / "extracted").mkdir(parents=True)
+            candidate = RecipeCandidate(name="Toast", ingredients=["bread"], instructions=["Toast."])
+            (work / "extracted" / f"{digest}.json").write_text(
+                ExtractionBatch(recipes=[candidate]).model_dump_json(), encoding="utf-8")
+            output = io.StringIO()
+
+            with patch("import_recipes.__file__", str(root / "import_recipes.py")), \
+                 patch("import_recipes.sys.argv", ["import_recipes.py", "--source", str(source)]), \
+                 patch("import_recipes.load_dotenv"), \
+                 patch.dict(os.environ, {"GEMINI_API_KEY": "synthetic", "GEMINI_MODEL": "test-model",
+                                         "MEALIE_TOKEN": "", "MEALIE_URL": ""}, clear=False), \
+                 patch("import_recipes.preflight_mealie") as preflight, \
+                 patch("import_recipes.MealieClient") as mealie_client, \
+                 patch("import_recipes.import_mealie") as create, redirect_stdout(output):
+                code = __import__("import_recipes").main()
+
+            with (work / "last_run_report.csv").open(encoding="utf-8-sig", newline="") as report_file:
+                report = list(csv.DictReader(report_file))
+
+        self.assertEqual(code, 0)
+        self.assertIn("review-only (safe default)", output.getvalue())
+        self.assertEqual([row["status"] for row in report], ["EXTRACTED_ONLY"])
+        preflight.assert_not_called()
+        mealie_client.assert_not_called()
+        create.assert_not_called()
+
+    def test_approved_only_mode_blocks_candidate_without_saved_approval(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "toast.jpg"
+            source.write_bytes(b"synthetic toast")
+            digest = __import__("hashlib").sha256(source.read_bytes()).hexdigest()
+            cache = root / "extracted"
+            cache.mkdir()
+            candidate = RecipeCandidate(name="Toast", ingredients=["bread"], instructions=["Toast."])
+            (cache / f"{digest}.json").write_text(
+                ExtractionBatch(recipes=[candidate]).model_dump_json(), encoding="utf-8")
+            imported = []
+
+            with patch("import_recipes.import_mealie",
+                       side_effect=lambda recipe, *_: imported.append(recipe) or "toast"):
+                rows = process_file(
+                    source, digest, {"api_key": "", "mealie_url": "http://mealie",
+                                    "mealie_token": "token", "model": "primary"}, None,
+                    StateStore(root / "state.jsonl"), cache, False,
+                    legacy_auto_import=False, approved_only=True,
+                )
+
+        self.assertEqual([row["status"] for row in rows], ["NEEDS_REVIEW"])
+        self.assertIn("explicitly approved", rows[0]["note"])
+        self.assertEqual(imported, [])
+
+    def test_cli_rejects_extract_only_with_import_authorization(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with patch("import_recipes.__file__", str(root / "import_recipes.py")), \
+                 patch("import_recipes.sys.argv", ["import_recipes.py", "--extract-only",
+                                                    "--import-approved"]), \
+                 patch("import_recipes.load_dotenv"):
+                with self.assertRaises(SystemExit) as raised:
+                    __import__("import_recipes").main()
+
+        self.assertEqual(raised.exception.code, 2)
+
     def test_forced_renamed_retry_is_held_when_same_source_has_an_imported_sibling(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

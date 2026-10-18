@@ -19,7 +19,7 @@ APP_PATH = Path(__file__).resolve().parents[1] / "streamlit_app.py"
 
 
 class StreamlitImportHistoryTests(unittest.TestCase):
-    def test_uncertain_reconciliation_ui_compares_before_explicit_confirmation(self):
+    def test_orphaned_intent_ui_compares_before_explicit_confirmation(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             fixture = write_ui_fixture(root)
@@ -50,14 +50,8 @@ class StreamlitImportHistoryTests(unittest.TestCase):
                 "title": eligible["title"], "source_path": eligible["source_path"],
                 "batch_tag": "", "recipe_snapshot": eligible["recipe"],
             }
-            uncertain = {
-                "event": "create_uncertain", "event_id": "synthetic-uncertain-event",
-                **{key: intent[key] for key in ("attempt_id", "candidate_id", "source_hash",
-                                                 "extraction_id", "revision", "content_sha256", "title")},
-            }
             with (output / "ui_import_events.jsonl").open("a", encoding="utf-8") as handle:
                 handle.write(json.dumps(intent) + "\n")
-                handle.write(json.dumps(uncertain) + "\n")
             returned = schema_recipe(RecipeCandidate.model_validate(eligible["recipe"]))
             returned["recipeIngredient"] = ["A different ingredient list"]
             (output / "fixture_mealie.json").write_text(json.dumps({
@@ -71,6 +65,8 @@ class StreamlitImportHistoryTests(unittest.TestCase):
                                          "RECIPE_IMPORTER_SOURCE_DIR": str(root / "sources"),
                                          "RECIPE_IMPORTER_FIXTURE_MODE": "1"}):
                 app = AppTest.from_file(str(PAGE)).run(timeout=15)
+                self.assertTrue(any("no result was recorded" in item.value for item in app.warning))
+                self.assertTrue(any(attempt_id in item.value for item in app.caption))
                 app.text_input(key=f"slug:{view.candidate_id}").set_value("synthetic-existing").run(timeout=15)
                 next(button for button in app.button if button.label == "Inspect existing recipe").click().run(timeout=15)
                 self.assertFalse(app.exception)

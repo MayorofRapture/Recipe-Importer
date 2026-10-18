@@ -729,7 +729,7 @@ def select_sources(files: list[tuple[Path, str]], state: StateStore, cache_dir: 
     return eligible[:limit] if limit else eligible
 
 
-def process_file(path: Path, digest: str, config: dict, gate: RateGate | None, state: StateStore, cache_dir: Path, extract_only: bool, retry_incomplete: bool = False, force_extract: bool = False, review_store: ReviewStore | None = None, router: ModelRouter | None = None, batch_tag: str = "", mealie_client=None) -> list[dict]:
+def process_file(path: Path, digest: str, config: dict, gate: RateGate | None, state: StateStore, cache_dir: Path, extract_only: bool, retry_incomplete: bool = False, force_extract: bool = False, review_store: ReviewStore | None = None, router: ModelRouter | None = None, batch_tag: str = "", mealie_client=None, legacy_auto_import: bool = True, approved_only: bool = False, repair_failed_tags: bool = True) -> list[dict]:
     report_fields: dict = {}
 
     def record(status: str, title: str = "", slug: str = "", note: str = "", **extra) -> dict:
@@ -852,9 +852,19 @@ def process_file(path: Path, digest: str, config: dict, gate: RateGate | None, s
         if modern_revision:
             candidate = RecipeCandidate.model_validate(effective.recipe)
         warnings = "; ".join(batch.general_warnings + candidate.warnings)
-        if previous and previous.get("status") == "IMPORTED" and batch_tag \
+        if (extract_only and previous and previous.get("status") == "IMPORTED"
+                and previous.get("tag_status") == "failed"
+                and (previous.get("tag_name") or previous.get("batch_tag")) == batch_tag):
+            results.append(record(
+                "ALREADY_DONE", candidate.name, previous.get("slug", ""),
+                "Extraction-only mode left the pending Mealie tag repair untouched.",
+                model=selected_model, route_reason=route_reason, candidate_id=identity,
+            ))
+            continue
+        if (not extract_only and repair_failed_tags and previous
+                and previous.get("status") == "IMPORTED" and batch_tag \
                 and previous.get("tag_status") == "failed" \
-                and (previous.get("tag_name") or previous.get("batch_tag")) == batch_tag:
+                and (previous.get("tag_name") or previous.get("batch_tag")) == batch_tag):
             try:
                 tag = mealie_client.ensure_tag(batch_tag)
                 tag_status = mealie_client.add_tag(previous.get("slug", ""), tag)
@@ -878,6 +888,11 @@ def process_file(path: Path, digest: str, config: dict, gate: RateGate | None, s
                                   note="The current review revision does not have an exact matching approval.",
                                   model=selected_model, route_reason=route_reason, candidate_id=identity))
             continue
+        if approved_only and not modern_revision:
+            results.append(record("NEEDS_REVIEW", candidate.name,
+                                  note="Import requires an explicitly approved saved review revision.",
+                                  model=selected_model, route_reason=route_reason, candidate_id=identity))
+            continue
         if candidate.missing_information or candidate.suggestions:
             reviews.add_candidate(str(path), identity, candidate)
         if not is_complete(candidate):
@@ -888,6 +903,11 @@ def process_file(path: Path, digest: str, config: dict, gate: RateGate | None, s
             continue
         if extract_only:
             results.append(record("EXTRACTED_ONLY", candidate.name, note=warnings, model=selected_model, route_reason=route_reason, candidate_id=identity))
+            continue
+        if not legacy_auto_import and not approved_only:
+            results.append(record("EXTRACTED_ONLY", candidate.name,
+                                  note="No import was authorized; use --legacy-auto-import or approve a revision and use --import-approved.",
+                                  model=selected_model, route_reason=route_reason, candidate_id=identity))
             continue
         try:
             from ui_import_service import ImportService
@@ -1268,6 +1288,13 @@ def main() -> int:
     parser.add_argument("--source", default=os.getenv("RECIPE_DIR", "recipes"))
     parser.add_argument("--limit", type=int, default=0)
     parser.add_argument("--extract-only", action="store_true")
+    import_modes = parser.add_mutually_exclusive_group()
+    import_modes.add_argument("--legacy-auto-import", action="store_true",
+                              help="Explicitly allow legacy imports without saved review approval")
+    import_modes.add_argument("--import-approved", action="store_true",
+                              help="Import only exact revisions with current explicit review approval")
+    parser.add_argument("--repair-failed-tags", action="store_true",
+                        help="Explicitly retry only previously imported recipes with a failed matching batch tag")
     parser.add_argument("--ocr-only", action="store_true",
                         help="Use local OCR only; do not initialize Gemini or connect to Mealie")
     parser.add_argument("--ocr-structure", action="store_true",
@@ -1293,6 +1320,12 @@ def main() -> int:
     model = os.getenv("GEMINI_MODEL", "").strip()
     work = Path(__file__).resolve().parent / "output"
     work.mkdir(exist_ok=True)
+    if args.extract_only and (args.legacy_auto_import or args.import_approved or args.repair_failed_tags):
+        parser.error("--extract-only cannot be combined with import or tag-repair authorization flags")
+    if args.repair_failed_tags and (args.legacy_auto_import or args.import_approved):
+        parser.error("--repair-failed-tags is a separate operation; do not combine it with recipe import modes")
+    if args.repair_failed_tags and not args.batch_tag:
+        parser.error("--repair-failed-tags requires --batch-tag")
     if args.ocr_only and args.ocr_structure:
         parser.error("--ocr-only and --ocr-structure are mutually exclusive")
     if args.ocr_only:
@@ -1473,8 +1506,14 @@ def main() -> int:
         )
         print("Tag backfill:", result)
         return 1 if any(value == "failed" for value in result.values()) else 0
+    mode = ("extract-only" if args.extract_only else
+            "legacy-auto-import" if args.legacy_auto_import else
+            "approved-revision import" if args.import_approved else
+            "failed-tag repair" if args.repair_failed_tags else "review-only (safe default)")
+    print(f"Execution mode: {mode}")
     missing = ["GEMINI_API_KEY"] if not api_key else []
-    if not args.extract_only:
+    needs_mealie = args.legacy_auto_import or args.import_approved or args.repair_failed_tags
+    if needs_mealie:
         missing += [name for name, value in (("MEALIE_TOKEN", token), ("MEALIE_URL", url)) if not value]
     if missing:
         parser.error("Missing .env settings: " + ", ".join(missing))
@@ -1483,7 +1522,7 @@ def main() -> int:
     source = Path(args.source).expanduser()
     if not source.is_dir():
         parser.error(f"Recipe directory not found: {source}")
-    if not args.extract_only:
+    if needs_mealie:
         try:
             preflight_mealie(url, token)
             print("Mealie connection/token OK.")
@@ -1503,7 +1542,7 @@ def main() -> int:
     state = StateStore(work / "import_state.jsonl")
     reviews = ReviewStore(work / "review_events.jsonl")
     router = ModelRouter(models, UsageLedger(work / "gemini_usage.json"), global_rpm=args.rpm)
-    tag_client = MealieClient(url, token) if args.batch_tag and not args.extract_only else None
+    tag_client = MealieClient(url, token) if args.batch_tag and needs_mealie and not args.extract_only else None
     config = {"api_key": api_key, "mealie_token": token, "mealie_url": url,
               "model": models[0].id, "tesseract_cmd": os.getenv("TESSERACT_CMD", "").strip()}
     unique: list[tuple[Path, str]] = []
@@ -1529,8 +1568,11 @@ def main() -> int:
     try:
         with ThreadPoolExecutor(max_workers=args.workers) as executor:
             futures = {executor.submit(process_file, path, digest, config, None, state, cache_dir,
-                                        args.extract_only, args.retry_incomplete, args.force_extract,
-                                        reviews, router, args.batch_tag, tag_client): path
+                                        args.extract_only or not needs_mealie, args.retry_incomplete, args.force_extract,
+                                        reviews, router, args.batch_tag, tag_client,
+                                        legacy_auto_import=args.legacy_auto_import,
+                                        approved_only=args.import_approved,
+                                        repair_failed_tags=args.repair_failed_tags): path
                        for path, digest in selected}
             for future in as_completed(futures):
                 try:

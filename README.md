@@ -2,6 +2,8 @@
 
 Designed for **300+ files in one short session**. Each file usually contains one recipe; if Gemini finds several distinct recipes in one file, each can be imported. Uses **Mealie's non-AI JSON import endpoint**, so you do not need to configure AI within Mealie. Tested for Python syntax and local mocked workflow, **not** against your live Mealie/Gemini accounts.
 
+> **Safe CLI default:** ordinary runs extract and register recipes for review only. They do not connect to Mealie or create recipes. Use `--import-approved` to import only exact revisions with current explicit approval. `--legacy-auto-import` deliberately enables the historical unattended behavior. Failed tag repair is separate and requires `--repair-failed-tags`.
+
 ## First-time setup (Windows PowerShell)
 
 1. Install Python 3.14 for the checked-in lock. The app also supports Python 3.11+ with the bounded `requirements.txt`; Node.js 24 is needed only to run browser test harnesses. Unzip this folder anywhere on your Windows PC.
@@ -14,8 +16,15 @@ Designed for **300+ files in one short session**. Each file usually contains one
 ```powershell
 py -3 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements-lock.txt
-.\.venv\Scripts\python.exe import_recipes.py --limit 5
+.\.venv\Scripts\python.exe import_recipes.py --extract-only --limit 5
 ```
+
+Review the extracted candidates in the local app, save and approve the exact
+revision, then authorize only those approvals from the CLI with
+`--import-approved`. Use `--legacy-auto-import` only when unattended import is
+intended. The old bare command no longer imports recipes. The execution mode is
+printed before batch processing; ordinary review-only mode requires no Mealie
+credentials and performs no Mealie preflight.
 
 `requirements-lock.txt` pins the Python 3.14 environment observed in the
 verified development venv; optional `pytesseract` stays in
@@ -215,10 +224,17 @@ replace (list fields preserve individual entries):
 
 The script first checks that your Mealie API token can authenticate. Open Mealie and spot-check the five recipes (especially quantities, temperatures, and instructions).
 
-Then import the rest:
+For unattended legacy imports (explicitly opt in):
 
 ```powershell
-.\.venv\Scripts\python.exe import_recipes.py
+.\.venv\Scripts\python.exe import_recipes.py --legacy-auto-import
+```
+
+For the protected workflow, approve saved candidate revisions in the review UI
+or with the review CLI, then import only those exact approvals:
+
+```powershell
+.\.venv\Scripts\python.exe import_recipes.py --import-approved
 ```
 
 If stopped, **run the same command again**. Already-imported recipes will be skipped using the append-only import ledger and stable source/title identity; array reordering is reconciled and ambiguous duplicate titles are held for review.
@@ -234,13 +250,13 @@ Extract 5 files without modifying Mealie:
 Try a lower request rate if receiving 429s:
 
 ```powershell
-.\.venv\Scripts\python.exe import_recipes.py --rpm 6 --workers 2
+.\.venv\Scripts\python.exe import_recipes.py --legacy-auto-import --rpm 6 --workers 2
 ```
 
 Retry unresolved files while preserving earlier extraction attempts:
 
 ```powershell
-.\.venv\Scripts\python.exe import_recipes.py --retry-incomplete --force-extract
+.\.venv\Scripts\python.exe import_recipes.py --extract-only --retry-incomplete --force-extract
 ```
 
 Validate configured model IDs against the provider before extraction:
@@ -258,8 +274,11 @@ Record an explicit review decision. Pending and rejected proposals never enter M
 Tag newly created recipes in a batch without retagging historical imports:
 
 ```powershell
-.\.venv\Scripts\python.exe import_recipes.py --batch-tag "Cookbook 2026"
+.\.venv\Scripts\python.exe import_recipes.py --legacy-auto-import --batch-tag "Cookbook 2026"
 ```
+
+Retrying a failed tag application does not create recipes. Run it as its own
+explicit operation with `--repair-failed-tags --batch-tag "Cookbook 2026"`.
 
 Repair tags only for an explicitly listed set of existing Mealie slugs; add `--dry-run` to preview:
 

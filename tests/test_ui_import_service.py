@@ -47,6 +47,10 @@ class FakeMealie:
         return {"id": "recipe-id", "slug": slug, "name": "Fried Rice"}
 
 
+class SimulatedProcessStop(BaseException):
+    """Model abrupt process death without being caught as a provider error."""
+
+
 def _approved_fried_rice(root: Path) -> tuple[Path, str, str]:
     fixture = write_ui_fixture(root)
     output = Path(fixture["output"])
@@ -547,6 +551,65 @@ print(json.dumps(ImportService(Path(sys.argv[1]), source_root=Path(sys.argv[2]),
         self.assertEqual(len(linked), 1)
         self.assertEqual(linked[0]["attempt_id"], intent["attempt_id"])
         self.assertIn("approved review revision", linked[0]["reviewer_evidence"])
+
+    def test_orphaned_create_intent_is_inspectable_and_reconcilable_without_retry(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output, source_root, candidate_id = _approved_fried_rice(Path(tmp))
+            client = FakeMealie()
+            service = ImportService(output, source_root=Path(source_root), client=client)
+            plan = service.preview([candidate_id])
+            create_calls = []
+
+            def stop_before_create(_recipe):
+                create_calls.append("attempted")
+                raise SimulatedProcessStop("process terminated after durable intent")
+
+            client.create_recipe = stop_before_create
+            with self.assertRaises(SimulatedProcessStop):
+                service.dispatch(plan["plan_id"])
+            events = [json.loads(line) for line in
+                      (output / "ui_import_events.jsonl").read_text(encoding="utf-8").splitlines()]
+            intent = next(item for item in events if item.get("event") == "intent_started")
+
+            restarted = ImportService(output, source_root=Path(source_root), client=client)
+            history = next(item for item in restarted.history()
+                           if item.get("candidate_id") == candidate_id)
+            client.get_recipe = lambda _slug: None
+            absent = restarted.reconcile_existing(candidate_id, "missing-slug", intent["attempt_id"])
+            retry_blocked = restarted.dispatch(plan["plan_id"])
+            snapshot = intent["recipe_snapshot"]
+            client.get_recipe = lambda slug: {
+                "id": "existing-recipe-id", "slug": slug, "name": snapshot["name"],
+                "recipeIngredient": snapshot["ingredients"],
+                "recipeInstructions": snapshot["instructions"],
+                "recipeYield": snapshot.get("yield_text", ""),
+                "description": snapshot.get("description", ""),
+            }
+            inspection = restarted.reconcile_existing(candidate_id, "existing-slug", intent["attempt_id"])
+            linked = restarted.reconcile_existing(
+                candidate_id, "existing-slug", intent["attempt_id"], reviewer_confirmed=True,
+                evidence="Compared the selected Mealie recipe with the stored approved snapshot.",
+                observed_recipe_digest=inspection["comparison_digest"],
+            )
+            repeated = ImportService(output, source_root=Path(source_root), client=client).reconcile_existing(
+                candidate_id, "existing-slug", intent["attempt_id"], reviewer_confirmed=True,
+                evidence="Repeated durable reconciliation.",
+                observed_recipe_digest=inspection["comparison_digest"],
+            )
+            final_history = next(item for item in restarted.history()
+                                 if item.get("candidate_id") == candidate_id)
+
+        self.assertEqual(inspection["creation_status"], "confirmation_required")
+        self.assertEqual(inspection["attempt_id"], intent["attempt_id"])
+        self.assertEqual(linked["creation_status"], "linked_existing")
+        self.assertEqual(repeated["creation_status"], "already_linked")
+        self.assertEqual(final_history["attempt_status"], "reconciled")
+        self.assertEqual(history.get("attempt_id"), intent["attempt_id"])
+        self.assertEqual(history.get("attempt_status"), "orphaned")
+        self.assertEqual(absent["creation_status"], "not_proven_absent")
+        self.assertEqual(retry_blocked[0]["creation_status"], "uncertain")
+        self.assertEqual(len(client.created), 0)
+        self.assertEqual(len(create_calls), 1)
 
     def test_reconciliation_fails_closed_on_missing_attempt_or_mismatched_returned_slug(self):
         with tempfile.TemporaryDirectory() as tmp:
