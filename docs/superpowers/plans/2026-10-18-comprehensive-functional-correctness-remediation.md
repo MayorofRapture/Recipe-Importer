@@ -107,7 +107,7 @@
 
 - [x] Complete owned synthetic journey covering batch upload, extraction retry, saved review/approval, fake import and tag recovery, and uncertain-create reconciliation with evidence. Existing focused service fault-injection tests cover interrupted mapping recovery.
 - [x] Run focused tests, full unittest suite (438 tests, 1 capability skip), AppTest/browser flow, Node fixture tests (9/9), compile, CLI help, `pip check`, and `git diff --check`.
-- [ ] Run a clean-checkout suite and GitHub Actions for the pushed commit; report no live-service verification unless explicitly performed.
+- [x] Run a clean-checkout suite and GitHub Actions for the pushed commit; both offline workflows succeeded. No live-service verification was performed.
 - [x] Recheck production ledger hashes and missing-file state; all three protected ledger hashes match baseline and `ui_import_events.jsonl` remains absent.
 - [ ] Commit each coherent functional correction and push the existing feature branch without rewriting history or merging PR #3.
 
@@ -115,6 +115,7 @@
 
 - Full local suite: `python -m unittest discover -s tests` — 438 passed, 1 skipped.
 - Browser: owned Chromium fixture journey completed upload, extraction, review save/approval, preview, and fake Mealie import. Viewport had no horizontal overflow; this is rendered-flow evidence, not a complete WCAG/keyboard audit.
+- Clean checkout: `d1af899` — 438 tests, 1 skipped. GitHub Actions push and PR offline verification workflows both succeeded for `d1af899`.
 - Static/runtime checks: targeted `compileall`, CLI `--help`, Node syntax checks, browser fixture tests, `pip check`, and `git diff --check` passed.
 - Live Mealie/Gemini behavior remains unverified. Empty-instruction compatibility is blocked on installed-version evidence and explicit disposable-recipe verification. Whole-book page-range extraction remains deferred; current 50 MiB/100-page safety rejection is verified.
 - Protected hashes: `review_events.jsonl` `66051F241A789080620D5C9FC7333ED5D795E5C0329527379BCE4851B865905B`; `import_state.jsonl` `007EC3FC6868585C01D7904E07E33B7B3279B99C402A95E7998172633708C93F`; `ui_drafts.jsonl` `4A99B9CF71903D5A3518DDB7EBF42A2AC7396103777A0C26DA2976638880FB7C`.
