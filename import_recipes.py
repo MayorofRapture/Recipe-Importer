@@ -1283,6 +1283,37 @@ def preflight_mealie(mealie_url: str, token: str) -> None:
         raise RuntimeError(f"Mealie preflight failed at {url}: {exc}") from exc
 
 
+def repair_import_tags(work: Path, batch_tag: str, client) -> list[dict]:
+    """Repair only imported identities for one explicitly selected batch tag."""
+    from ui_import_service import ImportService
+
+    tag = str(batch_tag or "").strip()
+    if not tag:
+        raise ValueError("--repair-failed-tags requires --batch-tag")
+    state = StateStore(Path(work) / "import_state.jsonl")
+    recoverable = []
+    for key, record in state.records.items():
+        identity = str(record.get("identity") or record.get("key") or key).strip()
+        existing_tag = str(record.get("batch_tag") or record.get("tag_name") or "").strip()
+        status = str(record.get("tag_status", "")).casefold()
+        slug = str(record.get("slug", "")).strip()
+        if (identity and slug and str(record.get("status", "")).upper() == "IMPORTED"
+                and existing_tag == tag and status in {"pending", "failed", "unknown"}):
+            recoverable.append((identity, record))
+    service = ImportService(Path(work), client=client)
+    rows = []
+    for identity, record in recoverable:
+        result = service.repair_tag(identity, expected_tag=tag)
+        rows.append({
+            "candidate_id": identity,
+            "title": str(record.get("title", "")),
+            "slug": str(result.get("slug") or record.get("slug", "")),
+            "tag_status": str(result.get("tag_status", result.get("creation_status", "failed"))),
+            "note": str(result.get("tag_reason") or result.get("reason", ""))[:500],
+        })
+    return rows
+
+
 def main() -> int:
     load_dotenv()
     parser = argparse.ArgumentParser(description="Batch import PDF/JPG recipes into Mealie")
@@ -1295,8 +1326,8 @@ def main() -> int:
                               help="Explicitly allow legacy imports without saved review approval")
     import_modes.add_argument("--import-approved", action="store_true",
                               help="Import only exact revisions with current explicit review approval")
-    parser.add_argument("--repair-failed-tags", action="store_true",
-                        help="Explicitly retry only previously imported recipes with a failed matching batch tag")
+    parser.add_argument("--repair-failed-tags", "--repair-tags", dest="repair_failed_tags", action="store_true",
+                        help="Explicitly repair pending, failed, or unknown tags for prior imports of --batch-tag")
     parser.add_argument("--ocr-only", action="store_true",
                         help="Use local OCR only; do not initialize Gemini or connect to Mealie")
     parser.add_argument("--ocr-structure", action="store_true",
@@ -1337,6 +1368,9 @@ def main() -> int:
         parser.error("--repair-failed-tags is a separate operation; do not combine it with recipe import modes")
     if args.repair_failed_tags and not args.batch_tag:
         parser.error("--repair-failed-tags requires --batch-tag")
+    if args.repair_failed_tags and (args.review_id or args.review_suggestion or args.review_status
+                                    or args.review_value or args.backfill_tag or args.backfill_slugs):
+        parser.error("--repair-failed-tags cannot be combined with review or backfill operations")
     if args.ocr_only and args.ocr_structure:
         parser.error("--ocr-only and --ocr-structure are mutually exclusive")
     if args.ocr_only:
@@ -1396,6 +1430,30 @@ def main() -> int:
         return _run_ocr_structure(
             source, work, config, router, limit=args.limit, workers=args.workers,
             force_extract=args.force_extract)
+    if args.repair_failed_tags:
+        if not token or not url:
+            parser.error("--repair-failed-tags requires MEALIE_TOKEN and MEALIE_URL")
+        try:
+            preflight_mealie(url, token)
+            client = MealieClient(url, token)
+            rows = repair_import_tags(work, args.batch_tag, client)
+        except (OSError, RuntimeError, ValueError) as exc:
+            parser.error(f"Tag repair could not start: {exc}")
+        if not rows:
+            print(f"No eligible imported recipes have a recoverable tag for {args.batch_tag!r}.", file=sys.stderr)
+            return 1
+        report = work / "last_run_report.csv"
+        fields = ["candidate_id", "title", "slug", "tag_status", "note"]
+        with report.open("w", encoding="utf-8-sig", newline="") as fh:
+            writer = csv.DictWriter(fh, fieldnames=fields, extrasaction="ignore")
+            writer.writeheader()
+            writer.writerows(rows)
+        counts: dict[str, int] = {}
+        for row in rows:
+            counts[row["tag_status"]] = counts.get(row["tag_status"], 0) + 1
+        print("Tag repair summary:", counts)
+        print(f"Report: {report}")
+        return 1 if any(row["tag_status"] not in {"tagged", "already_tagged"} for row in rows) else 0
     if args.review_id:
         if not args.review_status:
             parser.error("--review-id requires --review-status")
