@@ -74,6 +74,156 @@ def _approved_fried_rice(root: Path) -> tuple[Path, str, str]:
 
 
 class UiImportServiceTests(unittest.TestCase):
+    def test_reconciliation_comparison_covers_jsonld_fields_and_embedded_notes(self):
+        candidate = RecipeCandidate(
+            name="Toast", ingredients=["2 slices bread"], instructions=["Toast until golden."],
+            yield_text="1 serving", description="Use sturdy bread.", notes=["Butter is optional."],
+        )
+        provider = schema_recipe(candidate)
+        provider.update({"id": "toast-id", "slug": "toast"})
+        comparison = ImportService._compare_reconciliation_recipe(
+            candidate.model_dump(mode="json"), provider,
+        )
+
+        self.assertEqual(comparison["differences"], [])
+        self.assertEqual(comparison["material_differences"], [])
+        self.assertEqual(comparison["local"]["yield_text"], "1 serving")
+        self.assertEqual(comparison["mealie"]["yield_text"], "1 serving")
+        self.assertIn("Recipe note: Butter is optional.", comparison["mealie"]["description"])
+        self.assertEqual(comparison["local"]["notes"], ["Butter is optional."])
+        self.assertEqual(comparison["unavailable_fields"], ["notes"])
+        self.assertFalse(comparison["complete_evidence"])
+
+    def test_reconciliation_comparison_marks_yield_description_and_notes_differences(self):
+        candidate = RecipeCandidate(
+            name="Soup", ingredients=["beans"], instructions=["Simmer."],
+            yield_text="4 servings", description="With herbs.", notes=["Salt to taste."],
+        )
+        provider = schema_recipe(candidate)
+        provider["recipeYield"] = "6 servings"
+        provider["description"] = "With different herbs.\n\nRecipe note: Add pepper."
+        provider["notes"] = ["Add pepper."]
+        comparison = ImportService._compare_reconciliation_recipe(
+            candidate.model_dump(mode="json"), provider,
+        )
+
+        self.assertEqual(set(comparison["differences"]), {"yield_text", "description", "notes"})
+        self.assertEqual(set(comparison["material_differences"]), {"yield_text", "description", "notes"})
+        self.assertEqual(comparison["unavailable_fields"], [])
+
+    def test_reconciliation_comparison_ignores_formatting_only_differences(self):
+        candidate = RecipeCandidate(
+            name="Bean Soup", ingredients=["2 cups beans"], instructions=["Simmer gently."],
+            yield_text="4 servings", description="Serve warm.", notes=["Add salt to taste."],
+        )
+        provider = schema_recipe(candidate)
+        provider.update({
+            "name": "  BEAN   SOUP ", "recipeIngredient": [" 2 CUPS beans "],
+            "recipeInstructions": [{"@type": "HowToStep", "text": " simmer gently.  "}],
+            "recipeYield": " 4   servings ",
+            "description": " serve warm.  Recipe note:   add salt to taste. ",
+            "notes": [" ADD SALT TO TASTE. "],
+        })
+
+        comparison = ImportService._compare_reconciliation_recipe(
+            candidate.model_dump(mode="json"), provider,
+        )
+
+        self.assertEqual(comparison["differences"], [])
+        self.assertFalse(comparison["unavailable_fields"])
+        self.assertTrue(comparison["is_match"])
+
+    def test_reconciliation_comparison_does_not_claim_match_when_provider_fields_are_absent(self):
+        candidate = RecipeCandidate(
+            name="Toast", ingredients=["bread"], instructions=["Toast."],
+            yield_text="2 servings", description="Serve warm.", notes=["Add jam."],
+        )
+        provider = {"id": "toast-id", "slug": "toast", "name": "Toast",
+                    "recipeIngredient": ["bread"], "recipeInstructions": ["Toast."]}
+        comparison = ImportService._compare_reconciliation_recipe(
+            candidate.model_dump(mode="json"), provider,
+        )
+
+        self.assertEqual(set(comparison["unavailable_fields"]), {"yield_text", "description", "notes"})
+        self.assertFalse(comparison["complete_evidence"])
+        self.assertFalse(comparison["is_match"])
+
+    def test_reconciliation_digest_binds_yield_description_notes_and_evidence_version(self):
+        base = {"id": "id", "slug": "slug", "name": "Recipe",
+                "recipeIngredient": ["1 cup flour"], "recipeInstructions": ["Mix."],
+                "recipeYield": "4", "description": "Simple."}
+        changed = dict(base, recipeYield="6")
+
+        self.assertNotEqual(ImportService._reconciliation_digest(base),
+                            ImportService._reconciliation_digest(changed))
+
+    def test_reconciliation_rejects_changed_provider_evidence_after_inspection(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output, source_root, candidate_id = _approved_fried_rice(Path(tmp))
+            response = {"id": "same-recipe-id", "slug": "existing-rice", "name": "Fried Rice",
+                        "recipeIngredient": ["3 cups cooked rice", "1 egg"],
+                        "recipeInstructions": [{"text": "Cook rice."}, {"text": "Fold in egg."}],
+                        "recipeYield": "4 servings", "description": "Weeknight fried rice.",
+                        "notes": []}
+            client = FakeMealie(create_error=TimeoutError("synthetic timeout"))
+            client.get_recipe = lambda _slug: dict(response)
+            service = ImportService(output, source_root=Path(source_root), client=client)
+            plan = service.preview([candidate_id])
+            service.dispatch(plan["plan_id"])
+            attempt_id = next(item["attempt_id"] for item in service._read_events()
+                              if item.get("event") == "intent_started")
+            inspected = service.reconcile_existing(candidate_id, "existing-rice", attempt_id)
+            response["recipeYield"] = "6 servings"
+            rejected = service.reconcile_existing(
+                candidate_id, "existing-rice", attempt_id, reviewer_confirmed=True,
+                evidence="Compared this specific recipe and acknowledged changed provider content.",
+                material_difference_ack=True, unavailable_field_ack=True,
+                observed_recipe_digest=inspected["comparison_digest"],
+            )
+            reconciled = [item for item in service._read_events()
+                          if item.get("event") == "reconciled_existing"]
+
+        self.assertEqual(rejected["creation_status"], "not_verified")
+        self.assertIn("changed after it was displayed", rejected["reason"])
+        self.assertEqual(reconciled, [])
+
+    def test_reconciliation_feedback_survives_restart_and_dismissal_is_durable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output, source_root, candidate_id = _approved_fried_rice(Path(tmp))
+            client = FakeMealie(create_error=TimeoutError("synthetic timeout"))
+            service = ImportService(output, source_root=Path(source_root), client=client)
+            plan = service.preview([candidate_id])
+            service.dispatch(plan["plan_id"])
+            service.begin_reconciliation_action(
+                candidate_id=candidate_id, action_id="ui-action-stable-id",
+                action="Inspect existing Mealie recipe",
+            )
+            in_progress = next(item for item in ImportService(
+                output, source_root=Path(source_root), client=client,
+            ).history() if item.get("candidate_id") == candidate_id)
+            service.record_reconciliation_feedback(
+                candidate_id=candidate_id, action_id="ui-action-stable-id",
+                action="Inspect existing Mealie recipe", result_status="not_verified",
+                reason="The selected recipe could not be verified.",
+                next_step="Keep this recipe protected and inspect the Mealie identity.",
+                protection_active=True,
+            )
+            restarted = ImportService(output, source_root=Path(source_root), client=client)
+            history = next(item for item in restarted.history()
+                           if item.get("candidate_id") == candidate_id)
+            restarted.dismiss_reconciliation_feedback(candidate_id, "ui-action-stable-id")
+            after_dismiss = next(item for item in ImportService(
+                output, source_root=Path(source_root), client=client,
+            ).history() if item.get("candidate_id") == candidate_id)
+
+        self.assertEqual(history["creation_status"], "uncertain")
+        self.assertEqual(in_progress["reconciliation_feedback"]["result_status"], "in_progress")
+        self.assertEqual(history["reconciliation_feedback"]["action_id"], "ui-action-stable-id")
+        self.assertEqual(history["reconciliation_feedback"]["result_status"], "not_verified")
+        self.assertTrue(history["reconciliation_feedback"]["protection_active"])
+        self.assertIn("keep this recipe protected", history["reconciliation_feedback"]["next_step"].casefold())
+        self.assertNotIn("reconciliation_feedback", after_dismiss)
+
     def _linked_extraction_pair(self, root: Path) -> tuple[Path, Path, str, str, Path, str, object, object]:
         fixture = write_ui_fixture(root)
         output, source = Path(fixture["output"]), Path(fixture["source"])
@@ -525,17 +675,20 @@ print(json.dumps(ImportService(Path(sys.argv[1]), source_root=Path(sys.argv[2]),
             client.get_recipe = lambda slug: {"id": "valid-id", "slug": slug, "name": "Fried Rice"}
             inspected = service.reconcile_existing(candidate_id, "existing-slug", intent["attempt_id"])
             self.assertEqual(inspected["creation_status"], "confirmation_required", inspected.get("reason"))
-            self.assertTrue(inspected["comparison"]["material_differences"])
+            self.assertIn("ingredients", inspected["comparison"]["unavailable_fields"])
+            self.assertFalse(inspected["comparison"]["is_match"])
             blocked = service.reconcile_existing(
                 candidate_id, "existing-slug", intent["attempt_id"], reviewer_confirmed=True,
                 evidence="The title appears familiar.", observed_recipe_digest=inspected["comparison_digest"])
             found = service.reconcile_existing(
                 candidate_id, "existing-slug", intent["attempt_id"], reviewer_confirmed=True,
                 evidence="Compared the returned ingredients and steps with the approved review revision.",
-                material_difference_ack=True, observed_recipe_digest=inspected["comparison_digest"])
+                material_difference_ack=True, unavailable_field_ack=True,
+                observed_recipe_digest=inspected["comparison_digest"])
             repeated = service.reconcile_existing(
                 candidate_id, "existing-slug", intent["attempt_id"], reviewer_confirmed=True,
                 evidence="Repeat confirmation.", material_difference_ack=True,
+                unavailable_field_ack=True,
                 observed_recipe_digest=inspected["comparison_digest"])
             second_dispatch = service.dispatch(plan["plan_id"])
             events = [json.loads(line) for line in (output / "ui_import_events.jsonl").read_text(encoding="utf-8").splitlines()]
@@ -589,11 +742,13 @@ print(json.dumps(ImportService(Path(sys.argv[1]), source_root=Path(sys.argv[2]),
             linked = restarted.reconcile_existing(
                 candidate_id, "existing-slug", intent["attempt_id"], reviewer_confirmed=True,
                 evidence="Compared the selected Mealie recipe with the stored approved snapshot.",
+                unavailable_field_ack=True,
                 observed_recipe_digest=inspection["comparison_digest"],
             )
             repeated = ImportService(output, source_root=Path(source_root), client=client).reconcile_existing(
                 candidate_id, "existing-slug", intent["attempt_id"], reviewer_confirmed=True,
                 evidence="Repeated durable reconciliation.",
+                unavailable_field_ack=True,
                 observed_recipe_digest=inspection["comparison_digest"],
             )
             final_history = next(item for item in restarted.history()

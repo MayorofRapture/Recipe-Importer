@@ -176,6 +176,20 @@ async function waitForReviewRevision(fixture, candidateId, expectedRevision, tim
   }
   throw new Error(`Saved review revision did not settle; candidateId=${candidateId}, expected=${expectedRevision}, actual=${actualRevision}.`);
 }
+async function waitForReviewResolution(fixture, { candidateId, issueId, disposition }, timeout = 30000) {
+  const path = join(fixture.output, 'review_events.jsonl');
+  const deadline = Date.now() + timeout;
+  while (Date.now() < deadline) {
+    const events = (await readFile(path, 'utf8')).split(/\r?\n/).filter(Boolean)
+      .map((line) => JSON.parse(line));
+    const event = events.findLast((item) => item.event === 'review_issue_resolution'
+      && item.candidate_id === candidateId && item.issue_id === issueId
+      && item.disposition === disposition);
+    if (event?.target_id) return event;
+    await sleep(100);
+  }
+  throw new Error(`Review resolution did not persist; candidateId=${candidateId}, issueId=${issueId}, disposition=${disposition}.`);
+}
 async function clickVisibleText(cdp, text, selector = 'button,a,[role="button"]') {
   const point = await evaluate(cdp, `(() => {
     const value=${JSON.stringify(text)};
@@ -373,6 +387,9 @@ try {
   await assertActiveCandidate(cdp, fixture, candidate, { revision: 2 });
   await clickProposalAction(cdp, '12 bars', 'Accept inferred suggestion');
   await waitForReviewRevision(fixture, cranberryId, 3);
+  await waitForReviewResolution(fixture, {
+    candidateId: cranberryId, issueId: 'cranberry-yield', disposition: 'accepted',
+  });
   const yieldEvent = await assertReviewEvent(fixture, {
     candidateId: cranberryId, issueId: 'cranberry-yield', disposition: 'accepted',
   });

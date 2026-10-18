@@ -47,6 +47,26 @@ def _recipe_content_fingerprint(candidate: RecipeCandidate) -> str:
     }).encode("utf-8")).hexdigest()
 
 
+def _mapped_target_bindings(base_bindings: list[dict], source_bindings: list[dict],
+                            sections: list[str]) -> list[dict]:
+    """Apply one section replacement to revision bindings and retain immutable field targets."""
+    result = [item for item in base_bindings
+              if not (item.get("field") in sections
+                      or item.get("field_path_at_extraction", "").split("[", 1)[0] in sections)]
+    for source_target in source_bindings:
+        if source_target.get("target_kind") != "field":
+            continue
+        matches = [item for item in result
+                   if item.get("target_id") == source_target.get("target_id")]
+        if matches and any(item.get("field") != source_target.get("field") for item in matches):
+            raise ReconciliationError("The mapping conflicts with immutable source field bindings.")
+        if not matches:
+            result.append({key: source_target[key] for key in (
+                "target_id", "target_kind", "field", "original_value",
+            )})
+    return result
+
+
 class RetryService:
     """R5 retry boundary; attempt artifacts never enter the active extraction cache."""
 
@@ -303,11 +323,16 @@ class RetryService:
         recipe = RecipeCandidate.model_validate(target.candidate.model_dump(mode="json"))
         for field in selected:
             setattr(recipe, field, getattr(new_recipe, field))
-        base_bindings = list(target.revision_target_bindings or target.target_bindings)
-        bindings = [item for item in base_bindings
-                    if not (item.get("field") in selected
-                            or (item.get("field_path_at_extraction", "").split("[", 1)[0] in selected))]
         reviews = ReviewStore(self.review_path)
+        registration = next((item for item in reviews.registrations.get(target.candidate_id, [])
+                             if item.get("source_hash") == target.source_hash
+                             and item.get("extraction_id") == target.extraction_id), None)
+        if not registration:
+            raise ReconciliationError("The target source registration is unavailable; mapping is blocked.")
+        base_bindings = list(target.revision_target_bindings or target.target_bindings)
+        bindings = _mapped_target_bindings(
+            base_bindings, list(registration.get("target_bindings", [])), selected,
+        )
         try:
             revision_event = reviews.save_revision(
                 candidate_id=target.candidate_id, source_hash=target.source_hash,
@@ -371,20 +396,9 @@ class RetryService:
         for field in sections:
             setattr(expected_recipe, field, getattr(retry_recipe, field))
         expected_recipe_payload = expected_recipe.model_dump(mode="json")
-        expected_bindings = [item for item in base_bindings
-                             if not (item.get("field") in sections
-                                     or item.get("field_path_at_extraction", "").split("[", 1)[0] in sections)]
-        for source_target in registration.get("target_bindings", []):
-            if source_target.get("target_kind") != "field":
-                continue
-            matches = [item for item in expected_bindings
-                       if item.get("target_id") == source_target.get("target_id")]
-            if matches and any(item.get("field") != source_target.get("field") for item in matches):
-                raise ReconciliationError("The partial mapping conflicts with immutable source field bindings.")
-            if not matches:
-                expected_bindings.append({key: source_target[key] for key in (
-                    "target_id", "target_kind", "field", "original_value",
-                )})
+        expected_bindings = _mapped_target_bindings(
+            base_bindings, list(registration.get("target_bindings", [])), sections,
+        )
         if (written.get("recipe") != expected_recipe_payload
                 or written.get("target_bindings") != expected_bindings):
             raise ReconciliationError("The saved mapping revision does not match the requested retry sections.")

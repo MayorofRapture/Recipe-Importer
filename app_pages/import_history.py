@@ -1,5 +1,6 @@
 """Selected exact-revision imports and independent durable history."""
 import math
+import uuid
 import streamlit as st
 
 from app_pages.common import catalog, paths
@@ -16,6 +17,31 @@ def connected_service():
 
 def failure(action, error):
     st.error(f"{action} could not finish. Your history is preserved. Check configuration and local records before retrying. ({type(error).__name__})")
+
+
+def _reconciliation_next_step(status: str) -> str:
+    return {
+        "confirmation_required": "Compare every available field, record evidence, and acknowledge any differences or unavailable fields.",
+        "linked_existing": "No retry is needed; this Mealie recipe is durably linked to the protected attempt.",
+        "already_linked": "No retry is needed; the existing Mealie recipe is already linked.",
+        "not_proven_absent": "Keep the recipe protected. Check Mealie directly; a lookup miss does not authorize retry.",
+    }.get(status, "Keep the recipe protected. Check the local history and Mealie identity before taking another action.")
+
+
+def _persist_reconciliation_result(service, result: dict, *, candidate_id: str,
+                                   action_id: str, action: str, attempt_id: str,
+                                   slug: str) -> dict:
+    status = str(result.get("creation_status", "not_verified"))
+    reason = str(result.get("reason", ""))
+    service.record_reconciliation_feedback(
+        candidate_id=candidate_id, action_id=action_id, action=action,
+        result_status=status, reason=reason, attempt_id=attempt_id, slug=slug,
+        next_step=_reconciliation_next_step(status), protection_active=True,
+    )
+    # The UI action owns these values even when a service error omits its identifiers.
+    result.update({"candidate_id": candidate_id, "action_id": action_id,
+                   "attempt_id": attempt_id, "slug": slug})
+    return result
 
 
 st.title("Import & history")
@@ -153,6 +179,23 @@ else:
                 if st.button("Dismiss recovery result", key=f"dismiss_tag_result:{identity}"):
                     st.session_state.pop(repair_result_key, None)
                     st.rerun()
+            reconciliation_feedback = item.get("reconciliation_feedback")
+            if reconciliation_feedback:
+                st.markdown("**Latest recovery action**")
+                st.write(
+                    f"{reconciliation_feedback.get('action') or 'Reconciliation'} Â· "
+                    f"{reconciliation_feedback.get('result_status', '').replace('_', ' ').title()}"
+                )
+                if reconciliation_feedback.get("reason"):
+                    st.caption(reconciliation_feedback["reason"])
+                st.caption("Import protection remains active." if reconciliation_feedback.get("protection_active")
+                           else "Import protection is not active.")
+                if reconciliation_feedback.get("next_step"):
+                    st.write("Next step: " + reconciliation_feedback["next_step"])
+                feedback_action_id = str(reconciliation_feedback.get("action_id", ""))
+                if st.button("Dismiss recovery result", key=f"dismiss_reconcile_feedback:{feedback_action_id}"):
+                    service.dismiss_reconciliation_feedback(identity, feedback_action_id)
+                    st.rerun()
             if uncertain:
                 if item.get("attempt_status") == "orphaned":
                     st.warning("The create intent was saved, but no result was recorded. Mealie may still have received the request; do not retry this recipe.")
@@ -169,11 +212,40 @@ else:
                 inspection_key = f"reconcile_inspection:{identity}"
                 if st.button("Inspect existing recipe", key=f"inspect_reconcile:{identity}",
                              disabled=not slug.strip()):
+                    action_id = uuid.uuid4().hex
+                    active_service = service
                     try:
-                        st.session_state[inspection_key] = connected_service().reconcile_existing(
+                        service.begin_reconciliation_action(
+                            candidate_id=identity, action_id=action_id,
+                            action="Inspect existing Mealie recipe",
+                            attempt_id=str(item.get("attempt_id", "")), slug=slug.strip(),
+                        )
+                        active_service = connected_service()
+                        result = active_service.reconcile_existing(
                             identity, slug.strip(), str(item.get("attempt_id", "")))
+                        st.session_state[inspection_key] = _persist_reconciliation_result(
+                            active_service, result, candidate_id=identity, action_id=action_id,
+                            action="Inspect existing Mealie recipe",
+                            attempt_id=str(item.get("attempt_id", "")), slug=slug.strip(),
+                        )
                     except Exception as error:
+                        failure_result = {
+                            "creation_status": "not_verified", "reason":
+                                "The selected recipe could not be verified. Local history and import protection remain in place.",
+                            "attempt_id": str(item.get("attempt_id", "")), "slug": slug.strip(),
+                        }
+                        try:
+                            st.session_state[inspection_key] = _persist_reconciliation_result(
+                                active_service, failure_result, candidate_id=identity,
+                                action_id=action_id, action="Inspect existing Mealie recipe",
+                                attempt_id=str(item.get("attempt_id", "")), slug=slug.strip(),
+                            )
+                        except Exception:
+                            st.session_state[inspection_key] = dict(
+                                failure_result, candidate_id=identity, action_id=action_id,
+                            )
                         failure("Reconciliation", error)
+                    st.rerun()
                 inspection = st.session_state.get(inspection_key)
                 if (inspection and inspection.get("attempt_id") == item.get("attempt_id")
                         and inspection.get("slug", slug.strip()) == slug.strip()):
@@ -188,6 +260,12 @@ else:
                             st.write(comparison["local"]["ingredients"] or ["No ingredients recorded"])
                             st.markdown("Instructions")
                             st.write(comparison["local"]["instructions"] or ["No instructions recorded"])
+                            st.markdown("Yield")
+                            st.write(comparison["local"]["yield_text"] or "No yield recorded")
+                            st.markdown("Description")
+                            st.write(comparison["local"]["description"] or "No description recorded")
+                            st.markdown("Notes")
+                            st.write(comparison["local"]["notes"] or ["No notes recorded"])
                         with right:
                             st.markdown("**Mealie recipe**")
                             st.write(comparison["mealie"]["title"] or "Untitled recipe")
@@ -195,10 +273,19 @@ else:
                             st.write(comparison["mealie"]["ingredients"] or ["No ingredients returned"])
                             st.markdown("Instructions")
                             st.write(comparison["mealie"]["instructions"] or ["No instructions returned"])
+                            st.markdown("Yield")
+                            st.write(comparison["mealie"]["yield_text"] or "No yield returned")
+                            st.markdown("Description")
+                            st.write(comparison["mealie"]["description"] or "No description returned")
+                            st.markdown("Notes")
+                            st.write(comparison["mealie"]["notes"] or ["No separate notes returned"])
                         if comparison["differences"]:
                             st.warning("Differences found: " + ", ".join(comparison["differences"]))
-                        else:
-                            st.info("The returned title, ingredients, and instructions match the approved recipe.")
+                        if comparison["unavailable_fields"]:
+                            st.warning("Mealie did not return these fields, so they could not be compared: "
+                                       + ", ".join(comparison["unavailable_fields"]))
+                        if comparison["is_match"]:
+                            st.info("All returned recipe fields match after formatting-only normalization.")
                         evidence = st.text_area(
                             "Evidence for linking this Mealie recipe to the uncertain import",
                             key=f"reconcile_evidence:{identity}:{item.get('attempt_id', '')}",
@@ -206,25 +293,56 @@ else:
                         material_ack = False
                         if comparison["material_differences"]:
                             material_ack = st.checkbox(
-                                "I reviewed the ingredient or instruction differences and still confirm this is the created recipe.",
+                                "I reviewed the recipe content differences and still confirm this is the created recipe.",
                                 key=f"reconcile_material_ack:{identity}:{item.get('attempt_id', '')}")
+                        unavailable_ack = False
+                        if comparison["unavailable_fields"]:
+                            unavailable_ack = st.checkbox(
+                                "I understand the listed fields were not returned by Mealie and cannot be compared.",
+                                key=f"reconcile_unavailable_ack:{identity}:{item.get('attempt_id', '')}")
                         if st.button("Confirm this existing recipe", key=f"confirm_reconcile:{identity}",
                                      disabled=not evidence.strip() or (
-                                         bool(comparison["material_differences"]) and not material_ack)):
+                                         bool(comparison["material_differences"]) and not material_ack) or (
+                                         bool(comparison["unavailable_fields"]) and not unavailable_ack)):
+                            action_id = uuid.uuid4().hex
+                            active_service = service
                             try:
-                                st.session_state[inspection_key] = connected_service().reconcile_existing(
+                                service.begin_reconciliation_action(
+                                    candidate_id=identity, action_id=action_id,
+                                    action="Confirm existing Mealie recipe",
+                                    attempt_id=str(item.get("attempt_id", "")), slug=slug.strip(),
+                                )
+                                active_service = connected_service()
+                                result = active_service.reconcile_existing(
                                     identity, slug.strip(), str(item.get("attempt_id", "")),
                                     reviewer_confirmed=True, evidence=evidence,
                                     material_difference_ack=material_ack,
+                                    unavailable_field_ack=unavailable_ack,
                                     observed_recipe_digest=inspection["comparison_digest"])
+                                st.session_state[inspection_key] = _persist_reconciliation_result(
+                                    active_service, result, candidate_id=identity,
+                                    action_id=action_id, action="Confirm existing Mealie recipe",
+                                    attempt_id=str(item.get("attempt_id", "")), slug=slug.strip(),
+                                )
                                 st.rerun()
                             except Exception as error:
-                                st.session_state[inspection_key] = {
+                                failure_result = {
                                     "creation_status": "not_verified", "attempt_id": item.get("attempt_id"),
                                     "slug": slug.strip(),
                                     "reason": f"{type(error).__name__}: check Mealie and local import history before retrying.",
                                 }
+                                try:
+                                    st.session_state[inspection_key] = _persist_reconciliation_result(
+                                        active_service, failure_result, candidate_id=identity,
+                                        action_id=action_id, action="Confirm existing Mealie recipe",
+                                        attempt_id=str(item.get("attempt_id", "")), slug=slug.strip(),
+                                    )
+                                except Exception:
+                                    st.session_state[inspection_key] = dict(
+                                        failure_result, candidate_id=identity, action_id=action_id,
+                                    )
                                 failure("Reconciliation", error)
+                                st.rerun()
                     elif inspection.get("creation_status") in {"linked_existing", "already_linked"}:
                         st.success(f"Existing recipe linked for this attempt: {inspection.get('slug', '')}")
                     else:

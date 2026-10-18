@@ -15,7 +15,7 @@ from import_protection import (
     ImportProtectionError, candidate_identity_group, protected_candidate_ids_from_records,
     protected_identity_groups, read_import_state,
 )
-from recipe_quality import RecipeCandidate, is_complete
+from recipe_quality import RecipeCandidate, is_complete, schema_recipe
 from review_store import ReviewConflict, ReviewStore, _recipe_digest, _state_lock
 from ui_data import RecipeView, load_catalog
 
@@ -512,6 +512,34 @@ class ImportService:
                     row["tag_status"] = "tagged"
                 elif kind == "tag_failed":
                     row["tag_status"] = "failed"
+                elif kind == "reconciliation_action_started":
+                    row["reconciliation_feedback"] = {
+                        "action_id": str(event.get("action_id", "")),
+                        "attempt_id": str(event.get("attempt_id", "")),
+                        "slug": str(event.get("slug", "")),
+                        "action": str(event.get("action", "")),
+                        "result_status": "in_progress",
+                        "reason": "The selected Mealie recipe is being checked.",
+                        "protection_active": True,
+                        "next_step": "Wait for the result; do not retry the protected recipe.",
+                        "created_at": str(event.get("created_at", "")),
+                    }
+                elif kind == "reconciliation_action_result":
+                    row["reconciliation_feedback"] = {
+                        "action_id": str(event.get("action_id", "")),
+                        "attempt_id": str(event.get("attempt_id", "")),
+                        "slug": str(event.get("slug", "")),
+                        "action": str(event.get("action", "")),
+                        "result_status": str(event.get("result_status", "")),
+                        "reason": str(event.get("reason", "")),
+                        "protection_active": bool(event.get("protection_active", True)),
+                        "next_step": str(event.get("next_step", "")),
+                        "created_at": str(event.get("created_at", "")),
+                    }
+                elif kind == "reconciliation_action_dismissed":
+                    feedback = row.get("reconciliation_feedback") or {}
+                    if feedback.get("action_id") == str(event.get("action_id", "")):
+                        row.pop("reconciliation_feedback", None)
                 if event.get("created_at"):
                     row["timestamp"] = str(event["created_at"])
                 if event.get("source_hash"):
@@ -541,9 +569,93 @@ class ImportService:
         return self._outcome(candidate_id, title, "tag_repair", tag_status=result["status"],
                              tag_reason=result.get("reason", ""), slug=slug)
 
+    def begin_reconciliation_action(self, *, candidate_id: str, action_id: str,
+                                    action: str, attempt_id: str = "", slug: str = "") -> dict:
+        candidate_id, action_id = str(candidate_id).strip(), str(action_id).strip()
+        if not candidate_id or not action_id:
+            raise ValueError("A candidate ID and stable action ID are required for recovery feedback.")
+        event = {
+            "event": "reconciliation_action_started", "schema_version": 1,
+            "event_id": str(uuid.uuid4()), "action_id": action_id,
+            "candidate_id": candidate_id, "attempt_id": str(attempt_id or ""),
+            "slug": str(slug or "")[:200], "action": str(action or "")[:80],
+            "created_at": _now(),
+        }
+        with _state_lock(self.review_path):
+            events = self._read_events()
+            prior = next((item for item in events
+                          if item.get("event") == "reconciliation_action_started"
+                          and item.get("action_id") == action_id), None)
+            if prior:
+                if any(prior.get(key) != event.get(key) for key in (
+                    "candidate_id", "attempt_id", "slug", "action",
+                )):
+                    raise ImportServiceError("The recovery action ID was reused for another request.")
+                return prior
+            self._append_locked(event)
+        return event
+
+    def record_reconciliation_feedback(self, *, candidate_id: str, action_id: str,
+                                       action: str, result_status: str, reason: str,
+                                       attempt_id: str = "", slug: str = "",
+                                       next_step: str = "", protection_active: bool = True) -> dict:
+        """Persist the latest local recovery action without changing import authority."""
+        candidate_id, action_id = str(candidate_id).strip(), str(action_id).strip()
+        if not candidate_id or not action_id:
+            raise ValueError("A candidate ID and stable action ID are required for recovery feedback.")
+        event = {
+            "event": "reconciliation_action_result", "schema_version": 1,
+            "event_id": str(uuid.uuid4()), "action_id": action_id,
+            "candidate_id": candidate_id, "attempt_id": str(attempt_id or ""),
+            "slug": str(slug or "")[:200], "action": str(action or "")[:80],
+            "result_status": str(result_status or "failed")[:80],
+            "reason": str(reason or "")[:500],
+            "protection_active": bool(protection_active),
+            "next_step": str(next_step or "")[:500], "created_at": _now(),
+        }
+        with _state_lock(self.review_path):
+            events = self._read_events()
+            started = next((item for item in events
+                            if item.get("event") == "reconciliation_action_started"
+                            and item.get("action_id") == action_id), None)
+            if not started or started.get("candidate_id") != candidate_id:
+                raise ImportServiceError("The recovery action was not durably started before its result.")
+            prior = next((item for item in reversed(events)
+                          if item.get("event") == "reconciliation_action_result"
+                          and item.get("action_id") == action_id), None)
+            if prior:
+                if any(prior.get(key) != event.get(key) for key in (
+                    "candidate_id", "attempt_id", "slug", "action", "result_status",
+                    "reason", "protection_active", "next_step",
+                )):
+                    raise ImportServiceError("The recovery action ID was reused with different result data.")
+                return prior
+            self._append_locked(event)
+        return event
+
+    def dismiss_reconciliation_feedback(self, candidate_id: str, action_id: str) -> None:
+        candidate_id, action_id = str(candidate_id), str(action_id)
+        with _state_lock(self.review_path):
+            events = self._read_events()
+            latest = next((item for item in reversed(events)
+                           if item.get("event") in {"reconciliation_action_result",
+                                                     "reconciliation_action_started"}
+                           and item.get("candidate_id") == candidate_id), None)
+            if not latest or latest.get("action_id") != action_id:
+                return
+            if any(item.get("event") == "reconciliation_action_dismissed"
+                   and item.get("action_id") == action_id for item in events):
+                return
+            self._append_locked({
+                "event": "reconciliation_action_dismissed", "schema_version": 1,
+                "event_id": str(uuid.uuid4()), "action_id": action_id,
+                "candidate_id": candidate_id, "created_at": _now(),
+            })
+
     def reconcile_existing(self, candidate_id: str, slug: str, attempt_id: str = "", *,
                            reviewer_confirmed: bool = False, evidence: str = "",
                            material_difference_ack: bool = False,
+                           unavailable_field_ack: bool = False,
                            observed_recipe_digest: str = "") -> dict:
         """Inspect one uncertain attempt, then link only after explicit evidence and comparison."""
         self._require_client()
@@ -603,7 +715,12 @@ class ImportService:
                                  comparison_digest=comparison_digest, slug=slug)
         if comparison["material_differences"] and not material_difference_ack:
             return self._outcome(candidate_id, projection["title"], "not_verified",
-                                 reason="Ingredient or instruction differences require explicit acknowledgment.",
+                                 reason="Recipe content differences require explicit acknowledgment.",
+                                 attempt_id=attempt_id, comparison=comparison,
+                                 comparison_digest=comparison_digest, slug=slug)
+        if comparison["unavailable_fields"] and not unavailable_field_ack:
+            return self._outcome(candidate_id, projection["title"], "not_verified",
+                                 reason="Mealie did not return every compared field; explicitly acknowledge the unavailable evidence.",
                                  attempt_id=attempt_id, comparison=comparison,
                                  comparison_digest=comparison_digest, slug=slug)
 
@@ -632,6 +749,7 @@ class ImportService:
                 "reviewer_confirmed": True,
                 "reviewer_evidence": str(evidence).strip()[:1000],
                 "material_difference_ack": bool(material_difference_ack),
+                "unavailable_field_ack": bool(unavailable_field_ack),
                 "created_at": _now(),
             })
         try:
@@ -972,28 +1090,71 @@ class ImportService:
 
     @classmethod
     def _compare_reconciliation_recipe(cls, local_recipe: dict, mealie_recipe: dict) -> dict:
+        local_schema = schema_recipe(RecipeCandidate.model_validate(local_recipe))
         local = {
-            "title": str(local_recipe.get("name", "")),
-            "ingredients": cls._string_items(local_recipe.get("ingredients", [])),
-            "instructions": cls._string_items(local_recipe.get("instructions", [])),
+            "title": str(local_schema.get("name", "")),
+            "ingredients": cls._string_items(local_schema.get("recipeIngredient", [])),
+            "instructions": cls._string_items(local_schema.get("recipeInstructions", [])),
+            "yield_text": cls._plain_text(local_schema.get("recipeYield", "")),
+            "description": cls._plain_text(local_schema.get("description", "")),
+            "notes": cls._string_items(local_recipe.get("notes", [])),
         }
+        provider_values = {
+            "title": mealie_recipe.get("name"),
+            "ingredients": mealie_recipe.get("recipeIngredient"),
+            "instructions": mealie_recipe.get("recipeInstructions"),
+            "yield_text": mealie_recipe.get("recipeYield"),
+            "description": mealie_recipe.get("description"),
+            "notes": mealie_recipe.get("notes"),
+        }
+        provider_keys = {
+            "title": "name", "ingredients": "recipeIngredient",
+            "instructions": "recipeInstructions", "yield_text": "recipeYield",
+            "description": "description", "notes": "notes",
+        }
+        unavailable = [field for field, key in provider_keys.items()
+                       if key not in mealie_recipe or mealie_recipe.get(key) is None]
         returned = {
-            "title": str(mealie_recipe.get("name", "")),
-            "ingredients": cls._string_items(mealie_recipe.get("recipeIngredient", [])),
-            "instructions": cls._string_items(mealie_recipe.get("recipeInstructions", [])),
+            "title": cls._plain_text(provider_values["title"]),
+            "ingredients": cls._string_items(provider_values["ingredients"]),
+            "instructions": cls._string_items(provider_values["instructions"]),
+            "yield_text": cls._plain_text(provider_values["yield_text"]),
+            "description": cls._plain_text(provider_values["description"]),
+            "notes": cls._string_items(provider_values["notes"]),
         }
         differences = []
-        if cls._normalize(local["title"]) != cls._normalize(returned["title"]):
-            differences.append("title")
-        if [cls._normalize(item) for item in local["ingredients"]] != [
-                cls._normalize(item) for item in returned["ingredients"]]:
-            differences.append("ingredients")
-        if [cls._normalize(item) for item in local["instructions"]] != [
-                cls._normalize(item) for item in returned["instructions"]]:
-            differences.append("instructions")
-        material = [item for item in differences if item in {"ingredients", "instructions"}]
+        for field in provider_keys:
+            if field in unavailable:
+                continue
+            left = local[field]
+            right = returned[field]
+            if isinstance(left, list):
+                matches = ([cls._normalize(item) for item in left]
+                           == [cls._normalize(item) for item in right])
+            else:
+                matches = cls._normalize(left) == cls._normalize(right)
+            if not matches:
+                differences.append(field)
+        material = list(differences)
         return {"local": local, "mealie": returned, "differences": differences,
-                "material_differences": material}
+                "material_differences": material, "unavailable_fields": unavailable,
+                "complete_evidence": not unavailable,
+                "is_match": not differences and not unavailable}
+
+    @staticmethod
+    def _plain_text(value: Any) -> str:
+        if isinstance(value, str):
+            return value.strip()
+        if isinstance(value, (int, float)):
+            return str(value)
+        if isinstance(value, dict):
+            for key in ("text", "value", "name"):
+                if value.get(key) is not None:
+                    return ImportService._plain_text(value[key])
+            return ""
+        if isinstance(value, list):
+            return " ".join(ImportService._plain_text(item) for item in value if item is not None).strip()
+        return ""
 
     @staticmethod
     def _string_items(value: Any) -> list[str]:
@@ -1016,11 +1177,19 @@ class ImportService:
     @classmethod
     def _reconciliation_digest(cls, mealie_recipe: dict) -> str:
         normalized = {
+            "evidence_version": 2,
             "id": str(mealie_recipe.get("id", "")),
             "slug": str(mealie_recipe.get("slug", "")),
             "name": str(mealie_recipe.get("name", "")),
             "ingredients": cls._string_items(mealie_recipe.get("recipeIngredient", [])),
             "instructions": cls._string_items(mealie_recipe.get("recipeInstructions", [])),
+            "recipeYield": cls._plain_text(mealie_recipe.get("recipeYield")),
+            "description": cls._plain_text(mealie_recipe.get("description")),
+            "notes": cls._string_items(mealie_recipe.get("notes", [])),
+            "available_fields": [key for key in (
+                "name", "recipeIngredient", "recipeInstructions", "recipeYield",
+                "description", "notes",
+            ) if key in mealie_recipe and mealie_recipe.get(key) is not None],
         }
         payload = json.dumps(normalized, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()

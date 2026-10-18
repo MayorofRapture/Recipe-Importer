@@ -19,6 +19,47 @@ APP_PATH = Path(__file__).resolve().parents[1] / "streamlit_app.py"
 
 
 class StreamlitImportHistoryTests(unittest.TestCase):
+    def test_reconciliation_error_without_service_identifiers_is_visible_and_durable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            fixture = write_ui_fixture(root)
+            output = Path(fixture["output"])
+            view = next(item for item in load_catalog(output, root / "sources")
+                        if item.candidate.name == "Fried Rice")
+            intent = {
+                "event": "intent_started", "event_id": "missing-result-intent",
+                "attempt_id": "missing-result-attempt", "candidate_id": view.candidate_id,
+                "source_hash": view.source_hash, "extraction_id": view.extraction_id,
+                "revision": 1, "content_sha256": "synthetic-content-digest",
+                "title": view.candidate.name, "source_path": str(fixture["source"]),
+                "batch_tag": "", "recipe_snapshot": view.candidate.model_dump(mode="json"),
+            }
+            with (output / "ui_import_events.jsonl").open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(intent) + "\n")
+
+            with patch.dict(os.environ, {"RECIPE_IMPORTER_OUTPUT_DIR": str(output),
+                                         "RECIPE_IMPORTER_SOURCE_DIR": str(root / "sources"),
+                                         "RECIPE_IMPORTER_FIXTURE_MODE": "1"}), \
+                 patch("app_pages.import_history.ImportService.reconcile_existing",
+                       return_value={"creation_status": "not_verified",
+                                     "reason": "Provider lookup failed."}):
+                app = AppTest.from_file(str(PAGE)).run(timeout=15)
+                app.text_input(key=f"slug:{view.candidate_id}").set_value("synthetic-existing").run(timeout=15)
+                next(button for button in app.button if button.label == "Inspect existing recipe").click().run(timeout=15)
+                self.assertFalse(app.exception)
+                self.assertTrue(any("Provider lookup failed." in item.value for item in app.caption),
+                                repr(app.caption))
+
+            events = [json.loads(line) for line in
+                      (output / "ui_import_events.jsonl").read_text(encoding="utf-8").splitlines()]
+            feedback = next(item for item in events
+                            if item.get("event") == "reconciliation_action_result")
+
+        self.assertEqual(feedback["attempt_id"], "missing-result-attempt")
+        self.assertEqual(feedback["result_status"], "not_verified")
+        self.assertTrue(feedback["protection_active"])
+        self.assertEqual(feedback["action"], "Inspect existing Mealie recipe")
+
     def test_orphaned_intent_ui_compares_before_explicit_confirmation(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -78,8 +119,11 @@ class StreamlitImportHistoryTests(unittest.TestCase):
                                 if item.label == "Evidence for linking this Mealie recipe to the uncertain import")
                 app.text_area(key=evidence.key).set_value("Compared the returned contents to the exact approved revision.").run(timeout=15)
                 ack = next(item for item in app.checkbox
-                           if item.label.startswith("I reviewed the ingredient or instruction differences"))
+                           if item.label.startswith("I reviewed the recipe content differences"))
                 app.checkbox(key=ack.key).check().run(timeout=15)
+                unavailable = next(item for item in app.checkbox
+                                   if item.label.startswith("I understand the listed fields were not returned"))
+                app.checkbox(key=unavailable.key).check().run(timeout=15)
                 next(button for button in app.button if button.label == "Confirm this existing recipe").click().run(timeout=15)
                 app.run(timeout=15)
                 self.assertFalse(app.exception)
@@ -92,6 +136,7 @@ class StreamlitImportHistoryTests(unittest.TestCase):
             self.assertEqual(linked["attempt_id"], attempt_id)
             self.assertTrue(linked["reviewer_confirmed"])
             self.assertTrue(linked["material_difference_ack"])
+            self.assertTrue(linked["unavailable_field_ack"])
 
     def test_tag_repair_outcome_survives_rerender_until_dismissed(self):
         with tempfile.TemporaryDirectory() as tmp:

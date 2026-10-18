@@ -87,7 +87,7 @@
 - [x] Add one resolver with precedence `--output-dir`, `RECIPE_IMPORTER_OUTPUT_DIR`, stable app-relative default; resolve absolute paths and use it in CLI and GUI.
 - [x] Display the active path in CLI and GUI. Detect alternate existing CWD libraries and explain how to select them; never move, merge, or overwrite libraries.
 - [x] Test spaces, relative/absolute paths, CWD changes, explicit/env precedence, conflict detection, and fixture-mode isolation.
-- [ ] Run browser checks; AppTest/path tests passed. Commit Gate B now; Chromium acceptance remains in Gate E.
+- [x] Run synthetic Chromium review, approval, and import checks; captured six screenshots under `.test-tmp/browser-evidence/final-integrity`.
 
 ## Gate C: Reconciliation correctness
 
@@ -95,20 +95,20 @@
 
 **Files:** `reconciliation_service.py`, owning reconciliation tests.
 
-- [ ] Reproduce a saved selected-field mapping interrupted before lineage; include original field and row suggestions.
-- [ ] Factor one deterministic selected-section binding transformation used by both first write and recovery; do not loosen equality checks.
-- [ ] Cover restart, same/conflicting operation IDs, preexisting revision, revision/readback/lineage faults, concurrent retry, and unchanged proposal authority.
-- [ ] Run focused tests; commit Gate C1.
+- [x] Reproduce a saved selected-field mapping interrupted before lineage; include original field and row suggestions.
+- [x] Factor one deterministic selected-section binding transformation used by both first write and recovery; do not loosen equality checks.
+- [x] Cover restart, same/conflicting operation IDs, preexisting revision, revision/readback/lineage faults, concurrent retry, and unchanged proposal authority.
+- [x] Run focused tests; commit Gate C1.
 
 ### Task C2: Complete Mealie evidence comparison and confirmation
 
 **Files:** `ui_import_service.py`, `app_pages/import_history.py`, existing Mealie client adapter, import/AppTest tests.
 
-- [ ] Inspect actual normalized v3 payload/client response shape; add fixtures for yield, description, and notes availability.
-- [ ] Compare title, ingredients, instructions, yield, description, and available notes; distinguish formatting-only from material differences and mark unavailable fields explicitly.
-- [ ] Version the evidence digest and bind reviewer confirmation to the exact displayed Mealie recipe ID and evidence; changed evidence invalidates acknowledgment.
-- [ ] Cover wrong ID, unavailable fields, differences, external edits with rationale, reload/repeat, and unchanged no-duplicate protections.
-- [ ] Run focused tests; commit Gate C2.
+- [x] Inspect actual normalized v3 payload/client response shape; add fixtures for yield, description, and notes availability.
+- [x] Compare title, ingredients, instructions, yield, description, and available notes; distinguish formatting-only from material differences and mark unavailable fields explicitly.
+- [x] Version the evidence digest and bind reviewer confirmation to the exact displayed Mealie recipe ID and evidence; changed evidence invalidates acknowledgment.
+- [x] Cover wrong ID, unavailable fields, differences, external edits with rationale, reload/repeat, and unchanged no-duplicate protections.
+- [x] Run focused tests; commit Gate C2.
 
 ## Gate D: Recovery feedback
 
@@ -116,10 +116,10 @@
 
 **Files:** import-history action state/service result, `app_pages/import_history.py`, `tests/test_streamlit_import_history.py`.
 
-- [ ] Reproduce service failures without returned attempt/candidate IDs and confirm they disappear in UI.
-- [ ] Key each request by stable local action identity; persist success/failure/reason/protection/next-step feedback across rerenders until dismissed/replaced.
-- [ ] Cover malformed history, invalid slug, provider errors, revision/evidence mismatch, repeat confirmation, search/page change, app restart, and tag-repair feedback.
-- [ ] Run AppTest and owned browser recovery path; commit Gate D.
+- [x] Reproduce service failures without returned attempt/candidate IDs and confirm they disappear in UI.
+- [x] Key each request by stable local action identity; persist success/failure/reason/protection/next-step feedback across rerenders until dismissed/replaced.
+- [x] Cover malformed history, invalid slug, provider errors, revision/evidence mismatch, repeat confirmation, search/page change, app restart, and tag-repair feedback.
+- [x] Run AppTest and owned browser recovery path; commit Gate D.
 
 ## Gate E: Cross-interface acceptance and delivery
 

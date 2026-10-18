@@ -175,6 +175,7 @@ class FunctionalRemediationJourneyTests(unittest.TestCase):
                 view_by_name["Synthetic Chili"].candidate_id, chili_slug, attempt_id,
                 reviewer_confirmed=True,
                 evidence="Compared ingredients and instructions with the exact approved revision.",
+                unavailable_field_ack=True,
                 observed_recipe_digest=inspection["comparison_digest"],
             )
             self.assertEqual(linked["creation_status"], "linked_existing")

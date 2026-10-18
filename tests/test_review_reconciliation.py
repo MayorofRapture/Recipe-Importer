@@ -12,7 +12,7 @@ from review_store import (
     logical_recipe_identity,
 )
 import hashlib
-from reconciliation_service import RetryService, ReconciliationError
+from reconciliation_service import RetryService, ReconciliationError, _mapped_target_bindings
 from import_recipes import StateStore
 from import_protection import protected_candidate_ids
 from draft_store import DraftStore
@@ -421,6 +421,73 @@ class ReviewReconciliationTests(unittest.TestCase):
         self.assertEqual(len(revisions), 1)
         self.assertEqual(len(lineage), 1)
         self.assertEqual(lineage[0]["new_candidate_id"], new_id)
+
+    def test_mapping_recovery_reuses_exact_selected_field_binding_transform(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = write_ui_fixture(Path(tmp))
+            output = Path(fixture["output"])
+            target = next(view for view in load_catalog(output)
+                          if view.candidate.name == "Cranberry & Caramel Date Bars")
+            self.assertTrue(any(item.get("target_kind") == "field"
+                                for item in target.target_bindings))
+            reviews = ReviewStore(output / "review_events.jsonl")
+            reviews.save_revision(
+                candidate_id=target.candidate_id, source_hash=target.source_hash,
+                extraction_id=target.extraction_id, expected_parent=0,
+                operation_id="preexisting-empty-binding-revision",
+                recipe=target.candidate.model_dump(mode="json"), target_bindings=[],
+            )
+            target = next(view for view in load_catalog(output)
+                          if view.candidate_id == target.candidate_id)
+            self.assertTrue(any(item.get("target_kind") == "row" and item.get("field") == "instructions"
+                                for item in target.target_bindings), repr(target.target_bindings))
+            retry = RecipeCandidate(
+                name="Date Bars Updated", description="Mapped description", yield_text="18 bars",
+                ingredients=["dates", "cranberries"], instructions=["Mix and bake."],
+            )
+            service = RetryService(output, extractor=lambda *_: ExtractionBatch(recipes=[retry]))
+            attempt = service.start_attempt(str(fixture["digest"]), mode="local_ocr")
+            new_id = service.compare(attempt["attempt_id"])["new_candidates"][0]["candidate_id"]
+            operation_id = "recover-selected-field-mapping"
+            sections = ["yield_text", "description", "name"]
+
+            with patch.object(ReviewStore, "record_reconciliation",
+                              side_effect=OSError("fault after durable revision")):
+                with self.assertRaisesRegex(OSError, "durable revision"):
+                    service.apply_mapping(attempt["attempt_id"], new_id, target.candidate_id,
+                                          sections, 1, operation_id,
+                                          "The source was compared field by field.")
+            partial = next(view for view in load_catalog(output)
+                           if view.candidate_id == target.candidate_id)
+            self.assertEqual(partial.revision, 2)
+
+            result = service.apply_mapping(
+                attempt["attempt_id"], new_id, target.candidate_id, sections, 1,
+                operation_id, "The source was compared field by field.",
+            )
+            reviews = ReviewStore(output / "review_events.jsonl")
+            revisions = [item for item in reviews.revisions[target.candidate_id]
+                         if item.get("operation_id") == operation_id]
+            parent = next(item for item in reviews.revisions[target.candidate_id]
+                          if item.get("operation_id") == "preexisting-empty-binding-revision")
+            registration = next(item for item in reviews.registrations[target.candidate_id]
+                                if item.get("source_hash") == target.source_hash
+                                and item.get("extraction_id") == target.extraction_id)
+            expected_bindings = _mapped_target_bindings(
+                parent["target_bindings"], registration["target_bindings"], sections,
+            )
+            lineage = [item for item in reviews.events
+                       if item.get("event") == "candidate_reconciliation"
+                       and item.get("operation_id") == operation_id + ":lineage"]
+
+        self.assertEqual(result["revision"], 2)
+        self.assertTrue(result["recovered_partial_mapping"])
+        self.assertEqual(len(revisions), 1)
+        self.assertEqual(revisions[0]["target_bindings"], expected_bindings)
+        self.assertEqual(revisions[0]["recipe"]["name"], retry.name)
+        self.assertEqual(revisions[0]["recipe"]["yield_text"], retry.yield_text)
+        self.assertEqual(revisions[0]["recipe"]["description"], retry.description)
+        self.assertEqual(len(lineage), 1)
 
     def test_mapping_failure_before_first_write_leaves_no_effective_mapping(self):
         with tempfile.TemporaryDirectory() as tmp:
