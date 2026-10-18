@@ -29,6 +29,20 @@ def _pdf_bytes(pages: int = 1) -> bytes:
 
 
 class BatchStoreTests(unittest.TestCase):
+    def test_default_limits_reject_a_whole_cookbook_pdf_without_staging_it(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = BatchStore(Path(tmp) / "output")
+            batch = store.create("Whole cookbook safety boundary")
+            self.assertEqual(store.max_file_bytes, 50 * 1024 * 1024)
+            self.assertEqual(store.max_pdf_pages, 100)
+
+            rejected = store.stage(batch["batch_id"], "whole-book.pdf", _pdf_bytes(101))
+            reloaded = BatchStore(Path(tmp) / "output").get(batch["batch_id"])
+
+        self.assertEqual(rejected["status"], "rejected")
+        self.assertIn("100-page limit", rejected["reason"])
+        self.assertEqual(reloaded["sources"], [])
+
     def test_create_and_stage_supported_formats_with_durable_metadata(self):
         with tempfile.TemporaryDirectory() as tmp:
             output = Path(tmp) / "output"

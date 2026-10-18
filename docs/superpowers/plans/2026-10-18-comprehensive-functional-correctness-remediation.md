@@ -99,9 +99,9 @@
 
 **Files:** tests for mock Mealie response contract; `README.md` or a focused capability plan if findings require documentation.
 
-- [ ] Verify F8's current disabled gate and inspect only supplied version/configuration and existing API mocks. If installed behavior cannot be established read-only, keep the gate disabled and provide a disposable-recipe acceptance procedure; do not request a live write in this task.
-- [ ] Add version-targeted mock contract tests for empty `recipeInstructions`, response shape, rejection/default-step cases; label live compatibility blocked.
-- [ ] Assess F9's 50 MiB/100-page bounds and existing extraction/render pipeline. If page ranges require new lineage, identity, or overlap schema, do not force implementation; write a concrete remaining-capability design and test the current safe rejection.
+- [x] Verify F8's disabled gate and inspect supplied configuration/API mocks. The installed server version is absent, so the gate remains disabled and a disposable-recipe acceptance procedure is documented; no live write was attempted.
+- [x] Add adapter-level mocked contract coverage for empty `recipeInstructions` and rejection/retry safeguards. Exact installed-version storage/default-step behavior remains blocked and is documented as unverified.
+- [x] Assess F9's 50 MiB/100-page bounds and whole-document extraction/render pipeline. Page ranges require document/range identity and overlap lineage, so a concrete deferred design and 101-page safe-rejection test are recorded.
 
 ## Task 8: End-to-end verification and delivery
 
