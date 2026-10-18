@@ -6,9 +6,26 @@ from unittest.mock import patch
 
 from fixture_services import FixtureMealie
 from recipe_quality import RecipeCandidate
+from tests.ui_fixture_factory import write_ui_fixture
+from ui_data import load_catalog
 
 
 class FixtureServicesTests(unittest.TestCase):
+    def test_review_fixture_proposals_bind_to_independent_recipe_targets(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = write_ui_fixture(Path(tmp))
+            view = next(item for item in load_catalog(
+                Path(fixture["output"]), Path(fixture["source"]).parent)
+                if item.candidate.name == "Cranberry & Caramel Date Bars")
+            suggestions = {item.suggestion_id: item for item in view.candidate.suggestions}
+            bindings = {item["issue_id"]: item for item in view.target_bindings
+                        if "issue_id" in item}
+
+        self.assertEqual(suggestions["cranberry-quantity-alternative"].field_path, "ingredients[1]")
+        self.assertNotEqual(bindings["cranberry-quantity"]["source_target_id"],
+                            bindings["cranberry-quantity-alternative"]["source_target_id"])
+        self.assertEqual(bindings["cranberry-quantity-alternative"]["field"], "ingredients")
+
     def test_fake_service_requires_both_fixture_flag_and_marked_library(self):
         with tempfile.TemporaryDirectory() as tmp:
             with patch.dict(os.environ, {"RECIPE_IMPORTER_FIXTURE_MODE": "0"}):

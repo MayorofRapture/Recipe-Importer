@@ -4,7 +4,7 @@ Designed for **300+ files in one short session**. Each file usually contains one
 
 ## First-time setup (Windows PowerShell)
 
-1. Install Python 3.11+ if necessary. Unzip this folder anywhere on your Windows PC.
+1. Install Python 3.14 for the checked-in lock. The app also supports Python 3.11+ with the bounded `requirements.txt`; Node.js 24 is needed only to run browser test harnesses. Unzip this folder anywhere on your Windows PC.
 2. Put your PDFs/JPGs in a folder (`C:\Recipes_To_Import` in the example). Subfolders are fine; supported: PDF/JPG/JPEG/PNG/WEBP. The importer never moves or deletes your originals.
 3. Get your **Gemini API key** from https://aistudio.google.com/apikey . Check rate limits and billing in AI Studio; a paid API quota may be necessary to finish 300 requests in an hour.
 4. Create a **Mealie API token** in Mealie's profile/user settings. Your token must have permission to create recipes. Confirm you can open the `MEALIE_URL` from this PC.
@@ -13,15 +13,24 @@ Designed for **300+ files in one short session**. Each file usually contains one
 
 ```powershell
 py -3 -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\.venv\Scripts\python.exe -m pip install -r requirements-lock.txt
 .\.venv\Scripts\python.exe import_recipes.py --limit 5
 ```
+
+`requirements-lock.txt` pins the Python 3.14 environment observed in the
+verified development venv; optional `pytesseract` stays in
+`requirements-ocr.txt` and is constrained by this lock. To update the lock,
+install intended package changes from `requirements.txt`, run the offline suite
+on Windows, regenerate it from a core-only environment with
+`python -m pip freeze`, omit the optional `pytesseract` line, then review every
+version change. `requirements.txt` keeps broader compatible ranges for other
+supported Python versions. CI installs only the lock and never reads `.env`.
 
 Local OCR recovery is optional. Install its Python dependencies only when you
 want recovery after a Gemini `finish_reason=RECITATION` failure:
 
 ```powershell
-.\.venv\Scripts\python.exe -m pip install -r requirements-ocr.txt
+.\.venv\Scripts\python.exe -m pip install -r requirements-ocr.txt -c requirements-lock.txt
 # Install Tesseract for Windows, then configure its executable if it is not on PATH.
 $env:TESSERACT_CMD = 'C:\Program Files\Tesseract-OCR\tesseract.exe'
 ```
@@ -123,9 +132,18 @@ local and do not commit recipe scans, `.env`, or output records.
 Run the complete offline regression suite from PowerShell:
 
 ```powershell
-.\.venv\Scripts\python.exe -m unittest discover -v
-.\.venv\Scripts\python.exe -m compileall -q import_recipes.py local_ocr.py ocr_structuring.py
+.\.venv\Scripts\python.exe -m unittest discover -s tests -v
+.\.venv\Scripts\python.exe -m compileall -q -x '(^|[\\/])(\.git|\.venv|\.agents|\.test-tmp|output)([\\/]|$)' .
+.\.venv\Scripts\python.exe import_recipes.py --help
+node --check tools/browser_review_acceptance.mjs
+node --test tests/browser_fixture_runner.test.mjs
 ```
+
+The Windows GitHub Actions workflow runs these offline checks with fresh Python
+and Node environments, plus synthetic fixture setup. It needs no Gemini or
+Mealie credentials. The broad browser acceptance is run locally with
+`node tools/browser_review_acceptance.mjs`; it starts only its owned, attested
+synthetic Streamlit process and needs cached Playwright Chromium.
 
 To structure the saved/local OCR into reviewable recipe JSON, using deterministic
 Python parsing first and a text-only Gemini line-reference request only when the
@@ -261,7 +279,7 @@ Repair tags only for an explicitly listed set of existing Mealie slugs; add `--d
 - `output/ocr_text/`: raw local OCR text saved after a RECITATION failure. Review this text before approving or editing a recipe.
 - `output/extracted/<sha256>--ocr-structure--*.json`: versioned, reviewable OCR structure assembled from original OCR lines; prior versions are retained.
 
-If a file shows **NEEDS_MANUAL_CHECK**, inspect Mealie for that recipe before attempting another import. HTTP timeouts/5xx responses are ambiguous: the server might have created the recipe before the response failed. Such entries are intentionally not retried automatically. If you determine that an uncertain recipe really was not created, you can edit its `UNCERTAIN` record out of `output/import_state.jsonl` while the script is stopped, then rerun. Preserve a backup of the log first.
+If a file shows **NEEDS_MANUAL_CHECK**, inspect the recorded attempt and verify the recipe in Mealie before taking action. HTTP timeouts/5xx responses are ambiguous: the server might have created the recipe before the response failed, so the candidate remains protected from another create request. Use **Import & history** to record an explicit reconciliation when the result is known. If the outcome cannot be confirmed or the UI cannot safely reconcile it, leave the record protected and retain the log; never delete or rewrite `output/import_state.jsonl` to permit a retry. Contact the maintainer for a supported recovery path if needed.
 
 ### Important limitations
 
@@ -273,7 +291,7 @@ If a file shows **NEEDS_MANUAL_CHECK**, inspect Mealie for that recipe before at
 - API throughput depends on your Gemini project quotas (requests/minute, tokens/minute, requests/day), Mealie server load, source file sizes, and network access; the one-hour goal is **not guaranteed**.
 - Local Gemini scheduling coordinates configured global/per-model requests per minute and request/day across importer workers sharing this ledger. Its day boundary is UTC, it cannot see external project traffic, and it does not enforce tokens/minute because the router has no reliable request-token estimate; provider limits remain authoritative.
 - Gemini receives the PDF/image contents. Only upload materials you are authorized to process and comfortable sending to Google.
-- Do not edit extraction cache files while the importer is running. To correct a failed cached extraction, edit its JSON after stopping, or remove just its cached JSON to force re-extraction.
+- Do not edit or delete extraction cache files to force a retry. Correct recipe content through Review, or use the documented `--force-extract` operation to create a new extraction version while retaining earlier caches and review/import history.
 - Recipe import is best-effort against Mealie v3.22.x. If your Mealie configuration alters scraping behavior, test and troubleshoot before running all 300.
 
 ### Import mechanism

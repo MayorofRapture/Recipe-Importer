@@ -217,6 +217,7 @@ export async function startIsolatedBrowserFixture({ scenario = 'review', require
     fixture.sourceFile = manifest.source_file;
     fixture.manualCandidateId = manifest.manual_candidate_id;
     fixture.candidates = manifest.candidates;
+    fixture.candidateIds = manifest.candidate_ids;
     fixture.requiredCandidates = requiredCandidates;
     fixture.runId = runId;
     fixture.nonce = nonce;

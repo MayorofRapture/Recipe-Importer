@@ -145,11 +145,15 @@ def prepare(root: Path, scenario: str, run_id: str, nonce: str) -> dict:
         marker_candidates = ["Fried Rice"]
     if scenario == "p0":
         marker_candidates.append("Synthetic Manual Directions")
+    candidate_ids: dict[str, list[str]] = {}
+    for view in load_catalog(output, sources):
+        candidate_ids.setdefault(view.candidate.name, []).append(view.candidate_id)
     return {
         "root": str(root.resolve()), "output": str(output.resolve()),
         "sources": str(sources.resolve()), "valid_file": str(valid_file.resolve()),
         "invalid_file": str(invalid_file.resolve()), "source_file": str(fixture["source"]),
-        "candidates": marker_candidates, "manual_candidate_id": manual_candidate_id,
+        "candidates": marker_candidates, "candidate_ids": candidate_ids,
+        "manual_candidate_id": manual_candidate_id,
     }
 
 

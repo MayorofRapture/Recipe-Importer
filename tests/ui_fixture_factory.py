@@ -55,9 +55,9 @@ def write_ui_fixture(
             uncertainty="The quantity is cropped.",
         ), Suggestion(
             suggestion_id="cranberry-quantity-alternative",
-            field_path="ingredients[0]",
-            proposed_value="1/2 cup dates",
-            rationale="A second possible reading for comparison.",
+            field_path="ingredients[1]",
+            proposed_value="1 cup cranberries",
+            rationale="A separate synthetic ingredient edit for review isolation.",
             confidence="low",
             uncertainty="The quantity is cropped.",
         ), Suggestion(

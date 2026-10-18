@@ -160,6 +160,8 @@ def _apply_proposal(view, suggestion, disposition: str, final_value: str | None,
                 str(uuid.uuid4()) for _ in parsed.items
             ]
             _update_raw_section(buffer, field)
+        elif target_kind == "field" and field in {"name", "yield_text", "description"}:
+            buffer[field] = str(final_value or "")
         else:
             raise ValueError("The proposal has no exact ingredient or instruction target.")
     _resolve_suggestion(view, suggestion, disposition, final_value, buffer,
@@ -1691,7 +1693,7 @@ def _render_suggestions(view, buffer, field: str, row_id: str | None = None) -> 
         if path != field and not path.startswith(field + "["):
             continue
         current_bindings = (view.revision_target_bindings or view.target_bindings)
-        binding = next((item for item in current_bindings
+        binding = next((item for item in view.target_bindings
                         if item.get("issue_id") == suggestion.suggestion_id), None)
         target_id = getattr(suggestion, "target_id", None) or (binding.get("source_target_id") if binding else None)
         target_kind = binding.get("source_target_kind") if binding else ("row" if target_id else "field")
@@ -1704,7 +1706,8 @@ def _render_suggestions(view, buffer, field: str, row_id: str | None = None) -> 
         elif exact_row:
             continue
         can_apply = exact_row or whole_field or bool(getattr(suggestion, "generated", False))
-        current = suggestion_current_value(suggestion, view.candidate, current_bindings)
+        current = suggestion_current_value(
+            suggestion, view.candidate, (*view.target_bindings, *current_bindings))
         with st.container(border=True):
             status = getattr(suggestion, "dynamic_status", None) or getattr(suggestion, "review_status", "pending")
             if not can_apply and status == "pending":
