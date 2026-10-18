@@ -831,6 +831,94 @@ print(json.dumps(ImportService(Path(sys.argv[1]), source_root=Path(sys.argv[2]),
         self.assertEqual(reconciliations[0]["mealie_recipe_id"], "historical-mealie-id")
         self.assertTrue(reconciliations[0]["historical_content_ack"])
 
+    def test_historical_cli_reconciliation_rejects_conflicting_outcome_identity(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = write_ui_fixture(Path(tmp))
+            output = Path(fixture["output"])
+            source = Path(fixture["source"])
+            view = next(item for item in load_catalog(output, source.parent)
+                        if item.candidate.name == "Fried Rice")
+            attempt_id = "historical-conflicting-source-hash"
+            events_path = output / "ui_import_events.jsonl"
+            intent = {
+                "event": "intent_started", "schema_version": 1,
+                "attempt_id": attempt_id, "plan_id": "cli",
+                "candidate_id": view.candidate_id, "source_hash": view.source_hash,
+                "extraction_id": view.extraction_id, "revision": view.revision,
+                "title": view.candidate.name, "source_path": str(source),
+                "created_at": "2024-01-01T00:00:00+00:00",
+            }
+            outcome = {
+                "event": "create_uncertain", "attempt_id": attempt_id,
+                "candidate_id": view.candidate_id, "source_hash": "f" * 64,
+                "created_at": "2024-01-01T00:00:01+00:00",
+            }
+            with events_path.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(intent) + "\n")
+                fh.write(json.dumps(outcome) + "\n")
+            client = FakeMealie()
+            client.get_recipe = lambda slug: {
+                "id": "historical-mealie-id", "slug": slug, "name": "Fried Rice",
+                "recipeIngredient": ["3 cups cooked rice", "1 egg"],
+                "recipeInstructions": ["Cook rice.", "Fold in egg."],
+            }
+
+            service = ImportService(output, source_root=source.parent, client=client)
+            inspected = service.reconcile_existing(view.candidate_id, "old-slug", attempt_id)
+            result = service.reconcile_existing(
+                view.candidate_id, "old-slug", attempt_id,
+                reviewer_confirmed=True,
+                evidence="Matched the archived source, date, and ingredient list in my notes.",
+                material_difference_ack=True, unavailable_field_ack=True,
+                historical_content_ack=True,
+                observed_recipe_digest=inspected.get("comparison_digest", ""),
+            )
+
+        self.assertEqual(result["creation_status"], "not_verified")
+        self.assertIn("conflicting source_hash", result["reason"])
+        self.assertEqual(client.created, [])
+
+    def test_historical_cli_rejects_each_conflicting_identity_field(self):
+        for field, conflicting_value in (
+            ("candidate_id", "another-candidate"),
+            ("extraction_id", "e" * 64),
+            ("revision", 999),
+            ("title", "Other Recipe"),
+            ("batch_tag", "Other batch"),
+        ):
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as tmp:
+                fixture = write_ui_fixture(Path(tmp))
+                output = Path(fixture["output"])
+                source = Path(fixture["source"])
+                view = next(item for item in load_catalog(output, source.parent)
+                            if item.candidate.name == "Fried Rice")
+                attempt_id = f"historical-conflicting-{field}"
+                intent = {
+                    "event": "intent_started", "schema_version": 1,
+                    "attempt_id": attempt_id, "plan_id": "cli",
+                    "candidate_id": view.candidate_id, "source_hash": view.source_hash,
+                    "extraction_id": view.extraction_id, "revision": view.revision,
+                    "title": view.candidate.name, "source_path": str(source),
+                    "batch_tag": "Historical batch",
+                }
+                outcome = {
+                    "event": "create_uncertain", "attempt_id": attempt_id,
+                    "candidate_id": view.candidate_id,
+                }
+                outcome[field] = conflicting_value
+                events_path = output / "ui_import_events.jsonl"
+                with events_path.open("a", encoding="utf-8") as fh:
+                    fh.write(json.dumps(intent) + "\n")
+                    fh.write(json.dumps(outcome) + "\n")
+                service = ImportService(output)
+
+                projection, reason = service._uncertain_attempt(
+                    service._read_events(), view.candidate_id, attempt_id,
+                )
+
+                self.assertIsNone(projection)
+                self.assertIn(f"conflicting {field}", reason)
+
     def test_orphaned_create_intent_is_inspectable_and_reconcilable_without_retry(self):
         with tempfile.TemporaryDirectory() as tmp:
             output, source_root, candidate_id = _approved_fried_rice(Path(tmp))

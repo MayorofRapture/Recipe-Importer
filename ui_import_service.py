@@ -1086,6 +1086,18 @@ class ImportService:
             return None, "The selected import attempt has missing, duplicate, or contradictory create history and is protected."
         intent = intents[0]
         outcome = outcomes[0] if outcomes else None
+        identity_events = [item for item in events
+                           if str(item.get("attempt_id", "")) == selected
+                           and item.get("event") in {
+                               "create_uncertain", "create_rejected", "creation_confirmed",
+                           }]
+        for identity_event in identity_events:
+            for key in ("candidate_id", "source_hash", "extraction_id", "revision",
+                        "content_sha256", "title", "batch_tag"):
+                if (intent.get(key) not in (None, "")
+                        and identity_event.get(key) not in (None, "")
+                        and identity_event[key] != intent[key]):
+                    return None, f"The selected attempt has conflicting {key} history and is protected."
         if outcome and outcome.get("event") not in {"create_uncertain", "reconciled_existing"}:
             return None, "The selected attempt is not an unresolved uncertain create."
         if len(links) == 1 and outcome is not None and outcome.get("event") != "create_uncertain":
@@ -1155,10 +1167,6 @@ class ImportService:
                     "content_sha256", "title") + (() if legacy_mode else ("revision",))
         if any(intent.get(key) in (None, "") for key in required):
             return None, "The selected attempt is missing required identity or revision fields and is protected."
-        for key in ("candidate_id", "source_hash", "extraction_id", "revision",
-                    "content_sha256", "title", "batch_tag"):
-            if outcome and key in outcome and key in intent and outcome[key] != intent[key]:
-                return None, f"The selected attempt has conflicting {key} history and is protected."
         if len(links) > 1:
             return None, "The selected attempt has duplicate reconciliation history and is protected."
 
