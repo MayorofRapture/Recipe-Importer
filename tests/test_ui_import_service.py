@@ -11,7 +11,7 @@ from unittest.mock import patch
 
 from import_recipes import file_digest
 from recipe_quality import ExtractionBatch, RecipeCandidate, Suggestion, schema_recipe
-from review_store import ReviewStore, extraction_identity
+from review_store import ReviewStore, _recipe_digest, extraction_identity
 from tests.ui_fixture_factory import write_ui_fixture
 from ui_data import load_catalog
 from ui_import_service import ImportService
@@ -74,6 +74,37 @@ def _approved_fried_rice(root: Path) -> tuple[Path, str, str]:
 
 
 class UiImportServiceTests(unittest.TestCase):
+    def test_shared_attempt_snapshot_policy_ignores_review_metadata_but_rejects_content_or_payload_changes(self):
+        approved = RecipeCandidate(
+            name="OCR Bread", ingredients=["2 cups flour"], instructions=["Bake."],
+            requires_review=False,
+        ).model_dump(mode="json")
+        saved_revision = dict(approved, requires_review=True)
+        digest = _recipe_digest(approved)
+        intent = {
+            "title": approved["name"], "content_sha256": digest,
+            "attempt_evidence_version": 2, "recipe_snapshot": approved,
+            "outbound_payload": schema_recipe(RecipeCandidate.model_validate(approved)),
+        }
+
+        accepted, reason = ImportService._validated_attempt_snapshot(
+            intent, {"recipe": saved_revision, "content_sha256": digest},
+        )
+        changed = dict(approved, ingredients=["3 cups flour"])
+        bad_content, _ = ImportService._validated_attempt_snapshot(
+            dict(intent, recipe_snapshot=changed,
+                 outbound_payload=schema_recipe(RecipeCandidate.model_validate(changed))),
+            {"recipe": saved_revision, "content_sha256": digest},
+        )
+        bad_payload, _ = ImportService._validated_attempt_snapshot(
+            dict(intent, outbound_payload={"name": "Changed payload"}),
+            {"recipe": saved_revision, "content_sha256": digest},
+        )
+
+        self.assertEqual(accepted, approved, reason)
+        self.assertIsNone(bad_content)
+        self.assertIsNone(bad_payload)
+
     def test_reconciliation_comparison_covers_jsonld_fields_and_embedded_notes(self):
         candidate = RecipeCandidate(
             name="Toast", ingredients=["2 slices bread"], instructions=["Toast until golden."],
@@ -765,6 +796,95 @@ print(json.dumps(ImportService(Path(sys.argv[1]), source_root=Path(sys.argv[2]),
         self.assertEqual(retry_blocked[0]["creation_status"], "uncertain")
         self.assertEqual(len(client.created), 0)
         self.assertEqual(len(create_calls), 1)
+
+    def test_ocr_review_metadata_difference_does_not_block_uncertain_reconciliation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output, source_root, candidate_id = _approved_fried_rice(Path(tmp))
+            reviews = ReviewStore(output / "review_events.jsonl")
+            view = next(item for item in load_catalog(output, Path(source_root))
+                        if item.candidate_id == candidate_id)
+            ocr_recipe = view.candidate.model_copy(update={
+                "source_method": "ocr", "requires_review": True,
+            })
+            saved = reviews.save_revision(
+                candidate_id=candidate_id, source_hash=view.source_hash,
+                extraction_id=view.extraction_id, expected_parent=view.revision,
+                operation_id="ocr-review-metadata-revision",
+                recipe=ocr_recipe.model_dump(mode="json"),
+                target_bindings=list(view.target_bindings),
+            )
+            reviews.approve_revision(
+                candidate_id=candidate_id, source_hash=view.source_hash,
+                extraction_id=view.extraction_id, revision=saved["revision"],
+                operation_id="ocr-review-metadata-approval", source_path=view.source_path,
+            )
+            client = FakeMealie(create_error=TimeoutError("synthetic timeout"))
+            service = ImportService(output, source_root=Path(source_root), client=client)
+            plan = service.preview([candidate_id])
+            dispatched = service.dispatch(plan["plan_id"])
+            intent = next(item for item in service._read_events()
+                          if item.get("event") == "intent_started")
+            effective = intent["recipe_snapshot"]
+            self.assertFalse(effective["requires_review"])
+            self.assertTrue(saved["recipe"]["requires_review"])
+            client.get_recipe = lambda slug: {
+                "id": "ocr-existing", "slug": slug, "name": effective["name"],
+                "recipeIngredient": effective["ingredients"],
+                "recipeInstructions": effective["instructions"],
+                "recipeYield": effective.get("yield_text", ""),
+                "description": effective.get("description", ""),
+            }
+
+            inspected = service.reconcile_existing(candidate_id, "ocr-existing", intent["attempt_id"])
+
+        self.assertEqual(dispatched[0]["creation_status"], "uncertain")
+        self.assertEqual(inspected["creation_status"], "confirmation_required", inspected.get("reason"))
+
+    def test_legacy_cli_uncertain_intent_has_reconcilable_content_evidence(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = write_ui_fixture(Path(tmp))
+            output, source = Path(fixture["output"]), Path(fixture["source"])
+            digest = file_digest(source)
+            view = next(item for item in load_catalog(output, source.parent)
+                        if item.candidate.name == "Fried Rice")
+            candidate = view.candidate
+            service = ImportService(output, source_root=source.parent,
+                                    client=FakeMealie(create_error=TimeoutError("synthetic timeout")))
+            result = service.dispatch_cli_candidate(
+                view.candidate_id, candidate, source, digest, view.extraction_id,
+                lambda _recipe: (_ for _ in ()).throw(TimeoutError("synthetic timeout")),
+            )
+            intent = next(item for item in service._read_events()
+                          if item.get("event") == "intent_started")
+            snapshot = intent["recipe_snapshot"]
+            service.client.get_recipe = lambda slug: {
+                "id": "legacy-existing", "slug": slug, "name": snapshot["name"],
+                "recipeIngredient": snapshot["ingredients"],
+                "recipeInstructions": snapshot["instructions"],
+            }
+
+            inspected = service.reconcile_existing(view.candidate_id, "legacy-existing", intent["attempt_id"])
+            linked = service.reconcile_existing(
+                view.candidate_id, "legacy-existing", intent["attempt_id"],
+                reviewer_confirmed=True,
+                evidence="Compared the selected Mealie recipe with the durable legacy create snapshot.",
+                material_difference_ack=True, unavailable_field_ack=True,
+                observed_recipe_digest=inspected["comparison_digest"],
+            )
+            create_calls = []
+            second = service.dispatch_cli_candidate(
+                view.candidate_id, candidate, source, digest, view.extraction_id,
+                lambda _recipe: create_calls.append("called") or "duplicate-slug",
+            )
+
+        self.assertEqual(result["status"], "uncertain")
+        self.assertEqual(intent["authorization_mode"], "legacy_auto_import")
+        self.assertEqual(intent["attempt_evidence_version"], 2)
+        self.assertEqual(inspected["creation_status"], "confirmation_required", inspected.get("reason"))
+        self.assertEqual(linked["creation_status"], "linked_existing")
+        self.assertIn(second["status"], {"already_done", "uncertain"}, second.get("reason"))
+        self.assertEqual(create_calls, [])
+
 
     def test_reconciliation_fails_closed_on_missing_attempt_or_mismatched_returned_slug(self):
         with tempfile.TemporaryDirectory() as tmp:

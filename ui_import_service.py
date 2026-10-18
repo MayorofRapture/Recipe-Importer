@@ -142,7 +142,10 @@ class ImportService:
                     "approval_method": effective.approval_method,
                     "approval_rationale": effective.approval_rationale,
                     "no_instructions_reason": effective.no_instructions_reason,
+                    "authorization_mode": "approved_revision",
+                    "attempt_evidence_version": 2,
                     "recipe_snapshot": effective.recipe,
+                    "outbound_payload": schema_recipe(RecipeCandidate.model_validate(recipe)),
                 })
             try:
                 slug = self.client.create_recipe(RecipeCandidate.model_validate(recipe))
@@ -333,17 +336,25 @@ class ImportService:
                 status = self._service_protected_status(candidate_events)
                 return {"status": status, "slug": "", "tag_status": "not_attempted",
                         "reason": "A prior create attempt requires reconciliation or history review."}
+            attempt_recipe = (effective.recipe if modern else candidate.model_dump(mode="json"))
+            attempt_digest = (effective.content_sha256 if modern else _recipe_digest(attempt_recipe))
+            attempt_evidence = {
+                "authorization_mode": "approved_revision" if modern else "legacy_auto_import",
+                "attempt_evidence_version": 2,
+                "content_sha256": attempt_digest,
+                "recipe_snapshot": attempt_recipe,
+                "outbound_payload": schema_recipe(RecipeCandidate.model_validate(attempt_recipe)),
+            }
+            if modern:
+                attempt_evidence["revision"] = effective.revision
             self._append_locked({
                 "event": "intent_started", "schema_version": 1,
                 "event_id": str(uuid.uuid4()), "attempt_id": attempt_id,
                 "plan_id": "cli", "candidate_id": candidate_id,
                 "source_hash": source_hash, "extraction_id": extraction_id,
-                "revision": max((int(item.get("revision", 0))
-                                 for item in review.revisions.get(candidate_id, [])
-                                 if item.get("source_hash") == source_hash
-                                 and item.get("extraction_id") == extraction_id), default=0),
                 "title": candidate.name, "source_path": source_path,
                 "batch_tag": str(batch_tag or "").strip(), "created_at": _now(),
+                **attempt_evidence,
                 **approval_provenance,
             })
         try:
@@ -374,11 +385,7 @@ class ImportService:
                     "attempt_id": attempt_id, "candidate_id": candidate_id,
                     "title": candidate.name, "source_hash": source_hash,
                     "extraction_id": extraction_id,
-                    "revision": max((int(item.get("revision", 0))
-                                     for item in review.revisions.get(candidate_id, [])
-                                     if item.get("source_hash") == source_hash
-                                     and item.get("extraction_id") == extraction_id), default=0),
-                    "content_sha256": (approval_provenance.get("content_sha256", "")),
+                    **attempt_evidence,
                     "empty_instructions_rejected": (
                         not any(str(item).strip() for item in candidate.instructions)
                         and status == "rejected"),
@@ -402,6 +409,7 @@ class ImportService:
                     "candidate_id": candidate_id, "title": candidate.name,
                     "source_hash": source_hash, "source_path": source_path,
                     "extraction_id": extraction_id, "slug": slug, "batch_tag": tag,
+                    **attempt_evidence,
                     **approval_provenance,
                     "created_at": _now(),
                 })
@@ -1008,8 +1016,9 @@ class ImportService:
             outcome_status = ("orphaned" if outcome is None else
                               "uncertain" if outcome.get("event") == "create_uncertain" else
                               "reconciled" if links else "uncertain")
+        legacy_mode = intent.get("authorization_mode") == "legacy_auto_import"
         required = ("attempt_id", "candidate_id", "source_hash", "extraction_id",
-                    "revision", "content_sha256", "title")
+                    "content_sha256", "title") + (() if legacy_mode else ("revision",))
         if any(intent.get(key) in (None, "") for key in required):
             return None, "The selected attempt is missing required identity or revision fields and is protected."
         for key in ("candidate_id", "source_hash", "extraction_id", "revision",
@@ -1018,6 +1027,59 @@ class ImportService:
                 return None, f"The selected attempt has conflicting {key} history and is protected."
         if len(links) > 1:
             return None, "The selected attempt has duplicate reconciliation history and is protected."
+
+        if legacy_mode:
+            try:
+                review_events = [json.loads(line) for line in self.review_path.read_text(encoding="utf-8").splitlines()
+                                 if line.strip()] if self.review_path.exists() else []
+                if any(not isinstance(item, dict) for item in review_events):
+                    raise ValueError("invalid review history")
+                registrations = [item for item in review_events
+                                 if item.get("event") == "candidate_registration"
+                                 and item.get("candidate_id") == candidate_id
+                                 and item.get("source_hash") == intent.get("source_hash")
+                                 and item.get("extraction_id") == intent.get("extraction_id")]
+            except Exception as exc:
+                return None, "Candidate registration history is unavailable; the legacy attempt remains protected."
+            if len(registrations) != 1 or registrations[0].get("identity_status") != "registered":
+                return None, "The legacy attempt does not have one verified source/extraction identity and remains protected."
+            try:
+                legacy_state_record = self._state_for(StateStore(self.state_path), candidate_id)
+            except Exception:
+                return None, "Compatibility import history is malformed; the legacy attempt remains protected."
+            if legacy_state_record:
+                if (str(legacy_state_record.get("status", "")).upper() == "IMPORTED" and not links):
+                    return None, "Compatibility history conflicts with the uncertain legacy attempt; review local history."
+                for intent_key, record_key in (("source_hash", "source_hash"),
+                                               ("extraction_id", "extraction_id"),
+                                               ("title", "title"), ("batch_tag", "batch_tag")):
+                    if (intent.get(intent_key) not in (None, "")
+                            and legacy_state_record.get(record_key) not in (None, "")
+                            and str(intent[intent_key]) != str(legacy_state_record[record_key])):
+                        return None, f"Compatibility history conflicts with the legacy attempt's {intent_key}; review local history."
+            snapshot, snapshot_error = self._validated_attempt_snapshot(
+                intent, {"recipe": intent.get("recipe_snapshot"),
+                         "content_sha256": intent.get("content_sha256")},
+            )
+            if snapshot is None:
+                return None, snapshot_error
+            if snapshot.get("name") != intent.get("title"):
+                return None, "The legacy attempt title conflicts with its durable recipe content and remains protected."
+            return {
+                "attempt_id": selected, "events": attempt_events,
+                "source_hash": str(intent.get("source_hash", "")),
+                "extraction_id": str(intent.get("extraction_id", "")),
+                "revision": 0,
+                "content_sha256": str(intent.get("content_sha256", "")),
+                "title": str(intent.get("title", "")),
+                "source_path": str(intent.get("source_path", "")),
+                "batch_tag": str(intent.get("batch_tag", "")),
+                "created_at": str(intent.get("created_at", "")),
+                "outcome_status": outcome_status,
+                "provider_response_evidence": self._provider_evidence(outcome) if outcome else "",
+                "recipe_snapshot": snapshot,
+                "authorization_mode": "legacy_auto_import",
+            }, ""
 
         try:
             state = StateStore(self.state_path)
@@ -1054,12 +1116,9 @@ class ImportService:
             return None, "Review revision history is malformed; the uncertain attempt remains protected."
         if len(match) != 1 or not isinstance(match[0].get("recipe"), dict):
             return None, "The exact approved recipe snapshot is unavailable for this attempt; identity cannot be verified."
-        snapshot = intent.get("recipe_snapshot")
-        if snapshot is not None and snapshot != match[0]["recipe"]:
-            return None, "The attempted recipe snapshot conflicts with its review revision and is protected."
-        snapshot = match[0]["recipe"]
-        if _recipe_digest(snapshot) != str(intent.get("content_sha256", "")):
-            return None, "The attempted recipe snapshot does not match its recorded content digest and is protected."
+        snapshot, snapshot_error = self._validated_attempt_snapshot(intent, match[0])
+        if snapshot is None:
+            return None, snapshot_error
         return {
             "attempt_id": selected, "events": attempt_events,
             "source_hash": str(intent.get("source_hash", "")),
@@ -1074,6 +1133,33 @@ class ImportService:
             "provider_response_evidence": self._provider_evidence(outcome) if outcome else "",
             "recipe_snapshot": snapshot,
         }, ""
+
+    @staticmethod
+    def _validated_attempt_snapshot(intent: dict, revision: dict) -> tuple[dict | None, str]:
+        """Validate durable attempt evidence against the exact saved revision's content."""
+        digest = str(intent.get("content_sha256", ""))
+        saved = revision.get("recipe")
+        snapshot = intent.get("recipe_snapshot")
+        if not isinstance(saved, dict) or not isinstance(snapshot, dict):
+            return None, "The exact approved recipe snapshot is unavailable for this attempt; identity cannot be verified."
+        if (str(revision.get("content_sha256", "")) != digest
+                or _recipe_digest(saved) != digest
+                or _recipe_digest(snapshot) != digest):
+            return None, "The attempted recipe snapshot does not match its recorded content digest and is protected."
+        evidence_version = intent.get("attempt_evidence_version")
+        outbound = intent.get("outbound_payload")
+        if evidence_version is not None:
+            if evidence_version != 2 or not isinstance(outbound, dict):
+                return None, "The import attempt contains unsupported or incomplete versioned evidence and is protected."
+            try:
+                expected_payload = schema_recipe(RecipeCandidate.model_validate(snapshot))
+            except Exception:
+                return None, "The import attempt recipe snapshot is invalid and is protected."
+            if outbound != expected_payload:
+                return None, "The attempted Mealie payload conflicts with its recipe snapshot and is protected."
+        if snapshot.get("name") != intent.get("title"):
+            return None, "The attempted recipe title conflicts with its durable content and is protected."
+        return snapshot, ""
 
     @staticmethod
     def _provider_evidence(event: dict | None) -> str:
