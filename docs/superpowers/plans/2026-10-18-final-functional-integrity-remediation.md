@@ -126,5 +126,5 @@
 - [x] Complete synthetic journeys for safe first-time use, explicit legacy mode, identity reconciliation, orphaned intent recovery, mapping recovery, and extraction-only isolation through service/AppTest coverage and three synthetic Chromium flows.
 - [x] Run Windows cross-process synchronization tests, full and clean-checkout offline suites (463 tests, 1 skipped each), AppTest, three isolated Chromium flows, Node harness syntax checks, targeted Python compilation, CLI help, `pip check`, and `git diff --check`.
 - [x] Recheck protected hashes and absent-file state. All three existing production ledger hashes match baseline; `output/ui_import_events.jsonl` remains absent.
-- [ ] Commit logical gates without rewriting history; push to `feature/complete-recipe-workspace` and verify push and PR GitHub Actions on final SHA.
+- [x] Commit logical gates without rewriting history and push `feature/complete-recipe-workspace`; push and PR GitHub Actions passed on implementation SHA `a1ca5ea` (run IDs `39152918066` and `39152922726`).
 - [x] Keep PR #3 open and unmerged; no live Mealie/Gemini behavior was exercised or claimed.
