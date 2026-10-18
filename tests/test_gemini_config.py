@@ -1,21 +1,18 @@
 """Gemini credentials load consistently from project or process configuration."""
 import os
-import shutil
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
-import uuid
 
 from gemini_config import gemini_api_key
 
 
 class GeminiConfigTests(unittest.TestCase):
     def setUp(self):
-        self.root = Path(__file__).resolve().parent / ".test-tmp" / f"gemini-config-{uuid.uuid4().hex}"
-        self.root.mkdir(parents=True)
-
-    def tearDown(self):
-        shutil.rmtree(self.root, ignore_errors=True)
+        self._temporary_root = tempfile.TemporaryDirectory()
+        self.addCleanup(self._temporary_root.cleanup)
+        self.root = Path(self._temporary_root.name)
 
     def test_project_env_key_is_loaded_without_exposing_it(self):
         env_file = self.root / ".env"

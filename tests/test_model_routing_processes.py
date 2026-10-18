@@ -7,13 +7,14 @@ from pathlib import Path
 
 from model_routing import UsageLedger
 
+_REPO_ROOT = Path(__file__).resolve().parents[1]
 
 _WORKER = """
 import sys
 from pathlib import Path
-sys.path.insert(0, str(Path.cwd()))
+sys.path.insert(0, sys.argv[1])
 from model_routing import QuotaExhausted, UsageLedger
-ledger = UsageLedger(Path(sys.argv[1]))
+ledger = UsageLedger(Path(sys.argv[2]))
 print('READY', flush=True)
 sys.stdin.readline()
 try:
@@ -29,7 +30,8 @@ class ModelRoutingProcessTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "usage.json"
             processes = [subprocess.Popen(
-                [sys.executable, "-c", _WORKER, str(path)], cwd=Path.cwd(),
+                [sys.executable, "-c", _WORKER, str(_REPO_ROOT), str(path)],
+                cwd=_REPO_ROOT,
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 text=True,
             ) for _ in range(2)]

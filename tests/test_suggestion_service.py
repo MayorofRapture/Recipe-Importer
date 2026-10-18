@@ -1,10 +1,9 @@
 """Durable, revision-bound on-demand suggestion requests."""
 import hashlib
 import json
-import shutil
+import tempfile
 import unittest
 from pathlib import Path
-import uuid
 import threading
 from unittest.mock import patch
 
@@ -14,17 +13,11 @@ import review_store
 from suggestion_service import SuggestionService
 from model_routing import QuotaExhausted
 
-_TMP_ROOT = Path.cwd() / "tests" / ".test-temp" / "suggestion-service"
-
-
 class SuggestionServiceTests(unittest.TestCase):
     def setUp(self):
-        _TMP_ROOT.mkdir(parents=True, exist_ok=True)
-        self.root = _TMP_ROOT / uuid.uuid4().hex
-        self.root.mkdir()
-
-    def tearDown(self):
-        shutil.rmtree(self.root, ignore_errors=True)
+        self._temporary_root = tempfile.TemporaryDirectory()
+        self.addCleanup(self._temporary_root.cleanup)
+        self.root = Path(self._temporary_root.name)
 
     def setup_recipe(self, root):
         path = root / "review_events.jsonl"

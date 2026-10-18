@@ -207,8 +207,7 @@ class UiImportServiceTests(unittest.TestCase):
                 self.assertEqual(len(protected), 1)
                 self.assertIn("linked extraction", protected[0]["reason"])
     def test_mealie_empty_instructions_rejection_is_not_reposted_for_same_revision(self):
-        with tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parents[1] /
-                                         ".superpowers/sdd/2026-10-18-manual-review-missing-instructions-navigation/tmp") as tmp:
+        with tempfile.TemporaryDirectory() as tmp:
             fixture = write_ui_fixture(Path(tmp))
             output = Path(fixture["output"])
             source = Path(fixture["source"])
@@ -255,8 +254,7 @@ class UiImportServiceTests(unittest.TestCase):
             self.assertIn("empty-instructions", refreshed["excluded"][0]["reason"])
 
     def test_manual_approval_of_source_unavailable_seasoning_reaches_mock_mealie_unchanged(self):
-        with tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parents[1] /
-                                         ".superpowers/sdd/2026-10-18-manual-review-missing-instructions-navigation/tmp") as tmp:
+        with tempfile.TemporaryDirectory() as tmp:
             fixture = write_ui_fixture(Path(tmp))
             output = Path(fixture["output"])
             source = Path(fixture["source"])
@@ -463,8 +461,9 @@ print(json.dumps(ImportService(Path(sys.argv[1]), source_root=Path(sys.argv[2]),
 '''
             args = [sys.executable, "-c", script, str(output), str(source_root),
                     str(calls), plan["plan_id"]]
-            first = subprocess.Popen(args, cwd=Path.cwd(), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-            second = subprocess.Popen(args, cwd=Path.cwd(), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            project_root = Path(__file__).resolve().parents[1]
+            first = subprocess.Popen(args, cwd=project_root, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            second = subprocess.Popen(args, cwd=project_root, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
             first_stdout, first_stderr = first.communicate(timeout=20)
             second_stdout, second_stderr = second.communicate(timeout=20)
             self.assertEqual(first.returncode, 0, first_stderr)

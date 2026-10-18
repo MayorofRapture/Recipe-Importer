@@ -19,6 +19,7 @@ from review_store import ReviewConflict, ReviewStore
 
 SOURCE_BYTES = b"synthetic recipe scan for review authority tests"
 SOURCE_HASH = hashlib.sha256(SOURCE_BYTES).hexdigest()
+_REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 def _source_path(directory):
@@ -32,9 +33,9 @@ _SAME_PARENT_WORKER = """
 import json
 import sys
 from pathlib import Path
-sys.path.insert(0, str(Path.cwd()))
+sys.path.insert(0, sys.argv[1])
 from review_store import ReviewConflict, ReviewStore
-path, candidate_id, operation_id = sys.argv[1:]
+path, candidate_id, operation_id = sys.argv[2:]
 store = ReviewStore(Path(path))
 print('READY', flush=True)
 sys.stdin.readline()
@@ -54,10 +55,10 @@ _REGISTRATION_WORKER = """
 import json
 import sys
 from pathlib import Path
-sys.path.insert(0, str(Path.cwd()))
+sys.path.insert(0, sys.argv[1])
 from recipe_quality import RecipeCandidate
 from review_store import ReviewStore
-path = Path(sys.argv[1])
+path = Path(sys.argv[2])
 store = ReviewStore(path)
 print('READY', flush=True)
 sys.stdin.readline()
@@ -301,7 +302,8 @@ class ReviewAuthorityTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = str(Path(tmp) / "review_events.jsonl")
             processes = [subprocess.Popen(
-                [sys.executable, "-c", _REGISTRATION_WORKER, path], cwd=Path.cwd(),
+                [sys.executable, "-c", _REGISTRATION_WORKER, str(_REPO_ROOT), path],
+                cwd=_REPO_ROOT,
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
             ) for _ in range(2)]
             try:
@@ -1161,8 +1163,9 @@ class ReviewAuthorityTests(unittest.TestCase):
                 "scan", "source-hash", "extract-1", [candidate]
             )[0]["candidate_id"]
             processes = [subprocess.Popen(
-                [sys.executable, "-c", _SAME_PARENT_WORKER,
-                 path, candidate_id, f"save-{index}"], cwd=Path.cwd(),
+                [sys.executable, "-c", _SAME_PARENT_WORKER, str(_REPO_ROOT),
+                 path, candidate_id, f"save-{index}"],
+                cwd=_REPO_ROOT,
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 text=True,
             ) for index in range(2)]

@@ -47,7 +47,7 @@ class ReviewReconciliationTests(unittest.TestCase):
         return path, prior, event
 
     def test_eighteen_synthetic_metadata_only_pairs_project_as_safe_review_candidates(self):
-        with tempfile.TemporaryDirectory(dir=".devtest-tmp") as tmp:
+        with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             for index in range(18):
                 self._legacy_held_suggestion_version(root, suffix=f"-{index}")
@@ -58,7 +58,7 @@ class ReviewReconciliationTests(unittest.TestCase):
         self.assertTrue(all(not item["authoritative_differences"] for item in proposals))
 
     def test_metadata_only_historical_pair_requires_explicit_append_only_confirmation(self):
-        with tempfile.TemporaryDirectory(dir=".devtest-tmp") as tmp:
+        with tempfile.TemporaryDirectory() as tmp:
             path, prior, held = self._legacy_held_suggestion_version(Path(tmp))
             store = ReviewStore(path)
             before = path.read_text(encoding="utf-8").splitlines()
@@ -81,7 +81,7 @@ class ReviewReconciliationTests(unittest.TestCase):
         self.assertEqual(set(reopened.registrations), {prior["candidate_id"], "held-candidate"})
 
     def test_confirmed_identity_keeps_existing_draft_and_revision_streams_separate(self):
-        with tempfile.TemporaryDirectory(dir=".devtest-tmp") as tmp:
+        with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             path, prior, held = self._legacy_held_suggestion_version(root)
             drafts = DraftStore(root / "ui_drafts.jsonl")
@@ -101,7 +101,7 @@ class ReviewReconciliationTests(unittest.TestCase):
         self.assertNotEqual(prior["candidate_id"], "held-candidate")
 
     def test_import_protected_historical_match_stays_ineligible_and_defer_is_audited(self):
-        with tempfile.TemporaryDirectory(dir=".devtest-tmp") as tmp:
+        with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             path, prior, _held = self._legacy_held_suggestion_version(root)
             (root / "import_state.jsonl").write_text(json.dumps({
@@ -121,7 +121,7 @@ class ReviewReconciliationTests(unittest.TestCase):
                             and event.get("decision") == "deferred" for event in reopened.events))
 
     def test_conflicting_historical_recipe_content_remains_held(self):
-        with tempfile.TemporaryDirectory(dir=".devtest-tmp") as tmp:
+        with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             path, _prior, held = self._legacy_held_suggestion_version(root)
             events = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
@@ -134,7 +134,7 @@ class ReviewReconciliationTests(unittest.TestCase):
         self.assertIn("ingredients", proposal["possible_matches"][0]["differences"])
 
     def test_unlinked_prior_version_blocks_future_automatic_reuse_until_confirmed(self):
-        with tempfile.TemporaryDirectory(dir=".devtest-tmp") as tmp:
+        with tempfile.TemporaryDirectory() as tmp:
             unlinked_root = Path(tmp) / "unlinked"
             confirmed_root = Path(tmp) / "confirmed"
             unlinked_root.mkdir()
@@ -156,7 +156,7 @@ class ReviewReconciliationTests(unittest.TestCase):
         self.assertNotEqual(after_confirmation["candidate_id"], prior["candidate_id"])
 
     def test_ambiguous_exact_matches_require_evidence_and_selected_identity(self):
-        with tempfile.TemporaryDirectory(dir=".devtest-tmp") as tmp:
+        with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             path, prior, held = self._legacy_held_suggestion_version(root)
             store = ReviewStore(path)
@@ -202,7 +202,7 @@ class ReviewReconciliationTests(unittest.TestCase):
         ))
 
     def test_identical_sibling_recipes_remain_held(self):
-        with tempfile.TemporaryDirectory(dir=".devtest-tmp") as tmp:
+        with tempfile.TemporaryDirectory() as tmp:
             store = ReviewStore(Path(tmp) / "review_events.jsonl")
             recipe = RecipeCandidate(name="Sibling", ingredients=["1 cup rice"], instructions=["Cook."])
             rows = store.register_candidates("source.jpg", "same-source", "extract-1", [recipe, recipe])
@@ -212,7 +212,7 @@ class ReviewReconciliationTests(unittest.TestCase):
         self.assertNotEqual(rows[0]["candidate_id"], rows[1]["candidate_id"])
 
     def test_identical_text_from_a_different_source_hash_is_a_separate_identity(self):
-        with tempfile.TemporaryDirectory(dir=".devtest-tmp") as tmp:
+        with tempfile.TemporaryDirectory() as tmp:
             store = ReviewStore(Path(tmp) / "review_events.jsonl")
             recipe = RecipeCandidate(name="Cake", ingredients=["2 cups flour"], instructions=["Bake."])
             first = store.register_candidates("one.jpg", "source-one", "extract-one", [recipe])[0]
@@ -223,7 +223,7 @@ class ReviewReconciliationTests(unittest.TestCase):
         self.assertFalse(links)
 
     def test_import_protected_source_does_not_auto_link_changed_suggestions(self):
-        with tempfile.TemporaryDirectory(dir=".devtest-tmp") as tmp:
+        with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             state_path = root / "import_state.jsonl"
             store = ReviewStore(root / "review_events.jsonl", state_path=state_path)

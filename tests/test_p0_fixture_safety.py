@@ -4,6 +4,7 @@ import unittest
 import os
 import hashlib
 import json
+import tempfile
 from pathlib import Path
 from unittest.mock import patch
 
@@ -18,8 +19,13 @@ from tests.p0_fixture_factory import write_p0_fixture, write_p0_source_groups
 
 
 class P0FixtureSafetyTests(unittest.TestCase):
+    def _temporary_root(self) -> Path:
+        temporary_root = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary_root.cleanup)
+        return Path(temporary_root.name)
+
     def test_populated_fixture_loads_and_keeps_duplicate_identity_ambiguous(self):
-        root = Path.cwd() / ".test-tmp" / "p0-fixture-unittest"
+        root = self._temporary_root() / "p0-fixture-unittest"
         fixture = write_p0_fixture(root)
         self.assertTrue((fixture["output"] / ".fixture-library").exists())
         self.assertEqual(len(fixture["expected"]), 500)
@@ -44,10 +50,10 @@ class P0FixtureSafetyTests(unittest.TestCase):
 
     def test_fixture_rejects_unrealistic_recipe_counts(self):
         with self.assertRaises(ValueError):
-            write_p0_fixture(Path.cwd() / ".test-tmp" / "p0-invalid", recipe_count=20)
+            write_p0_fixture(self._temporary_root() / "p0-invalid", recipe_count=20)
 
     def test_mixed_source_groups_resolve_available_sources_and_keep_missing_sources_unavailable(self):
-        fixture = write_p0_source_groups(Path.cwd() / ".test-tmp" / "p0-source-groups")
+        fixture = write_p0_source_groups(self._temporary_root() / "p0-source-groups")
         views = load_catalog(fixture["output"], fixture["source_root"])
         self.assertEqual(len(views), 500)
         self.assertEqual(sum(view.source_available for view in views), 450)
@@ -55,7 +61,7 @@ class P0FixtureSafetyTests(unittest.TestCase):
         self.assertEqual(len({Path(item["source"]).parent.name for item in fixture["groups"]}), 8)
 
     def test_cached_display_hash_cannot_authorize_new_approval_or_import_after_same_stat_tamper(self):
-        root = Path.cwd() / ".test-tmp" / "p0-boundary-tamper"
+        root = self._temporary_root() / "p0-boundary-tamper"
         output, sources = root / "output", root / "sources"
         extracted = output / "extracted"
         extracted.mkdir(parents=True, exist_ok=True)

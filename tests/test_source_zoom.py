@@ -9,12 +9,8 @@ from tests.ui_fixture_factory import write_ui_fixture
 from ui_data import render_source_page
 
 
-_TEST_TMP_ROOT = Path(__file__).resolve().parents[1] / ".test-tmp" / "source-zoom"
-
-
 def _temporary_directory():
-    _TEST_TMP_ROOT.mkdir(parents=True, exist_ok=True)
-    return tempfile.TemporaryDirectory(dir=_TEST_TMP_ROOT)
+    return tempfile.TemporaryDirectory()
 
 
 def _write_pdf(path: Path, width: int, height: int) -> None:

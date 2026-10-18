@@ -3,9 +3,8 @@ from __future__ import annotations
 
 import json
 import os
-import shutil
+import tempfile
 import unittest
-import uuid
 from pathlib import Path
 from unittest.mock import patch
 
@@ -19,16 +18,11 @@ from review_store import ReviewConflict, ReviewStore
 
 
 APP_PATH = Path(__file__).resolve().parents[1] / "streamlit_app.py"
-TEST_TMP = Path(__file__).resolve().parents[1] / ".test-tmp"
-TEST_TMP.mkdir(exist_ok=True)
-
-
 class ReviewInlineTabTests(unittest.TestCase):
     def _temp_dir(self) -> Path:
-        root = TEST_TMP / str(uuid.uuid4())
-        root.mkdir()
-        self.addCleanup(shutil.rmtree, root)
-        return root
+        temporary_root = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary_root.cleanup)
+        return Path(temporary_root.name)
 
     def _launch(self, tmp: str):
         fixture = write_ui_fixture(Path(tmp))

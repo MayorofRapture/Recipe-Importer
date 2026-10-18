@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 
 import {
@@ -13,6 +14,9 @@ import {
   rejectArbitraryUrl,
   startIsolatedBrowserFixture,
 } from '../tools/browser_fixture_runner.mjs';
+
+const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const projectTemp = path.join(projectRoot, '.test-tmp');
 
 const marker = (runId = 'test-run', nonce = 'a'.repeat(64)) => ({
   kind: 'synthetic-browser-fixture', run_id: runId, nonce,
@@ -76,11 +80,11 @@ test('write-capable harnesses reject caller URLs before launch', () => {
 });
 
 test('browser evidence stays in project temp storage and rejects production paths', async (t) => {
-  await assert.rejects(prepareEvidenceDirectory(path.resolve('output')),
+  await assert.rejects(prepareEvidenceDirectory(path.join(projectRoot, 'output')),
     /project \.test-tmp/);
-  const evidence = path.resolve('.test-tmp', 'browser-runner-test', 'evidence');
+  const evidence = path.join(projectTemp, 'browser-runner-test', 'evidence');
   await prepareEvidenceDirectory(evidence);
-  t.after(() => rm(path.resolve('.test-tmp', 'browser-runner-test'), { recursive: true, force: true }));
+  t.after(() => rm(path.join(projectTemp, 'browser-runner-test'), { recursive: true, force: true }));
 });
 
 test('fixture runner rejects credentials and absent required candidates', () => {

@@ -204,7 +204,7 @@ class RuntimeSafetyTests(unittest.TestCase):
         output_key = "RECIPE_IMPORTER_OUTPUT_DIR"
         previous_output = os.environ.pop(output_key, None)
         original_glob = Path.glob
-        default_cache = (Path.cwd() / "output" / "extracted").resolve()
+        default_cache = (Path(__file__).resolve().parents[1] / "output" / "extracted").resolve()
 
         def reject_default_cache(path, pattern):
             if path.resolve() == default_cache:
