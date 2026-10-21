@@ -500,6 +500,8 @@ def _save(view, buffer, advance: bool) -> None:
         return
     st.success(f"Draft saved (revision {record.revision}).")
     st.session_state.review_active_selection = view.candidate_id
+    if record.revision != view.revision:
+        st.rerun()
     if advance:
         _advance_queue(1)
 
@@ -662,7 +664,7 @@ def _render_no_instructions_control(view, buffer) -> None:
     if choice == "Add instructions manually":
         st.info("The Instructions section is open. Add the preparation steps in the editor above.")
     elif choice == "Request AI-suggested instructions":
-        _render_suggestion_request_controls(view)
+        st.info("The Instructions section is open. Use its suggestion controls above.")
     elif choice == "Confirm that no instructions are needed":
         reason = st.selectbox(
             "Why are no preparation instructions required?",
@@ -1887,6 +1889,7 @@ def _render_suggestion_request_controls(view) -> None:
             "I authorize sending this recipe's title, ingredients, and current instructions to Google Gemini.",
             key=consent_key,
             disabled=active or not api_available or fixture_disabled or not identity_ready or not enough_information,
+            persist_state="page",
         )
         if not api_available:
             st.caption("Gemini is not configured. Add its API key before requesting suggestions.")

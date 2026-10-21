@@ -436,6 +436,83 @@ class ReviewInlineTabTests(unittest.TestCase):
         store = ReviewStore(Path(fixture["output"]) / "review_events.jsonl")
         self.assertFalse(any(item.get("event") == "suggestion_request" for item in store.events))
 
+    def test_missing_instruction_ai_choice_does_not_duplicate_request_widgets(self):
+        tmp = self._temp_dir()
+        fixture = write_ui_fixture(tmp)
+        source_root = tmp / "sources"
+        env = patch.dict(os.environ, {
+            "RECIPE_IMPORTER_OUTPUT_DIR": str(fixture["output"]),
+            "RECIPE_IMPORTER_SOURCE_DIR": str(source_root),
+            "RECIPE_IMPORTER_FIXTURE_MODE": "false",
+            "GEMINI_API_KEY": "synthetic-test-key",
+        }, clear=False)
+        env.start()
+        self.addCleanup(env.stop)
+        view = next(item for item in load_catalog(Path(fixture["output"]), source_root)
+                    if item.candidate.name == "Cranberry & Caramel Date Bars")
+        buffer = buffer_for(view)
+        buffer["structured_instructions"] = []
+        buffer["instruction_ids"] = []
+        save_draft(view, buffer)
+
+        app = AppTest.from_file(str(APP_PATH)).run(timeout=10)
+        app = next(item for item in app.selectbox if item.label == "Jump to recipe").set_value(
+            "Cranberry & Caramel Date Bars").run(timeout=10)
+        candidate_id = app.session_state["review_selection"]
+        app.session_state[f"recipe_sections:{candidate_id}"] = "Instructions"
+        app.run(timeout=10)
+        app.radio(key=f"instruction_handling:{candidate_id}").set_value(
+            "Request AI-suggested instructions").run(timeout=10)
+        self.assertFalse(app.exception, repr(app.exception))
+        consent_label = (
+            "I authorize sending this recipe's title, ingredients, and current instructions to Google Gemini."
+        )
+        consent = next(item for item in app.checkbox if item.label == consent_label)
+        request_button = next(item for item in app.button
+                              if item.label == "Suggest missing instructions with AI")
+        self.assertEqual(sum(item.label == consent_label for item in app.checkbox), 1)
+        self.assertEqual(sum(item.label == "Suggest missing instructions with AI" for item in app.button), 1)
+        self.assertTrue(request_button.disabled)
+        consent.check().run(timeout=10)
+        self.assertFalse(next(item for item in app.button
+                              if item.label == "Suggest missing instructions with AI").disabled)
+
+        app.text_input(key=f"recipe_name:{candidate_id}").set_value(
+            "Cranberry & Caramel Date Bars Revised").run(timeout=10)
+        app.button(key=f"save:{candidate_id}").click().run(timeout=10)
+        self.assertFalse(app.exception, repr(app.exception))
+        current_view = next(item for item in load_catalog(Path(fixture["output"]), source_root)
+                            if item.candidate_id == candidate_id)
+        self.assertGreater(current_view.revision, view.revision)
+        consent = next(item for item in app.checkbox if item.label == consent_label)
+        request_button = next(item for item in app.button
+                              if item.label == "Suggest missing instructions with AI")
+        self.assertFalse(consent.value)
+        self.assertTrue(request_button.disabled)
+        consent.check().run(timeout=10)
+
+        app.session_state[f"recipe_sections:{candidate_id}"] = "Ingredients"
+        app.run(timeout=10)
+        self.assertFalse(app.exception, repr(app.exception))
+        app.session_state[f"recipe_sections:{candidate_id}"] = "Instructions"
+        app.run(timeout=10)
+        self.assertFalse(app.exception, repr(app.exception))
+        self.assertEqual(sum(item.label == consent_label for item in app.checkbox), 1)
+        self.assertTrue(next(item for item in app.checkbox if item.label == consent_label).value)
+
+        next(item for item in app.selectbox if item.label == "Jump to recipe").set_value(
+            "Fried Rice").run(timeout=10)
+        other_candidate_id = app.session_state["review_selection"]
+        app.session_state[f"recipe_sections:{other_candidate_id}"] = "Instructions"
+        app.run(timeout=10)
+        self.assertFalse(app.exception, repr(app.exception))
+        self.assertEqual(sum(item.label == "Suggest improvements with AI" for item in app.button), 1)
+        self.assertFalse(next(item for item in app.checkbox if item.label == consent_label).value)
+        app.switch_page("app_pages/upload.py").run(timeout=10)
+        self.assertFalse(app.exception, repr(app.exception))
+        app.switch_page("app_pages/review.py").run(timeout=10)
+        self.assertFalse(app.exception, repr(app.exception))
+
     def test_review_ui_recognizes_project_env_gemini_key_without_displaying_it(self):
         tmp = self._temp_dir()
         fixture = write_ui_fixture(tmp)
