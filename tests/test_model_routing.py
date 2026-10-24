@@ -1,6 +1,7 @@
 import json
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from model_routing import (
@@ -13,6 +14,33 @@ from model_routing import (
 
 
 class ModelRoutingTests(unittest.TestCase):
+    def test_rpm_windows_are_shared_by_independent_routers_and_survive_restart(self):
+        class Clock:
+            current = datetime(2026, 10, 15, tzinfo=timezone.utc)
+
+            def now(self):
+                return self.current
+
+            def sleep(self, seconds):
+                self.current += timedelta(seconds=seconds)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "usage.json"
+            clock = Clock()
+            starts = []
+
+            for index, model in enumerate(("shared", "shared", "other", "shared")):
+                model_rpm = 2 if model == "shared" and index == 0 else 12
+                router = ModelRouter(
+                    [ModelConfig(model, rpm=model_rpm)],
+                    UsageLedger(path, now=clock.now),
+                    global_rpm=4 if index == 0 else 12, sleep=clock.sleep,
+                )
+                router.run(lambda selected: starts.append((selected.id, clock.now())) or "ok")
+
+        self.assertEqual([name for name, _ in starts], ["shared", "shared", "other", "shared"])
+        self.assertEqual([int((when - starts[0][1]).total_seconds()) for _, when in starts], [0, 30, 45, 60])
+
     def test_parses_ordered_roles_and_limits_from_json(self):
         configs = parse_model_config(json.dumps({"models": [
             {"id": "primary", "role": "primary", "rpm": 10, "rpd": 20},
@@ -36,6 +64,32 @@ class ModelRoutingTests(unittest.TestCase):
 
         self.assertEqual(result.value, "ok")
         self.assertEqual(calls, ["primary"])
+
+    def test_unknown_transient_result_can_stop_before_retry_or_fallback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ledger = UsageLedger(Path(tmp) / "usage.json")
+            router = ModelRouter([
+                ModelConfig("primary", "primary", rpd=10),
+                ModelConfig("fallback", "quota_fallback", rpd=10),
+            ], ledger, sleep=lambda _: None)
+            calls = []
+            def fail(model):
+                calls.append(model.id)
+                raise TimeoutError("provider response timed out")
+            with self.assertRaises(TimeoutError):
+                router.run(fail, retry_transient=False, stop_on_transient=True)
+            self.assertEqual(calls, ["primary"])
+            self.assertEqual(ledger.count("primary"), 1)
+            self.assertEqual(ledger.count("fallback"), 0)
+
+    def test_configured_tpm_reservations_are_persisted_per_model(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ledger = UsageLedger(Path(tmp) / "usage.json")
+            ledger.reserve_scheduled("primary", tpm=100, tokens=75, sleep=lambda _: None)
+            with self.assertRaisesRegex(QuotaExhausted, "exceeds configured TPM"):
+                ledger.reserve_scheduled("primary", tpm=100, tokens=101, sleep=lambda _: None)
+            persisted = json.loads((Path(tmp) / "usage.json").read_text(encoding="utf-8"))
+        self.assertEqual(persisted["model_token_windows"]["primary"][0][1], 75)
 
     def test_quality_failure_uses_quality_model(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -72,6 +126,27 @@ class ModelRoutingTests(unittest.TestCase):
 
         self.assertEqual(result.value, "fallback-result")
         self.assertEqual(calls, ["primary", "fallback"])
+        self.assertEqual(result.reason, "quota_fallback")
+
+    def test_primary_quota_uses_quota_fallback_before_quality_model(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            router = ModelRouter([
+                ModelConfig("primary", "primary", rpd=10),
+                ModelConfig("strong", "quality_escalation", rpd=10),
+                ModelConfig("fallback", "quota_fallback", rpd=10),
+            ], UsageLedger(Path(tmp) / "usage.json"), sleep=lambda _: None)
+            calls = []
+
+            def attempt(model):
+                calls.append(model.id)
+                if model.id == "primary":
+                    raise QuotaExhausted("primary daily quota")
+                return model.id
+
+            result = router.run(attempt)
+
+        self.assertEqual(calls, ["primary", "fallback"])
+        self.assertEqual(result.value, "fallback")
         self.assertEqual(result.reason, "quota_fallback")
 
     def test_usage_limit_survives_restart(self):

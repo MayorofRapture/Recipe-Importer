@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import re
+import uuid
 from dataclasses import dataclass, replace
 from typing import Literal
 
@@ -11,6 +12,36 @@ from ui_data import RecipeView
 
 
 EditField = Literal["ingredients", "instructions"]
+
+
+def row_ids_for(
+    field: EditField, count: int, registration_bindings: list[dict] | tuple[dict, ...],
+    revision_bindings: list[dict] | tuple[dict, ...] = (),
+) -> list[str]:
+    """Restore row identity from the saved revision, falling back to extraction rows."""
+    ids: list[str | None] = [None] * count
+    for item in revision_bindings:
+        position = item.get("position")
+        target_id = item.get("target_id")
+        if (item.get("field") == field and isinstance(position, int)
+                and 0 <= position < count and target_id and ids[position] is None):
+            ids[position] = str(target_id)
+    for item in registration_bindings:
+        position = item.get("original_position")
+        target_id = item.get("target_id")
+        if (item.get("target_kind") == "row" and item.get("field") == field
+                and isinstance(position, int) and 0 <= position < count
+                and ids[position] is None and target_id):
+            ids[position] = str(target_id)
+    used = {item for item in ids if item is not None}
+    for position, item in enumerate(ids):
+        if item is None or ids.count(item) > 1:
+            row_id = str(uuid.uuid4())
+            while row_id in used:
+                row_id = str(uuid.uuid4())
+            ids[position] = row_id
+            used.add(row_id)
+    return [str(item) for item in ids]
 
 
 @dataclass(frozen=True)

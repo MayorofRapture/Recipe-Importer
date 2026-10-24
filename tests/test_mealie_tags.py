@@ -4,8 +4,9 @@ from pathlib import Path
 from unittest.mock import patch
 
 from mealie_client import MealieClient
-from import_recipes import StateStore, process_file
+from import_recipes import StateStore, file_digest, process_file
 from recipe_quality import ExtractionBatch, RecipeCandidate
+from review_store import ReviewStore, extraction_identity
 
 
 class Response:
@@ -87,7 +88,10 @@ class MealieTagTests(unittest.TestCase):
             def add_tag(self, slug, tag):
                 if self.failed:
                     self.failed = False
-                    raise RuntimeError("tag service unavailable")
+                    # A definite rejection is safe to retry automatically on
+                    # the next run; an outcome-unknown error needs explicit
+                    # read-before-write reconciliation instead.
+                    raise RuntimeError("HTTP 400")
                 return "tagged"
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -108,6 +112,65 @@ class MealieTagTests(unittest.TestCase):
         self.assertEqual(creates, ["create"])
         self.assertEqual(first[0]["status"], "TAG_FAILED")
         self.assertEqual(second[0]["status"], "TAGGED_REPAIRED")
+
+    def test_extract_only_never_repairs_failed_tag_or_changes_import_ledgers(self):
+        class Tagger:
+            def __init__(self): self.calls = []
+            def ensure_tag(self, name):
+                self.calls.append(("ensure", name))
+                return {"name": name, "slug": "batch"}
+            def add_tag(self, slug, tag):
+                self.calls.append(("add", slug, tag["name"]))
+                return "tagged"
+
+        for force_extract in (False, True):
+            with self.subTest(force_extract=force_extract), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                source = root / "scan.jpg"
+                source.write_bytes(b"synthetic recipe source")
+                digest = file_digest(source)
+                cache = root / "extracted"
+                cache.mkdir()
+                candidate = RecipeCandidate(name="Toast", ingredients=["bread"], instructions=["Toast."])
+                (cache / f"{digest}.json").write_text(
+                    ExtractionBatch(recipes=[candidate]).model_dump_json(), encoding="utf-8")
+                state_path = root / "import_state.jsonl"
+                batch = ExtractionBatch(recipes=[candidate])
+                reviews = ReviewStore(root / "review_events.jsonl")
+                registration = reviews.register_candidates(
+                    str(source), digest, extraction_identity(digest, batch.model_dump(mode="json")),
+                    batch.recipes,
+                )[0]
+                identity = registration["candidate_id"]
+                StateStore(state_path).add(
+                    identity, "IMPORTED", "toast", str(source), candidate.name,
+                    identity=identity, source_hash=digest, tag_status="failed",
+                    tag_name="Batch", batch_tag="Batch",
+                )
+                state_before = state_path.read_bytes()
+                event_path = root / "ui_import_events.jsonl"
+                event_before = event_path.read_bytes() if event_path.exists() else None
+                tagger = Tagger()
+                extracted = ExtractionBatch(recipes=[candidate])
+
+                with patch("import_recipes.extract", return_value=extracted) as extract_call, \
+                        patch("import_recipes.import_mealie") as create_call:
+                    rows = process_file(
+                        source, digest, {"api_key": "", "model": "primary",
+                                          "mealie_url": "", "mealie_token": ""},
+                        None, StateStore(state_path), cache, True,
+                        force_extract=force_extract, batch_tag="Batch", mealie_client=tagger,
+                    )
+
+                self.assertEqual(rows[0]["status"], "ALREADY_DONE", rows)
+                self.assertEqual(rows[0]["candidate_id"], identity)
+                self.assertEqual(tagger.calls, [])
+                create_call.assert_not_called()
+                self.assertEqual(extract_call.call_count, int(force_extract))
+                self.assertEqual(state_path.read_bytes(), state_before)
+                self.assertEqual(event_path.read_bytes() if event_path.exists() else None, event_before)
+                self.assertTrue(any(item.get("candidate_id") == identity
+                                    for item in ReviewStore(root / "review_events.jsonl").registrations.get(identity, [])))
 
 
 if __name__ == "__main__":
