@@ -8,6 +8,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import fitz
 from PIL import Image
 import io
 
@@ -33,6 +34,13 @@ def _batch(store: BatchStore, name: str, *contents: bytes) -> dict:
     return batch
 
 
+def _write_parent_pdf(path: Path) -> None:
+    document = fitz.open()
+    document.new_page().insert_text((72, 72), "Synthetic parent page")
+    document.save(path)
+    document.close()
+
+
 def _recipe_rows(source: dict, mode: str, config: dict):
     return [{
         "status": "EXTRACTED_ONLY", "title": f"Synthetic {source['original_filename']}",
@@ -49,6 +57,24 @@ class JobServiceTests(unittest.TestCase):
         self.fixture_env.start()
         self.addCleanup(self.fixture_env.stop)
         self.addCleanup(self.tmp.cleanup)
+
+    def test_parent_documents_are_never_job_sources(self):
+        batch = self.store.create("Parent boundary")
+        parent_path = Path(self.tmp.name) / "book.pdf"
+        _write_parent_pdf(parent_path)
+        parent = self.store.stage_parent_pdf(batch["batch_id"], parent_path)
+        service = JobService(self.output, extractor=_recipe_rows)
+
+        with self.assertRaisesRegex(ValueError, "accepted source file"):
+            service.start(batch["batch_id"], "local_ocr")
+        self.assertEqual(service.list_jobs(), [])
+
+        scan = self.store.stage(batch["batch_id"], "recipe.png", _png())
+        job = service.start(batch["batch_id"], "local_ocr")
+
+        self.assertEqual(parent["status"], "staged")
+        self.assertEqual([source["source_id"] for source in job["sources"]], [scan["source_id"]])
+        self.assertNotIn(parent["document_id"], {source.get("document_id") for source in job["sources"]})
 
     def test_start_is_durable_and_second_tab_returns_same_nonterminal_job(self):
         batch = _batch(self.store, "Weekend", _png())
