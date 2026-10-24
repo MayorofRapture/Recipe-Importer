@@ -8,7 +8,7 @@
 
 ## Scope and authority
 
-This roadmap records two completed code corrections and separates them from later implementation tracks. Phases 1 and 2 are complete and include their commit, offline test, browser, and CI evidence. Phase 3A is architecture/design only; Phase 3B needs a separate approval after independent review. Phase 4 is deferred maintenance. A comprehensive visual/interaction redesign is a separate project and is outside this roadmap's implementation scope.
+This roadmap records Phases 1 and 2 plus the completed Phase 3B.1 backend staging milestone. Phase 3A remains the design basis; page-range work in Phase 3B.2 onward requires separate approval after independent review. Phase 4 is deferred maintenance. A comprehensive visual/interaction redesign is a separate project and is outside this roadmap's implementation scope.
 
 No phase authorizes a live Gemini or Mealie call, a production data change, a rewrite of production JSONL records, a PR merge, or changes to `.vscode/` or generated Graphify output. Keep `MEALIE_SUPPORTS_EMPTY_INSTRUCTIONS=false` until the separately authorized, version-matched Mealie check described in the compatibility document is completed.
 
@@ -100,12 +100,12 @@ Where legacy method provenance was not persisted, the UI labels the variant as u
 
 ## Phase 3A — Resumable whole-book PDF design (AUD-001)
 
-**Authorization:** Design only. Phase 3B requires a separate approval after independent review of this specification.
+**Authorization:** This phase is the design basis. Phase 3B.1 was separately authorized and implemented as backend-only staging. Phase 3B.2 and later require separate approval after independent review of their range, job, and UI contracts.
 **Goal:** Process a cookbook as an immutable parent PDF with durable, user-selected, resumable page-range children. Do not implement by merely raising the current limits.
 
 ### Current constraints
 
-`BatchStore` stages bytes as one content-addressed source, with a 50 MiB file limit and 100-page PDF limit. It validates PDF signature, encryption, and page count before adding source metadata. `ui_job_service.JobService` records attempts and outcomes per source ID and resumes waiting/failed sources. `import_recipes.process_file()` and the current caches use whole-file hashes. `local_ocr._ocr_pdf()` already produces page-marked text, and `ui_data.render_source_page()` renders one page of the original. Candidate identities currently use source hash plus a content fingerprint; matching must not use title or the `recipes[]` position.
+`BatchStore.stage()` continues accepting recipe-sized byte sources with a 50 MiB file limit and 100-page PDF limit. Phase 3B.1 adds a separate path-based parent-PDF staging API with larger explicit bounds, but does not add page ranges or job dispatch. `ui_job_service.JobService` records attempts and outcomes per ordinary source ID and resumes waiting/failed sources. `import_recipes.process_file()` and the current caches use whole-file hashes. `local_ocr._ocr_pdf()` already produces page-marked text, and `ui_data.render_source_page()` renders one page of an ordinary source. Candidate identities currently use source hash plus a content fingerprint; matching must not use title or the `recipes[]` position.
 
 ### Proposed parent and range records
 
@@ -127,11 +127,11 @@ The existing `digest`/source hash remains the hash of its source bytes and retai
 
 ### Parent intake above 50 MiB
 
-The existing Upload path calls `UploadedFile.getvalue()` and `BatchStore.stage()` accepts an in-memory `bytes`; raising either configured bound would keep the whole parent in memory and would remove an important safety limit. The later implementation must provide a separate, bounded parent-PDF intake path.
+The existing Upload path calls `UploadedFile.getvalue()` and `BatchStore.stage()` accepts an in-memory `bytes`; raising either configured bound would keep the whole parent in memory and would remove an important safety limit. Phase 3B.1 therefore adds `BatchStore.stage_parent_pdf(batch_id, source_path)` as a separate backend path. Its default cap is 256 MiB and 2,000 pages, with a 64 MiB free-space reserve. It streams 1 MiB chunks, hashes incrementally, checks available space every 16 MiB, validates the staged path with PyMuPDF, fsyncs, and atomically publishes versioned parent metadata. It preserves ordinary `sources` and uses the existing manifest lock and atomic-write behavior.
 
-**Recommended design to validate before Phase 3B:** because this application is run locally on Windows (`run_app.bat`) and the recipe library is local, add a same-host “Choose local PDF” intake into a task-owned temporary file. The picker returns a path, not file bytes. Copy from the selected path into a temporary file under the isolated batch storage using fixed-size chunks (for example, 1 MiB), incremental SHA-256, early size-limit enforcement, and a minimum free-disk check; validate with path-based PyMuPDF APIs, fsync, then atomically publish. Restrict selection to PDF and to an approved local root or explicit user selection, sanitize the display name, and never modify the original. Clean up incomplete temporary files on cancellation/restart without deleting completed parent documents.
+**Implemented in Phase 3B.1:** the backend accepts a trusted local PDF path and copies it in bounded chunks into isolated, content-addressed parent storage. It rejects invalid, encrypted, changed, or over-limit files; preserves the original; cleans partial copies; safely recovers a content file after a manifest-write failure; and restores missing duplicate content only to a validated in-library path. Versioned records are additive under `parent_documents`. `JobService` continues to select only `sources`, so parent PDFs cannot enter OCR, extraction, or Mealie import.
 
-This is a design choice contingent on verifying the actual launch model and Windows file-dialog behavior. Do not use a server-host dialog when the Streamlit server is remote. If remote use is required, stop and separately design a loopback/authenticated chunk-upload component that streams to disk and enforces the same byte/disk/page caps; do not silently fall back to `st.file_uploader` for oversized books. Keep the existing 50 MiB limit for ordinary uploads. Establish a measured finite cookbook cap (initial proposal: 256 MiB), a page-count cap, a disk reserve, and cancellation/cleanup limits before enabling this intake. The 256 MiB number is a proposed cap to validate against peak Windows memory/disk tests, not a verified capacity claim.
+**UI selection remains unresolved.** `run_app.bat` is local, but no headed Windows proof-of-concept verifies a native picker on Streamlit's script thread. A remote browser cannot supply a server-local path; remote use would need a bounded chunk upload that writes to server-owned temporary storage and enforces the same size/disk/page caps. Do not pass browser-supplied path strings to `stage_parent_pdf`, and do not use regular `st.file_uploader` for oversized books. The 256 MiB cap is an explicit staging guardrail; it is not a downstream processing-capacity claim. See the picker evidence and source links in `docs/mealie-compatibility-and-large-pdf-capability.md`.
 
 ### Range identity, extraction, and cache strategy
 
@@ -160,20 +160,26 @@ Add optional versioned parent/range metadata to new batches and job records, or 
 
 Rollback is feature-disablement, not data deletion: stop offering new parent/range intake and dispatch; retain originals, range events, attempts, and caches; keep readers for v1 metadata; let legacy file jobs continue. Do not restore an older binary that cannot read new metadata until compatibility is verified. Re-enabling requires a successful read/resume check on preserved synthetic records.
 
-### Tests and staged implementation plan for future Phase 3B
+### Phase 3B.1 implementation evidence and remaining milestones
 
 Use synthetic files only; no production recipe data or service writes.
 
 | Milestone | Boundary | Required evidence |
 |---|---|---|
-| 3B.1 Parent staging | New bounded same-host intake and `BatchStore` metadata | >50 MiB and >100-page PDFs within explicit cap; over-cap, low-disk, corrupt/encrypted, cancellation, interrupted temporary copy, changed bytes; original unchanged; no whole-file `read_bytes()` path. |
+| **3B.1 Parent staging — completed** | Backend-only bounded path intake and additive `BatchStore` parent metadata | >50 MiB and >100-page PDFs within explicit cap; over-cap, low-disk, corrupt/encrypted, interrupted temporary copy, changed bytes; original unchanged; duplicate and recovery behavior; no parent-to-job dispatch. |
 | 3B.2 Range creation | Deterministic inclusive IDs and bounded PyMuPDF copy | Same range idempotent; bounds validated; overlap recorded; generated bytes hash and page count stable; parent hash/path preserved. |
 | 3B.3 Range jobs/cache | JobService per-range attempts/resume and cache keys | Multi-range partial failure, completed ranges not repeated, interrupted resume, changed model/config/source invalidation, legacy jobs readable. |
 | 3B.4 Candidate and review provenance | Range-aware registration, source preview/page mapping, reconciliation | Multi-recipe pages, recipes spanning pages, duplicate titles, overlapping ranges; distinct candidates; exact source hash/revision approval; ambiguous duplicates held. |
 | 3B.5 Upload/review interaction | Range picker and progress/recovery UI | Streamlit AppTest plus synthetic Chromium for add/edit ranges, overlap, resume, page mapping, and recovery. Review checklist and accessibility evidence. |
 | 3B.6 Compatibility gate | Existing workflows and safety | Run `tests/test_batch_store.py`, `tests/test_ui_jobs.py`, `tests/test_ui_data.py`, `tests/test_review_identity_authorization.py`, `tests/test_review_reconciliation.py`, `tests/test_streamlit_upload.py`, relevant full suite, CLI help, compilation, browser journeys, and `git diff --check`; inspect legacy fixtures and confirm no live services. |
 
-Do not begin 3B until the data model, local/remote intake choice, hard bounds, source hash/candidate ID contracts, and rollback behavior receive independent review and separate user approval.
+**3B.1 implementation commit:** `7e15c3ceeb9b086659c562c7bc17e2ee83014ee1` (`feat: stage parent cookbook PDFs safely`), pushed from baseline `e82d293400220e8cd7f75e81cea89a9c578eb2fd`.
+
+**3B.1 verification:** 517 offline tests passed with 1 capability skip (`unittest discover -s tests`, 326.267 seconds, process exit 0). The batch/job subset passed 44/44. Targeted Python compilation, CLI `--help`, and `git diff --check` passed. Synthetic Chromium review/import and historical recovery journeys passed; the Windows `Offline verification` workflow passed for the exact implementation SHA in both the [push run](https://github.com/MayorofRapture/Recipe-Importer/actions/runs/40126488768) and [PR run](https://github.com/MayorofRapture/Recipe-Importer/actions/runs/40126492197). A synthetic 60 MiB staging probe measured a 2.16 MiB sampled working-set increase at 5 ms intervals; this is one observation, not a guaranteed upper bound.
+
+No UI picker, range creation, OCR, extraction, range job, review, or Mealie import for parent PDFs was added. Same-host native picker integration remains **Unverified** pending a headed Windows proof-of-concept. For remote browsers, a native dialog would select on the server host; any later remote selection needs an authenticated, bounded chunk-to-disk transfer and must never accept a browser-supplied server path. Details and official Streamlit/Tkinter references are in `docs/mealie-compatibility-and-large-pdf-capability.md`.
+
+Do not begin 3B.2 or later until the range identity, job/cache, candidate provenance, UI, and rollback contracts receive independent review and separate user approval.
 
 ## Phase 4 — CLI/UI primitive ownership (AUD-004)
 
@@ -191,7 +197,8 @@ The audit and Phase 1 browser journey do not establish that the entire interface
 
 - [x] Phase 1 changes are limited to draft feedback and its necessary regression journey/tests.
 - [x] Phase 2 source-text review is implemented and verified; Phase 3A remains a specification only.
-- [x] Phase 3B and Phase 4 are not implemented.
+- [x] Phase 3B.1 implements backend-only parent staging; range handling, picker UI, OCR/extraction, parent job dispatch, and parent import remain unimplemented.
+- [x] Phase 4 remains deferred maintenance.
 - [x] No live Gemini or Mealie calls were made.
 - [x] Production import/review histories, source scans, extraction caches, and recipe records were not modified.
 - [x] `.vscode/` and `graphify-out/` were preserved and excluded from commits.
@@ -199,4 +206,4 @@ The audit and Phase 1 browser journey do not establish that the entire interface
 
 ## Phase gates
 
-Phases 1 and 2 are complete with passing targeted and full offline tests, synthetic Chromium journeys, clean compilation/help/diff checks, pushed implementation commits, and Windows CI verified at each implementation SHA. Phase 3B awaits independent review of its design and separate implementation approval. Phase 4 remains deferred unless a concrete maintenance benefit and compatibility plan are approved. No phase automatically authorizes the next.
+Phases 1 and 2 and Phase 3B.1 are complete with passing offline tests, synthetic Chromium journeys where applicable, compilation/help/diff checks, pushed implementation commits, and Windows CI verified at each implementation SHA. Phase 3B.2 onward awaits independent review of the remaining design and separate implementation approval. Phase 4 remains deferred unless a concrete maintenance benefit and compatibility plan are approved. No phase automatically authorizes the next.

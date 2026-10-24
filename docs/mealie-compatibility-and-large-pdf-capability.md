@@ -25,14 +25,33 @@ Without the exact server version and authorization in step 3, leave the gate dis
 
 ## F9: whole-book PDFs and page ranges
 
-### Current behavior and limit
+### Recipe-sized source behavior
 
-- `BatchStore` defaults to a 50 MiB per-file limit and a 100-page PDF limit. It rejects a 101-page PDF before staging it.
-- An accepted PDF is staged and hashed as one immutable source. The upload preview renders only its first page.
-- Local PDF OCR iterates every page and joins the text into one extraction input. Gemini extraction sends the complete PDF as one uploaded/inline document. There is no selected-page-range field in batch/job/source identity.
-- A single extraction may yield multiple recipes, but an identical title on different pages has no page-specific provenance. Raising only the file/page bounds would increase memory, OCR/provider work, and identity ambiguity without adding resumable page-level ownership.
+- Ordinary `BatchStore.stage()` uploads retain the 50 MiB file cap and 100-page PDF cap. The existing Upload page continues using this path.
+- Existing ordinary sources remain content-addressed entries in `sources`; their hashes, IDs, extraction behavior, and job behavior are unchanged.
+- Ordinary uploaded PDFs can still be sent as whole-file extraction inputs. No selected-page-range field exists in batch/job/source identity.
 
-The current workflow is suitable for recipe-sized scans and PDFs within these bounds. Whole-cookbook input is **Unverified / Unsupported** by the current page-range workflow; a synthetic 101-page PDF is rejected without adding a batch source.
+### Phase 3B.1: backend-only parent PDF staging
+
+`BatchStore.stage_parent_pdf(batch_id, source_path)` adds a separate intake API for a trusted local path. It does not relax ordinary upload limits and is not called by the UI, OCR, extraction, or Mealie import code.
+
+- Defaults are 256 MiB per parent PDF, 2,000 pages, and a 64 MiB free-space reserve. These are explicit guardrails, not a promise that every downstream PDF operation can process a file at those maxima.
+- The copy streams in 1 MiB chunks, incrementally hashes, checks for source changes, and rechecks remaining free space every 16 MiB. It validates the copied file by path with PyMuPDF, flushes and fsyncs it, then publishes it atomically under the batch's `parent_documents` directory.
+- New metadata uses a versioned `parent_pdf` record with the full SHA-256 as its stable `document_id`. Existing manifests without `parent_documents` remain readable. Parent records do not enter `sources`, and `JobService` continues building jobs from `sources` only.
+- Corrupt, encrypted, empty, unsupported, changed, and over-cap PDFs are rejected. Interrupted temporary copies are cleaned up. A manifest-write failure leaves a content-addressed file that an identical retry can register. Duplicate content creates no second record; if its owned staged file is missing or corrupt, retry restores it only to the validated in-library content path.
+- A synthetic 60 MiB staging probe passed with a sampled process working-set increase of 2.16 MiB at 5 ms sampling. This is one local observation, not a formal maximum-memory guarantee.
+
+This milestone only stages the immutable parent. It does **not** add page ranges, page-range jobs, automatic splitting, a picker, OCR, extraction, review, or import of parent documents. Whole-book PDF processing remains **Unsupported** until the later range milestones are implemented and separately verified.
+
+### Local path-picker feasibility and security
+
+`run_app.bat` starts a local Streamlit server. Streamlit still runs a server and a per-session script thread, while a browser may be on a different machine. The [Streamlit threading guide](https://docs.streamlit.io/develop/concepts/design/multithreading) documents this separation and warns that attaching Streamlit context to custom threads is unsupported. The [architecture guide](https://docs.streamlit.io/develop/concepts/architecture/architecture) distinguishes browser and server machines. A server-side native dialog therefore cannot select a file from a remote browser's computer.
+
+The regular [`st.file_uploader`](https://docs.streamlit.io/develop/api-reference/widgets/st.file_uploader) flow transfers uploaded content to the server and exposes it as an uploaded-file object; it does not provide the client's local path. Its normal in-memory upload object is not a suitable large-book path. A future remote flow would need a bounded chunk-to-disk upload mechanism rather than passing a browser-supplied filesystem path to the server.
+
+On the same Windows host, a native dialog could select a host-local path, but the current Streamlit script thread is not a conventional GUI event-loop thread. Python's [Tkinter threading notes](https://docs.python.org/3.14/library/tkinter.html#threading-model) explain that Tk calls depend on its event loop and thread model. No headed Windows proof-of-concept has established that a blocking Tk dialog integrates reliably with Streamlit reruns, and starting it on an arbitrary worker thread is not approved as a design.
+
+The picker decision remains **Unverified**. Before adding UI, choose and demonstrate either a reliable same-host desktop bridge or a bounded browser-mediated transfer. Never accept an arbitrary server path from a browser request. A future implementation must obtain a selected path only through a trusted local picker or allowlisted root, validate regular-file/PDF status, sanitize its display name, copy into app-owned storage, and never use the selected file path as a destination. Remote upload must enforce the same file/page/disk caps and keep path handling server-side.
 
 ### Deferred implementation design
 
