@@ -8,7 +8,7 @@
 
 ## Scope and authority
 
-This roadmap separates the one currently authorized code correction from three later implementation tracks. Phase 1 is authorized and is recorded below with its final commit, offline test, browser, and CI evidence before this document is committed. Phase 2 is design only. Phase 3A is architecture/design only; Phase 3B needs a separate approval after independent review. Phase 4 is deferred maintenance. A comprehensive visual/interaction redesign is a separate project and is outside this roadmap's implementation scope.
+This roadmap records two completed code corrections and separates them from later implementation tracks. Phases 1 and 2 are complete and include their commit, offline test, browser, and CI evidence. Phase 3A is architecture/design only; Phase 3B needs a separate approval after independent review. Phase 4 is deferred maintenance. A comprehensive visual/interaction redesign is a separate project and is outside this roadmap's implementation scope.
 
 No phase authorizes a live Gemini or Mealie call, a production data change, a rewrite of production JSONL records, a PR merge, or changes to `.vscode/` or generated Graphify output. Keep `MEALIE_SUPPORTS_EMPTY_INSTRUCTIONS=false` until the separately authorized, version-matched Mealie check described in the compatibility document is completed.
 
@@ -48,8 +48,8 @@ The Chromium journey runs against the repository's marked synthetic library and 
 
 ## Phase 2 — Accessible source-text review (AUD-002)
 
-**Authorization:** Design only. Do not implement without separate approval.
-**Goal:** Let a keyboard and screen-reader user inspect available source-derived text for the exact page beside the existing scan and editable recipe.
+**Status:** Completed and verified under the user-approved Phase 2 implementation request.
+**Goal:** Let a keyboard and screen-reader user inspect available source-derived text for the exact page beside the existing scan and editable recipe. The source-text region is read-only and does not change recipe data, approval, or import projections.
 
 ### Existing building blocks
 
@@ -60,9 +60,9 @@ The Chromium journey runs against the repository's marked synthetic library and 
 - `verify_selected_source()` and the catalog bind candidate review to a source hash and current source availability. The text view must preserve that boundary.
 - OCR and source-preview tests already cover page markers, original/layout/selected variants, source caching, and missing source behavior. Extend these contracts rather than adding a second OCR pipeline.
 
-### Proposed lookup contract
+### Implemented lookup contract
 
-Add a small read-only page lookup near the current source-preview helpers, for example `ui_data.source_text_for_page(view, page_number) -> SourceTextPage`. The result should carry `source_hash`, exact one-based source page, text (or empty), a plain-language method/provenance label, uncertainty notes, and a status such as `available`, `no_text`, `cache_unreadable`, or `source_unavailable`.
+Added `ui_data.source_text_for_page(view, page_number, output_dir) -> SourceTextPage` beside the existing source-preview helpers. It validates the selected source identity/hash and returns the exact one-based page text (or empty), method/provenance, uncertainty notes, page mapping, and a user-readable status. It reads selectable PDF text or existing hash-bound OCR variants and never writes or regenerates OCR caches.
 
 Lookup order:
 
@@ -73,26 +73,30 @@ Lookup order:
 5. If cache text or metadata is missing, malformed, or unreadable, return a user-readable state and keep the scan visible. Do not fall back to a different source's cache. For an unavailable source with a hash-bound cache, expose it only with a prominent “Original source unavailable; this text cannot be checked against the scan” notice; keep existing approval/source-integrity gates unchanged.
 6. Existing Gemini-derived recipe fields are not transcription and must never be used as a source-text fallback. No cloud request is permitted by this design.
 
-If a cached OCR page is unavailable, the initial design shows the reason and leaves the existing review path intact. A separate, explicit local-OCR action for sources with no readable cache is not included until its resource bounds, consent wording, background-job ownership, and recovery behavior are separately specified and approved. It must not silently invoke Gemini.
+If a cached OCR page is unavailable, the UI shows the reason and leaves the existing review path intact. A separate, explicit local-OCR action for sources with no readable cache is not included until its resource bounds, consent wording, background-job ownership, and recovery behavior are separately specified and approved. It must not silently invoke Gemini.
 
-### Proposed Review presentation
+### Implemented Review presentation
 
 Keep the current visual scan and page control. Add a separately headed, read-only “Source text” region in the source pane, tied to that same page selection. Use native Streamlit text/heading elements, not editable recipe widgets or custom HTML. Show the original page number, method, cache/variant provenance where known, uncertainty, and empty/unavailable explanations. Preserve OCR text as a reading aid; the recipe editor remains a separate, authoritative draft. No OCR text is automatically copied into a recipe field.
 
-The text region should be exposed in document order to screen readers and keyboard navigation. Its heading and status must distinguish source text from recipe ingredients/instructions. Keep text out of session state where practical; if a bounded cache is needed, key it by source hash, cache file identity/mtime, variant, and page, with a small maximum. Do not store a whole cookbook's OCR copy in Streamlit session state.
+The text region is exposed in document order using native Streamlit elements, and its heading distinguishes source text from recipe ingredients and instructions. Text is not stored in session state; page text and metadata reads have file-size limits and bounded process caches.
 
-### Acceptance tests for the later implementation
+### Verification evidence
 
-- Hashed image with page-marked OCR returns only page 1, with the right variant and method.
-- PDF with selectable text displays only the selected page and labels the method accurately.
-- Scanned PDF with page-marked OCR displays the corresponding original page number; changing the page changes both preview and text.
-- Multi-page PDF text is not repeated under other pages; a markerless multi-page legacy cache reports unavailable mapping.
-- Missing/corrupt cache, missing/corrupt source, and source-hash mismatch give actionable states and never surface another candidate's text.
-- The image remains present, OCR uncertainty is disclosed, and source transcription cannot edit the authoritative recipe or alter approval/import projections.
-- AppTest covers labels, candidate binding, status/error presentation, and unchanged approval. Chromium covers page selection and recovery. Keyboard-only plus accessibility-tree inspection verifies the task path; use a supported assistive-technology check where available.
-- Run the accessibility audit on the actual changed markup/rendering. Report what each input can and cannot prove; do not claim WCAG conformance from screenshots alone.
+- [x] Hash-bound image OCR and selectable/scanned PDF tests return only the requested page; variant provenance and OCR uncertainty are reported.
+- [x] Markerless multi-page caches, duplicate markers, oversized/unreadable caches, missing sources, source-hash mismatch, and candidate cache isolation are covered by unit tests.
+- [x] AppTest verifies page-bound source text, the unavailable-source warning, and unchanged review/import history.
+- [x] Synthetic Chromium verified the source-text heading/content and page control in the accessibility tree, keyboard navigation to page 2, page-specific text, visible keyboard focus, and existing edit/approval/fake-import workflows.
+- [x] Source-text contrast measured 13.33:1 in the rendered browser; body text was 16px and provenance was 14px.
+- [x] Full offline suite: 501 tests passed (`unittest discover -s tests -v`, 375.444 seconds, process exit 0). Targeted compilation, credential-free CLI `--help`, browser harness syntax, and `git diff --check` passed.
+- [ ] Screen-reader announcements were not verified. Windows Narrator is installed, but the synthetic Chromium run is headless and no interactive Narrator session was exercised.
+- [ ] The audit is limited to the changed source-text panel and page control. App-wide 200% resize, 320px reflow, all focus-obscuring cases, and target sizes were not verified; this is not a full WCAG conformance claim.
 
-**Design dependency:** Confirm exact OCR metadata available in old report/job/cache records. Where method provenance was not persisted, show “Local OCR; method details not recorded” rather than inferring it.
+**Implementation commit:** `ec37f04fe6ff9c7c4a8e1eff199b8a1310eafc01` (`feat: show page-bound source text in review`).
+**Windows CI for the exact implementation SHA:** Passed. Workflow `Offline verification`, Windows job, run [40123240419](https://github.com/MayorofRapture/Recipe-Importer/actions/runs/40123240419), completed successfully for `ec37f04fe6ff9c7c4a8e1eff199b8a1310eafc01`.
+**Live services:** No Gemini or Mealie calls were made.
+
+Where legacy method provenance was not persisted, the UI labels the variant as unrecorded or reports a selected-cache fallback rather than inferring a method.
 
 ## Phase 3A — Resumable whole-book PDF design (AUD-001)
 
@@ -186,7 +190,7 @@ The audit and Phase 1 browser journey do not establish that the entire interface
 ## Safety checklist
 
 - [x] Phase 1 changes are limited to draft feedback and its necessary regression journey/tests.
-- [x] Phase 2 and Phase 3A remain specifications only.
+- [x] Phase 2 source-text review is implemented and verified; Phase 3A remains a specification only.
 - [x] Phase 3B and Phase 4 are not implemented.
 - [x] No live Gemini or Mealie calls were made.
 - [x] Production import/review histories, source scans, extraction caches, and recipe records were not modified.
@@ -195,4 +199,4 @@ The audit and Phase 1 browser journey do not establish that the entire interface
 
 ## Phase gates
 
-Phase 1 is complete only with passing targeted and full offline tests, the synthetic Chromium journey, clean compilation/help/diff checks, a pushed implementation commit, and Windows CI verified at that exact SHA. Phase 2 awaits separate implementation approval. Phase 3B awaits independent review of this design and separate implementation approval. Phase 4 remains deferred unless a concrete maintenance benefit and compatibility plan are approved. No phase automatically authorizes the next.
+Phases 1 and 2 are complete with passing targeted and full offline tests, synthetic Chromium journeys, clean compilation/help/diff checks, pushed implementation commits, and Windows CI verified at each implementation SHA. Phase 3B awaits independent review of its design and separate implementation approval. Phase 4 remains deferred unless a concrete maintenance benefit and compatibility plan are approved. No phase automatically authorizes the next.
