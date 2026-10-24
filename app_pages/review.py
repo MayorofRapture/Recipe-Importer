@@ -26,10 +26,12 @@ from app_pages.common import (
     save_draft,
     structured_widget_key,
     sync_buffer,
+    paths,
     _buffer_signature,
     _revision_bindings,
 )
-from ui_data import extraction_quality_audit, render_source_page, verify_selected_source
+from ui_data import (extraction_quality_audit, render_source_page,
+                     source_text_for_page, verify_selected_source)
 from review_queue_state import QueueState
 from recipe_quality import is_complete
 from recipe_validation import propose_repair, validate_recipe
@@ -1415,6 +1417,7 @@ def _select_quality_result(candidate_id: str, field_path: str) -> None:
     st.session_state.review_quality_target = (candidate_id, field_path)
 
 def _render_source(view, buffer) -> None:
+    output, _ = paths()
     with st.container(border=True):
         st.markdown(f"**Source scan** · {view.source_display_name}")
         if not view.source_verified or not view.source_available:
@@ -1432,7 +1435,6 @@ def _render_source(view, buffer) -> None:
                 if hashlib.sha256(source_bytes).hexdigest() != view.source_hash:
                     st.error("This file does not match the original source hash. It was not saved or linked.")
                 else:
-                    from app_pages.common import paths
                     output, _ = paths()
                     suffix = Path(uploaded.name).suffix.casefold()
                     destination = output / "recovered_sources" / f"{view.candidate_id}-{view.source_hash}{suffix}"
@@ -1448,11 +1450,15 @@ def _render_source(view, buffer) -> None:
                         st.rerun(scope="app")
                     except Exception as exc:
                         st.error(f"The source file was not linked. {exc}")
+            _render_source_text(view, 1, output,
+                                page_key=f"source_text_page:{view.candidate_id}",
+                                allow_page_selection=True)
             _render_manual_approval(view, buffer)
             return
         count("preview_renders")
         page_key = f"page:{view.candidate_id}"
         st.session_state.setdefault(page_key, int(load_resume_pointer().get("source_page", 1)))
+        page = int(st.session_state.get(page_key, 1))
         zoom_key = f"zoom:{view.candidate_id}"
         zoom_options = {"Fit": 1.0, "Inspect": 1.5, "More detail": 2.0}
         st.session_state.setdefault(zoom_key, "Fit")
@@ -1474,6 +1480,7 @@ def _render_source(view, buffer) -> None:
             st.image(preview.image, width="stretch", alt=f"Recipe source page {preview.page_number}")
         else:
             st.warning(preview.message or "Source preview unavailable.")
+        _render_source_text(view, page, output)
         with st.expander("Source and extraction details"):
             st.caption(f"Collection: {view.batch_name}")
             st.caption(f"Method: {view.candidate.source_method or 'Not recorded'}")
@@ -1481,6 +1488,43 @@ def _render_source(view, buffer) -> None:
                 st.caption(f"Reported confidence: {view.candidate.confidence}")
             for note in view.candidate.uncertainties:
                 st.write(note)
+
+
+def _render_source_text(view, page_number: int, output_dir: Path,
+                        *, page_key: str = "", allow_page_selection: bool = False) -> None:
+    result = source_text_for_page(view, page_number, output_dir)
+    if allow_page_selection and result.page_numbers:
+        selected = st.session_state.get(page_key, page_number)
+        if selected not in result.page_numbers:
+            selected = result.page_numbers[0]
+        st.session_state[page_key] = selected
+        if len(result.page_numbers) > 1:
+            st.selectbox("Source text page", result.page_numbers, key=page_key,
+                         format_func=lambda value: f"{value} of {result.page_count}")
+        result = source_text_for_page(view, int(st.session_state[page_key]), output_dir)
+
+    st.subheader("Source text")
+    if result.status == "available":
+        st.caption(f"Read-only · page {result.page_number} of {result.page_count or result.page_number} · {result.method}")
+        if not view.source_verified or not view.source_available:
+            st.warning("Original source is unavailable. This cached text cannot be checked against the scan.")
+        for note in result.uncertainty:
+            if "Original source is unavailable" not in note:
+                st.caption(note)
+        st.text(result.text)
+        return
+
+    messages = {
+        "identity_invalid": "Source text is unavailable because this recipe has no valid source identity.",
+        "source_mismatch": "Source text is hidden because the selected file does not match this recipe's source hash.",
+        "ambiguous_page": "Cached text has no reliable page mapping, so it is hidden rather than assigned to a page.",
+        "cache_unreadable": "The saved source-text cache is missing, too large, or unreadable.",
+        "page_unavailable": "That source page is unavailable.",
+        "source_unavailable": "The original source cannot be checked and no safe cached text is available.",
+        "no_text": "No selectable text or cached OCR text is available for this page.",
+    }
+    st.caption(f"Read-only · page {result.page_number} · {result.method or 'Source-derived text'}")
+    st.info(messages.get(result.status, "Source-derived text is unavailable."))
 
 
 @st.fragment

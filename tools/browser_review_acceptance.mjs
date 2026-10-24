@@ -206,6 +206,23 @@ async function clickVisibleText(cdp, text, selector = 'button,a,[role="button"]'
   await evaluate(cdp, 'new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))');
   console.error(`Clicked ${JSON.stringify({ text: point.text, x: Math.round(point.x), y: Math.round(point.y) })}`);
 }
+async function pressKey(cdp, key, code, windowsVirtualKeyCode) {
+  await cdp.send('Input.dispatchKeyEvent', { type: 'keyDown', key, code, windowsVirtualKeyCode });
+  await cdp.send('Input.dispatchKeyEvent', { type: 'keyUp', key, code, windowsVirtualKeyCode });
+}
+async function tabToSourcePageControl(cdp) {
+  const trail = [];
+  for (let index = 0; index < 50; index += 1) {
+    await pressKey(cdp, 'Tab', 'Tab', 9);
+    const focus = await evaluate(cdp, `(() => { const e=document.activeElement; return {
+      tag:e?.tagName||'', role:e?.getAttribute('role')||'', label:e?.getAttribute('aria-label')||'',
+      visible:!!e?.getClientRects().length, focusedText:(e?.innerText||'').trim().slice(0,60)
+    }; })()`);
+    trail.push(focus);
+    if (focus.label === 'Page' && focus.visible) return trail;
+  }
+  throw new Error(`Keyboard Tab did not reach the source page control; focus trail=${JSON.stringify(trail)}.`);
+}
 async function ensureExpanderOpen(cdp, text) {
   const state = await evaluate(cdp, `(() => {const e=[...document.querySelectorAll('[data-testid="stExpander"]')].find(x=>x.innerText.includes(${JSON.stringify(text)}));return e?{open:e.innerText.includes('keyboard_arrow_down'),text:e.innerText.slice(0,120)}:null})()`);
   if (!state) throw new Error(`Could not find expander containing ${text}.`);
@@ -317,6 +334,62 @@ try {
   const friedRiceId = await assertActiveCandidate(cdp, fixture, 'Fried Rice', { revision: 0 });
   const timings = { firstReviewSettledMs: Date.now() - navigationStarted };
   const evidence = { screenshots: [await screenshot(cdp, 'browser-review-after-precise-1440x900.png')], timings };
+  const firstSourceText = await evaluate(cdp, `(() => {
+    const sections=[...document.querySelectorAll('[data-testid="stText"]')]
+      .filter(element=>element.getClientRects().length).map(element=>element.innerText.trim());
+    return JSON.stringify({sections, body:document.body.innerText.includes('Source text')});
+  })()`);
+  const firstSource = JSON.parse(firstSourceText || '{}');
+  if (!firstSource.body || !firstSource.sections.some(text=>text.includes('Fried Rice')&&text.includes('Cook rice.'))
+      || firstSource.sections.some(text=>text.includes('The Best Caramel Apples'))) {
+    throw new Error(`Source text did not show only the selected source page: ${JSON.stringify(firstSource)}.`);
+  }
+  evidence.sourceTextStyleAudit = await evaluate(cdp, `(() => {
+    const color=(value)=>{const m=value.match(/rgba?\\((\\d+),\\s*(\\d+),\\s*(\\d+)/);return m?m.slice(1,4).map(Number):null};
+    const luminance=(rgb)=>{const values=rgb.map(v=>v/255).map(v=>v<=.04045?v/12.92:((v+.055)/1.055)**2.4);return .2126*values[0]+.7152*values[1]+.0722*values[2]};
+    const ratio=(a,b)=>{const x=luminance(a),y=luminance(b);return (Math.max(x,y)+.05)/(Math.min(x,y)+.05)};
+    const text=[...document.querySelectorAll('[data-testid="stText"]')].find(e=>e.innerText.includes('Cook rice.'));
+    const caption=[...document.querySelectorAll('[data-testid="stCaptionContainer"]')].find(e=>e.innerText.includes('Read-only'));
+    const read=(element)=>{if(!element)return null;const style=getComputedStyle(element),fg=color(style.color);let bg=element;let background=null;
+      while(bg){const parsed=color(getComputedStyle(bg).backgroundColor);if(parsed&&getComputedStyle(bg).backgroundColor!=='rgba(0, 0, 0, 0)'){background=parsed;break}bg=bg.parentElement}
+      background=background||[255,255,255];return {color:style.color,background:'rgb('+background.join(', ')+')',fontSize:style.fontSize,contrast:fg?Number(ratio(fg,background).toFixed(2)):null};};
+    return {sourceText:read(text),provenance:read(caption)};
+  })()`);
+  const initialAx = await cdp.send('Accessibility.getFullAXTree');
+  const axNodes = initialAx.nodes || [];
+  const sourceHeading = axNodes.some(node=>node.role?.value==='heading'&&node.name?.value==='Source text');
+  const sourceTextNode = axNodes.some(node=>node.name?.value?.includes('Cook rice.')
+    && (node.role?.value==='StaticText'||node.role?.value==='generic'));
+  const pageControlNode = axNodes.some(node=>node.role?.value==='combobox'&&node.name?.value==='Page');
+  if (!sourceHeading || !sourceTextNode || !pageControlNode) {
+    throw new Error(`Source text or its page control is missing from the accessibility tree: ${JSON.stringify({sourceHeading,sourceTextNode,pageControlNode,
+      candidates:axNodes.filter(node=>node.name?.value?.includes('Source text')||node.name?.value?.includes('Cook rice.'))
+        .map(node=>({role:node.role?.value,name:node.name?.value}))})}.`);
+  }
+  evidence.sourceTextAccessibilityTree = { heading: true, sourceText: true, pageControl: true };
+  const focusTrail = await tabToSourcePageControl(cdp);
+  const focusState = await evaluate(cdp, `(() => {const e=document.activeElement,s=getComputedStyle(e);return {
+    label:e.getAttribute('aria-label'),outlineStyle:s.outlineStyle,outlineWidth:s.outlineWidth,
+    outlineColor:s.outlineColor,boxShadow:s.boxShadow,borderColor:s.borderColor,
+    rect:(()=>{const r=e.getBoundingClientRect();return {width:r.width,height:r.height}})()
+  }})()`);
+  evidence.sourcePageKeyboardFocus = focusState;
+  evidence.screenshots.push(await screenshot(cdp, 'browser-review-source-page-keyboard-focus.png'));
+  await pressKey(cdp, 'ArrowDown', 'ArrowDown', 40);
+  await pressKey(cdp, 'Enter', 'Enter', 13);
+  await waitFor(cdp, `(() => {
+    const text=[...document.querySelectorAll('[data-testid="stText"]')].filter(e=>e.getClientRects().length)
+      .map(e=>e.innerText.trim()).join(' ');
+    return text.includes('The Best Caramel Apples')&&!text.includes('Cook rice.');
+  })()`, 'keyboard-selected source page text');
+  evidence.sourceTextKeyboardNavigation = { tabsToPageControl: focusTrail.length };
+  await evaluate(cdp, `(() => {const h=[...document.querySelectorAll('h1,h2,h3,h4')]
+    .find(e=>e.innerText.trim()==='Source text');h?.scrollIntoView({block:'center'});return !!h})()`);
+  evidence.screenshots.push(await screenshot(cdp, 'browser-review-source-text-readable.png'));
+  await pressKey(cdp, 'ArrowUp', 'ArrowUp', 38);
+  await pressKey(cdp, 'Enter', 'Enter', 13);
+  await waitFor(cdp, `(() => [...document.querySelectorAll('[data-testid="stText"]')]
+    .filter(e=>e.getClientRects().length).some(e=>e.innerText.includes('Cook rice.')))()`, 'return to source page one');
   if (arg('inspect') === 'true') {
     console.log(JSON.stringify(await evaluate(cdp, `JSON.stringify({body:document.body.innerText.slice(0,2400),controls:[...document.querySelectorAll('input,textarea,button,[role="tab"]')].map(e=>({tag:e.tagName,role:e.getAttribute('role'),aria:e.getAttribute('aria-label'),text:e.innerText?.trim().slice(0,80),value:e.value?.slice(0,100),disabled:e.disabled})).filter(x=>x.aria||x.text)})`), null, 2));
     ws.close(); browser.kill(); await sleep(150); await rm(profile, { recursive: true, force: true }).catch(() => {});

@@ -14,7 +14,10 @@ from typing import Any, Iterable
 from functools import lru_cache
 
 from draft_store import DraftStore
-from import_recipes import StateStore, candidate_identity, file_digest
+from import_recipes import (
+    OCR_STRUCTURE_CACHE_VERSION, OCR_STRUCTURE_PROMPT_VERSION,
+    StateStore, _ocr_text_paths, candidate_identity, file_digest,
+)
 from import_protection import ImportProtectionError, protected_candidate_ids
 from quick_edit import ParseWarning, parse_ingredients, parse_instructions
 from recipe_quality import ExtractionBatch, RecipeCandidate, is_complete, needs_review
@@ -81,6 +84,19 @@ class SourcePage:
     page_count: int
     page_number: int
     message: str = ""
+
+
+@dataclass(frozen=True)
+class SourceTextPage:
+    """Read-only, page-bound source transcription and its provenance."""
+
+    text: str = ""
+    page_number: int = 1
+    page_count: int = 0
+    page_numbers: tuple[int, ...] = ()
+    status: str = "no_text"
+    method: str = ""
+    uncertainty: tuple[str, ...] = ()
 
 
 class _SourceIndex:
@@ -540,6 +556,249 @@ def render_source_page(path: Path, page_number: int = 1, zoom: float = 1) -> Sou
         return SourcePage(None, 0, page_number, "Source file is unavailable.")
     return _render_source_cached(str(path.resolve()), stamp.st_mtime_ns, stamp.st_size,
                                  int(page_number), float(zoom))
+
+
+_SOURCE_TEXT_CACHE_LIMIT = 4 * 1024 * 1024
+_SOURCE_TEXT_METADATA_LIMIT = 1024 * 1024
+_SOURCE_TEXT_PAGE_MARKER = re.compile(r"(?m)^---[ \t]+(?:OCR|PDF)[ \t]+PAGE[ \t]+(\d+)[ \t]+---[ \t]*\r?$")
+
+
+def source_text_for_page(view: RecipeView, page_number: int,
+                         output_dir: Path) -> SourceTextPage:
+    """Return selectable page text or an existing hash-bound OCR page, without writing."""
+    digest = str(view.source_hash or "").casefold()
+    if (not view.candidate_id or not re.fullmatch(r"[0-9a-f]{64}", digest)
+            or page_number < 1):
+        return SourceTextPage(page_number=page_number, status="identity_invalid",
+                              method="Source identity unavailable")
+
+    source = Path(view.source_path) if view.source_path else None
+    source_exists = False
+    source_verified = False
+    page_count = 0
+    if source is not None:
+        from runtime_safety import fixture_mode, fixture_source_allowed
+        if fixture_mode() and not fixture_source_allowed(source):
+            return SourceTextPage(page_number=page_number, status="source_unavailable",
+                                  method="Source text unavailable")
+        try:
+            source_exists = source.is_file()
+        except OSError:
+            source_exists = False
+        if source_exists:
+            if view.source_verified and view.source_available:
+                source_verified = True
+            else:
+                try:
+                    source_verified = file_digest(source) == digest
+                except OSError:
+                    source_verified = False
+            if not source_verified:
+                return SourceTextPage(page_number=page_number, status="source_mismatch",
+                                      method="Source hash does not match this recipe")
+
+    if source_verified and source and source.suffix.casefold() == ".pdf":
+        try:
+            text, page_count = _selectable_pdf_page_text(
+                str(source.resolve()), digest, source.stat().st_mtime_ns,
+                source.stat().st_size, page_number,
+            )
+        except Exception:
+            text = ""
+        if page_count and page_number > page_count:
+            return SourceTextPage(page_number=page_number, page_count=page_count,
+                                  page_numbers=tuple(range(1, page_count + 1)),
+                                  status="page_unavailable", method="PDF page unavailable")
+        if text:
+            return SourceTextPage(
+                text=text, page_number=page_number, page_count=page_count,
+                page_numbers=tuple(range(1, page_count + 1)), status="available",
+                method="Selectable PDF text",
+                uncertainty=("Selectable text may omit words contained in images or graphics.",),
+            )
+
+    output = Path(output_dir)
+    paths = _ocr_text_paths(output, digest)
+    metadata = _source_text_ocr_metadata(output, digest)
+    preferred = metadata[0]
+    choices = ["selected"]
+    if preferred in {"original", "layout"}:
+        choices.append(preferred)
+    choices.extend(("original", "layout"))
+    cache_path = next((paths[name] for name in dict.fromkeys(choices)
+                       if paths[name].is_file()), None)
+    method_suffix = ""
+    if cache_path is None:
+        legacy_path = output / "ocr_text" / f"{digest}.txt"
+        if legacy_path.is_file():
+            cache_path = legacy_path
+            method_suffix = "legacy cache"
+    if cache_path is None:
+        return SourceTextPage(page_number=page_number, page_count=page_count,
+                              page_numbers=tuple(range(1, page_count + 1)),
+                              status="no_text", method="No selectable or cached source text")
+
+    try:
+        stat = cache_path.stat()
+        cache_text, read_status = _read_source_text_cache(
+            str(cache_path.resolve()), stat.st_mtime_ns, stat.st_ctime_ns, stat.st_size,
+        )
+    except OSError:
+        cache_text, read_status = "", "cache_unreadable"
+    if read_status != "available":
+        return SourceTextPage(page_number=page_number, page_count=page_count,
+                              status=read_status, method="Cached OCR text unavailable")
+
+    markers = _source_text_page_markers(
+        str(cache_path.resolve()), stat.st_mtime_ns, stat.st_ctime_ns, stat.st_size,
+    )
+    uncertainty = ["Local OCR may misread characters or reading order; compare this text with the scan."]
+    if metadata[1]:
+        uncertainty.extend(metadata[1])
+    if not source_exists:
+        uncertainty.insert(0, "Original source is unavailable; this cached text cannot be checked against the scan.")
+
+    if markers:
+        page_numbers = tuple(sorted({item[0] for item in markers}))
+        matching = [item for item in markers if item[0] == page_number]
+        if len(matching) != 1:
+            status = "ambiguous_page" if len(matching) > 1 else "no_text"
+            return SourceTextPage(page_number=page_number,
+                                  page_count=max(page_numbers, default=page_count),
+                                  page_numbers=page_numbers, status=status,
+                                  method="Cached OCR text with page markers",
+                                  uncertainty=tuple(uncertainty))
+        _marker_page, marker_start, marker_end = matching[0]
+        end = next((item[1] for item in markers if item[1] > marker_start), len(cache_text))
+        text = cache_text[marker_end:end].strip()
+        page_count = max(page_numbers, default=page_count)
+    else:
+        page_numbers = ()
+        is_single_image = bool(source and source.suffix.casefold() in {".jpg", ".jpeg", ".png", ".webp"})
+        is_verified_single_pdf = bool(source_verified and source and source.suffix.casefold() == ".pdf"
+                                      and page_count == 1)
+        if not (is_single_image or is_verified_single_pdf):
+            return SourceTextPage(page_number=page_number, page_count=page_count,
+                                  status="ambiguous_page", method="Cached OCR page mapping unavailable",
+                                  uncertainty=tuple(uncertainty))
+        page_numbers = (1,)
+        text = cache_text.strip()
+        page_count = 1
+
+    if not text:
+        return SourceTextPage(page_number=page_number, page_count=page_count,
+                              page_numbers=page_numbers, status="no_text",
+                              method="No OCR text for this source page",
+                              uncertainty=tuple(uncertainty))
+
+    selected_cache = cache_path == paths["selected"]
+    variant_cache = next((name for name in ("original", "layout")
+                          if cache_path == paths[name]), "")
+    if method_suffix:
+        method = "Legacy cached OCR text (variant not recorded)"
+    elif selected_cache and preferred:
+        method = f"Cached OCR text ({preferred} variant selected)"
+    elif selected_cache:
+        method = "Cached OCR text (selected variant details not recorded)"
+    elif variant_cache in {"original", "layout"}:
+        method = f"Cached OCR text ({variant_cache} variant; selected cache unavailable)"
+    else:
+        method = "Cached OCR text (variant not recorded)"
+    return SourceTextPage(text=text, page_number=page_number, page_count=page_count,
+                          page_numbers=page_numbers, status="available", method=method,
+                          uncertainty=tuple(dict.fromkeys(uncertainty)))
+
+
+@lru_cache(maxsize=64)
+def _selectable_pdf_page_text(path_value: str, digest: str, modified_ns: int,
+                              size: int, page_number: int) -> tuple[str, int]:
+    """Cache one verified page extraction; callers freshly verify source bytes first."""
+    import fitz
+
+    document = fitz.open(path_value)
+    try:
+        page_count = len(document)
+        if not 1 <= page_number <= page_count:
+            return "", page_count
+        return str(document[page_number - 1].get_text("text") or "").strip(), page_count
+    finally:
+        document.close()
+
+
+@lru_cache(maxsize=16)
+def _read_source_text_cache(path_value: str, modified_ns: int, changed_ns: int,
+                            size: int) -> tuple[str, str]:
+    if size > _SOURCE_TEXT_CACHE_LIMIT:
+        return "", "cache_unreadable"
+    try:
+        with Path(path_value).open("rb") as handle:
+            raw = handle.read(_SOURCE_TEXT_CACHE_LIMIT + 1)
+    except OSError:
+        return "", "cache_unreadable"
+    if len(raw) > _SOURCE_TEXT_CACHE_LIMIT:
+        return "", "cache_unreadable"
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return "", "cache_unreadable"
+    return (text, "available") if text.strip() else ("", "no_text")
+
+
+def _source_text_ocr_metadata(output_dir: Path, digest: str) -> tuple[str, tuple[str, ...]]:
+    directory = Path(output_dir) / "extracted"
+    try:
+        paths = sorted(directory.glob(f"{digest}--ocr-structure--*.json"),
+                       key=lambda item: item.stat().st_mtime_ns, reverse=True)[:8]
+    except OSError:
+        return "", ()
+    for path in paths:
+        try:
+            stat = path.stat()
+            variant, notes = _read_source_text_metadata(
+                str(path.resolve()), digest, stat.st_mtime_ns, stat.st_ctime_ns, stat.st_size,
+            )
+        except OSError:
+            continue
+        if variant:
+            return variant, notes
+    return "", ()
+
+
+@lru_cache(maxsize=64)
+def _read_source_text_metadata(path_value: str, digest: str,
+                               modified_ns: int, changed_ns: int,
+                               size: int) -> tuple[str, tuple[str, ...]]:
+    if size > _SOURCE_TEXT_METADATA_LIMIT:
+        return "", ()
+    try:
+        with Path(path_value).open("rb") as handle:
+            raw_bytes = handle.read(_SOURCE_TEXT_METADATA_LIMIT + 1)
+        if len(raw_bytes) > _SOURCE_TEXT_METADATA_LIMIT:
+            return "", ()
+        raw = json.loads(raw_bytes.decode("utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return "", ()
+    if (not isinstance(raw, dict) or raw.get("source_hash") != digest
+            or raw.get("schema_version") != OCR_STRUCTURE_CACHE_VERSION
+            or raw.get("prompt_version") != OCR_STRUCTURE_PROMPT_VERSION):
+        return "", ()
+    variant = str(raw.get("ocr_selected_variant") or "")
+    if variant not in {"original", "layout"}:
+        variant = ""
+    notes = raw.get("ocr_selection_reason", [])
+    if not isinstance(notes, list):
+        notes = []
+    return variant, tuple(str(note)[:300] for note in notes if str(note).strip())[:5]
+
+
+@lru_cache(maxsize=16)
+def _source_text_page_markers(path_value: str, modified_ns: int, changed_ns: int,
+                              size: int) -> tuple[tuple[int, int, int], ...]:
+    text, status = _read_source_text_cache(path_value, modified_ns, changed_ns, size)
+    if status != "available":
+        return ()
+    return tuple((int(match.group(1)), match.start(), match.end())
+                 for match in _SOURCE_TEXT_PAGE_MARKER.finditer(text))
 
 
 def _source_preview_pixel_limit(zoom: float) -> tuple[int, int]:

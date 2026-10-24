@@ -5,15 +5,250 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import fitz
+from PIL import Image
+
 from tests.ui_fixture_factory import write_ui_fixture
 from batch_store import BatchStore
-from import_recipes import file_digest
+from import_recipes import _ocr_text_paths, file_digest
 from recipe_quality import ExtractionBatch, RecipeCandidate
 from review_store import ReviewStore
-from ui_data import RecipeView, extraction_quality_audit, load_catalog, next_unresolved, render_source_page
+from ui_data import (RecipeView, extraction_quality_audit, load_catalog, next_unresolved,
+                     render_source_page, source_text_for_page)
 
 
 class UiDataTests(unittest.TestCase):
+    def _source_text_view(self, source: Path, digest: str | None = None, candidate_id: str = "synthetic-recipe") -> RecipeView:
+        return RecipeView(
+            candidate_id, digest or file_digest(source), str(source),
+            RecipeCandidate(name=candidate_id, ingredients=["1 cup test flour"],
+                            instructions=["Mix the synthetic ingredients."]),
+            "Ready to review",
+        )
+
+    @staticmethod
+    def _write_pdf(path: Path, pages: list[str]) -> None:
+        document = fitz.open()
+        for text in pages:
+            page = document.new_page()
+            if text:
+                page.insert_text((72, 72), text)
+        document.save(path)
+        document.close()
+
+    def test_source_text_uses_selectable_pdf_text_for_only_the_requested_page(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "two-pages.pdf"
+            self._write_pdf(source, ["Alpha page one", "Beta page two"])
+            output = root / "output"
+            view = self._source_text_view(source)
+
+            first = source_text_for_page(view, 1, output)
+            second = source_text_for_page(view, 2, output)
+
+            self.assertEqual(first.status, "available")
+            self.assertEqual(first.method, "Selectable PDF text")
+            self.assertIn("Alpha page one", first.text)
+            self.assertNotIn("Beta page two", first.text)
+            self.assertEqual((first.page_number, first.page_count), (1, 2))
+            self.assertIn("Beta page two", second.text)
+            self.assertNotIn("Alpha page one", second.text)
+            self.assertEqual((second.page_number, second.page_count), (2, 2))
+
+    def test_source_text_uses_only_the_hash_bound_ocr_page_for_scanned_pdf(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "scanned.pdf"
+            self._write_pdf(source, ["", ""])
+            output = root / "output"
+            view = self._source_text_view(source)
+            cache = _ocr_text_paths(output, view.source_hash)["selected"]
+            cache.parent.mkdir(parents=True)
+            cache.write_text("--- OCR PAGE 1 ---\nFirst scan page\n\n--- OCR PAGE 2 ---\nSecond scan page\n", encoding="utf-8")
+
+            result = source_text_for_page(view, 2, output)
+
+        self.assertEqual(result.status, "available")
+        self.assertIn("Second scan page", result.text)
+        self.assertNotIn("First scan page", result.text)
+        self.assertEqual((result.page_number, result.page_count), (2, 2))
+        self.assertTrue(any("OCR" in note for note in result.uncertainty))
+
+    def test_source_text_accepts_unmarked_hash_bound_ocr_for_single_page_image(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "single.png"
+            Image.new("RGB", (24, 24), "white").save(source)
+            output = root / "output"
+            view = self._source_text_view(source)
+            cache = _ocr_text_paths(output, view.source_hash)["selected"]
+            cache.parent.mkdir(parents=True)
+            cache.write_text("Synthetic image transcription", encoding="utf-8")
+
+            result = source_text_for_page(view, 1, output)
+
+        self.assertEqual(result.status, "available")
+        self.assertEqual(result.text, "Synthetic image transcription")
+        self.assertEqual((result.page_number, result.page_count), (1, 1))
+        self.assertIn("OCR", result.method)
+
+    def test_source_text_rejects_unmarked_cache_for_multipage_pdf(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "scanned.pdf"
+            self._write_pdf(source, ["", ""])
+            output = root / "output"
+            view = self._source_text_view(source)
+            cache = _ocr_text_paths(output, view.source_hash)["selected"]
+            cache.parent.mkdir(parents=True)
+            cache.write_text("Text with no reliable page markers", encoding="utf-8")
+
+            result = source_text_for_page(view, 1, output)
+
+        self.assertEqual(result.status, "ambiguous_page")
+        self.assertEqual(result.text, "")
+
+    def test_source_text_rejects_duplicate_page_markers_as_ambiguous(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "scan.pdf"
+            self._write_pdf(source, [""])
+            output = root / "output"
+            view = self._source_text_view(source)
+            cache = _ocr_text_paths(output, view.source_hash)["selected"]
+            cache.parent.mkdir(parents=True)
+            cache.write_text("--- OCR PAGE 1 ---\nFirst section\n--- PDF PAGE 1 ---\nSecond section\n",
+                             encoding="utf-8")
+
+            result = source_text_for_page(view, 1, output)
+
+        self.assertEqual(result.status, "ambiguous_page")
+        self.assertEqual(result.text, "")
+
+    def test_source_text_bounds_oversized_cache_reads(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "scan.png"
+            Image.new("RGB", (24, 24), "white").save(source)
+            output = root / "output"
+            view = self._source_text_view(source)
+            cache = _ocr_text_paths(output, view.source_hash)["selected"]
+            cache.parent.mkdir(parents=True)
+            cache.write_bytes(b"x" * (4 * 1024 * 1024 + 1))
+
+            result = source_text_for_page(view, 1, output)
+
+        self.assertEqual(result.status, "cache_unreadable")
+        self.assertEqual(result.text, "")
+
+    def test_source_text_rejects_cache_when_present_source_hash_mismatches(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "changed.pdf"
+            self._write_pdf(source, ["Changed source bytes"])
+            expected_hash = "a" * 64
+            output = root / "output"
+            cache = _ocr_text_paths(output, expected_hash)["selected"]
+            cache.parent.mkdir(parents=True)
+            cache.write_text("Must not be shown", encoding="utf-8")
+            view = self._source_text_view(source, expected_hash)
+
+            result = source_text_for_page(view, 1, output)
+
+        self.assertEqual(result.status, "source_mismatch")
+        self.assertEqual(result.text, "")
+
+    def test_source_text_can_show_hash_bound_cache_when_original_is_missing_with_notice(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            output = root / "output"
+            digest = "b" * 64
+            source = root / "missing.pdf"
+            view = self._source_text_view(source, digest)
+            cache = _ocr_text_paths(output, digest)["selected"]
+            cache.parent.mkdir(parents=True)
+            cache.write_text("--- OCR PAGE 1 ---\nCached page one\n", encoding="utf-8")
+
+            result = source_text_for_page(view, 1, output)
+
+        self.assertEqual(result.status, "available")
+        self.assertIn("Cached page one", result.text)
+        self.assertTrue(any("Original source is unavailable" in note for note in result.uncertainty))
+
+    def test_source_text_reports_missing_and_unreadable_caches_without_raising(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "scan.pdf"
+            self._write_pdf(source, [""])
+            output = root / "output"
+            view = self._source_text_view(source)
+            missing = source_text_for_page(view, 1, output)
+            cache = _ocr_text_paths(output, view.source_hash)["selected"]
+            cache.parent.mkdir(parents=True)
+            cache.write_bytes(b"\xff\xfe\xfa")
+
+            unreadable = source_text_for_page(view, 1, output)
+
+        self.assertEqual(missing.status, "no_text")
+        self.assertEqual(unreadable.status, "cache_unreadable")
+        self.assertEqual(unreadable.text, "")
+
+    def test_source_text_uses_recorded_variant_when_selected_cache_is_missing(self):
+        from import_recipes import OCR_STRUCTURE_CACHE_VERSION, OCR_STRUCTURE_PROMPT_VERSION
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "scan.pdf"
+            self._write_pdf(source, [""])
+            output = root / "output"
+            view = self._source_text_view(source)
+            text_dir = output / "ocr_text"
+            text_dir.mkdir(parents=True)
+            _ocr_text_paths(output, view.source_hash)["layout"].write_text(
+                "--- OCR PAGE 1 ---\nLayout variant only", encoding="utf-8")
+            extracted = output / "extracted"
+            extracted.mkdir()
+            metadata = {
+                "schema_version": OCR_STRUCTURE_CACHE_VERSION,
+                "prompt_version": OCR_STRUCTURE_PROMPT_VERSION,
+                "source_hash": view.source_hash,
+                "ocr_selected_variant": "layout",
+                "ocr_selection_reason": ["Layout order selected for this scan."],
+                "batch": {"recipes": []},
+            }
+            (extracted / f"{view.source_hash}--ocr-structure--local-1.json").write_text(
+                json.dumps(metadata), encoding="utf-8")
+
+            result = source_text_for_page(view, 1, output)
+
+        self.assertEqual(result.status, "available")
+        self.assertEqual(result.text, "Layout variant only")
+        self.assertIn("layout", result.method.casefold())
+        self.assertIn("Layout order selected for this scan.", result.uncertainty)
+
+    def test_source_text_cache_is_bound_to_selected_candidate_hash(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            output = root / "output"
+            views = []
+            for name, content, color in (("first.jpg", "First candidate text", "white"),
+                                          ("second.jpg", "Second candidate text", "black")):
+                source = root / name
+                Image.new("RGB", (24, 24), color).save(source)
+                view = self._source_text_view(source, candidate_id=name)
+                cache = _ocr_text_paths(output, view.source_hash)["selected"]
+                cache.parent.mkdir(parents=True, exist_ok=True)
+                cache.write_text(content, encoding="utf-8")
+                views.append(view)
+
+            first = source_text_for_page(views[0], 1, output)
+            second = source_text_for_page(views[1], 1, output)
+
+        self.assertEqual(first.text, "First candidate text")
+        self.assertEqual(second.text, "Second candidate text")
+        self.assertNotIn(first.text, second.text)
+
     def test_review_projection_exposes_shared_semantic_ingredient_findings(self):
         candidate = RecipeCandidate(
             ingredients=["Combine 1 cup flour and 2 eggs in a bowl."], instructions=[],

@@ -8,11 +8,72 @@ from unittest.mock import patch
 from streamlit.testing.v1 import AppTest
 
 from tests.ui_fixture_factory import write_ui_fixture
+from import_recipes import _ocr_text_paths
 
 APP_PATH = Path(__file__).resolve().parents[1] / "streamlit_app.py"
 
 
 class StreamlitReviewTests(unittest.TestCase):
+    def test_review_shows_hash_bound_cached_text_with_unavailable_source_notice(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = write_ui_fixture(Path(tmp))
+            source = Path(fixture["source"])
+            source.unlink()
+            cache = _ocr_text_paths(Path(fixture["output"]), str(fixture["digest"]))["selected"]
+            cache.parent.mkdir(parents=True, exist_ok=True)
+            cache.write_text(
+                "--- OCR PAGE 1 ---\nCached recipe one\n\n--- OCR PAGE 2 ---\nCached recipe two\n",
+                encoding="utf-8",
+            )
+            with patch.dict(os.environ, {
+                "RECIPE_IMPORTER_OUTPUT_DIR": str(fixture["output"]),
+                "RECIPE_IMPORTER_SOURCE_DIR": str(Path(tmp, "sources")),
+            }, clear=False):
+                app = AppTest.from_file(str(APP_PATH)).run(timeout=10)
+                app = next(item for item in app.selectbox if item.label == "Jump to recipe").set_value(
+                    "Fried Rice").run(timeout=10)
+
+                first_text = "\n".join(str(item.value) for item in app.get("text"))
+                self.assertIn("Cached recipe one", first_text)
+                self.assertNotIn("Cached recipe two", first_text)
+                self.assertTrue(any("Original source is unavailable" in item.value for item in app.warning))
+
+                app = next(item for item in app.selectbox if item.label == "Source text page").set_value(2).run(timeout=10)
+                second_text = "\n".join(str(item.value) for item in app.get("text"))
+
+        self.assertFalse(app.exception)
+        self.assertIn("Cached recipe two", second_text)
+        self.assertNotIn("Cached recipe one", second_text)
+
+    def test_review_source_text_tracks_page_and_does_not_change_review_or_import_history(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = write_ui_fixture(Path(tmp))
+            output = Path(fixture["output"])
+            review_path = output / "review_events.jsonl"
+            import_path = output / "import_state.jsonl"
+            review_before = review_path.read_bytes()
+            import_before = import_path.read_bytes() if import_path.exists() else None
+            with patch.dict(os.environ, {
+                "RECIPE_IMPORTER_OUTPUT_DIR": str(output),
+                "RECIPE_IMPORTER_SOURCE_DIR": str(Path(tmp, "sources")),
+            }, clear=False):
+                app = AppTest.from_file(str(APP_PATH)).run(timeout=10)
+                app = next(item for item in app.selectbox if item.label == "Jump to recipe").set_value(
+                    "Fried Rice").run(timeout=10)
+
+                self.assertTrue(any(item.value == "Source text" for item in app.get("subheader")))
+                first_text = "\n".join(str(item.value) for item in app.get("text"))
+                self.assertIn("Fried Rice", first_text)
+                self.assertNotIn("The Best Caramel Apples", first_text)
+
+                app = next(item for item in app.selectbox if item.label == "Page").set_value(2).run(timeout=10)
+                second_text = "\n".join(str(item.value) for item in app.get("text"))
+            self.assertFalse(app.exception)
+            self.assertIn("The Best Caramel Apples", second_text)
+            self.assertNotIn("Fried Rice", second_text)
+            self.assertEqual(review_path.read_bytes(), review_before)
+            self.assertEqual(import_path.read_bytes() if import_path.exists() else None, import_before)
+
     def test_review_page_loads_sanitized_catalog_without_external_services(self):
         with tempfile.TemporaryDirectory() as tmp:
             fixture = write_ui_fixture(Path(tmp))
