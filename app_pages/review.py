@@ -26,6 +26,7 @@ from app_pages.common import (
     save_draft,
     structured_widget_key,
     sync_buffer,
+    _buffer_signature,
     _revision_bindings,
 )
 from ui_data import extraction_quality_audit, render_source_page, verify_selected_source
@@ -493,17 +494,29 @@ def _apply_pending_queue_change(views) -> None:
 
 
 def _save(view, buffer, advance: bool) -> None:
+    previous_revision = int(buffer.get("_revision", view.revision))
+    feedback = st.session_state.get("review_save_state")
+    if isinstance(feedback, dict) and feedback.get("kind") == "draft_saved":
+        st.session_state.pop("review_save_state", None)
     try:
         record, _ = save_draft(view, buffer)
     except Exception as exc:
         st.error(f"Draft was not saved. Your current text remains on screen: {exc}")
         return
-    st.success(f"Draft saved (revision {record.revision}).")
+    message = (f"Draft saved (revision {record.revision})."
+               if record.revision != previous_revision
+               else f"Draft already saved (revision {record.revision}).")
+    st.session_state.review_save_state = {
+        "kind": "draft_saved",
+        "candidate_id": view.candidate_id,
+        "revision": record.revision,
+        "signature": buffer.get("_saved_signature"),
+        "message": message,
+    }
     st.session_state.review_active_selection = view.candidate_id
-    if record.revision != view.revision:
-        st.rerun()
-    if advance:
+    if record.revision == view.revision and advance:
         _advance_queue(1)
+    st.rerun()
 
 
 def _approve(view, buffer, *, approval_method: str = "source_verified",
@@ -1479,6 +1492,15 @@ def _render_editor_fragment(view, buffer) -> None:
     # Tab and row widgets rerun this fragment only, so capture both sections
     # before Streamlit cleans up the inactive tab's widget state.
     sync_buffer(view, buffer)
+    state = st.session_state.get("review_save_state")
+    if isinstance(state, dict) and state.get("kind") == "draft_saved":
+        if (state.get("candidate_id") != view.candidate_id
+                or state.get("revision") != buffer.get("_revision")
+                or state.get("signature") != _buffer_signature(view, buffer)
+                or buffer_is_dirty(view, buffer)):
+            st.session_state.pop("review_save_state", None)
+        else:
+            st.caption(state["message"])
     _render_editor(view, buffer)
     if diagnostics is not None:
         with st.expander("Performance counters", expanded=True):
@@ -1602,7 +1624,7 @@ def _render_actions(view, buffer) -> str:
         workspace_view = st.radio("Workspace view", ["Side by side", "Source", "Recipe"],
                                   key="review_workspace_view")
     state = st.session_state.get("review_save_state")
-    if state:
+    if isinstance(state, str) and state:
         st.caption(state)
     return workspace_view
 
