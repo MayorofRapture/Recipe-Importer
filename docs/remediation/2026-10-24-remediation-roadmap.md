@@ -8,7 +8,7 @@
 
 ## Scope and authority
 
-This roadmap records Phases 1 and 2 plus the completed Phase 3B.1 backend staging milestone. Phase 3A remains the design basis; page-range work in Phase 3B.2 onward requires separate approval after independent review. Phase 4 is deferred maintenance. A comprehensive visual/interaction redesign is a separate project and is outside this roadmap's implementation scope.
+This roadmap records Phases 1 and 2 plus the completed Phase 3B.1 parent staging and Phase 3B.2 page-range backend milestones. Phase 3A remains the design basis; Phase 3B.3 onward requires separate approval after independent review. Phase 4 is deferred maintenance. A comprehensive visual/interaction redesign is a separate project and is outside this roadmap's implementation scope.
 
 No phase authorizes a live Gemini or Mealie call, a production data change, a rewrite of production JSONL records, a PR merge, or changes to `.vscode/` or generated Graphify output. Keep `MEALIE_SUPPORTS_EMPTY_INSTRUCTIONS=false` until the separately authorized, version-matched Mealie check described in the compatibility document is completed.
 
@@ -100,7 +100,7 @@ Where legacy method provenance was not persisted, the UI labels the variant as u
 
 ## Phase 3A — Resumable whole-book PDF design (AUD-001)
 
-**Authorization:** This phase is the design basis. Phase 3B.1 was separately authorized and implemented as backend-only staging. Phase 3B.2 and later require separate approval after independent review of their range, job, and UI contracts.
+**Authorization:** This phase is the design basis. Phases 3B.1 and 3B.2 were separately authorized and implemented as backend-only parent staging and range creation. Phase 3B.3 and later require separate approval after independent review of their job, cache, provenance, and UI contracts.
 **Goal:** Process a cookbook as an immutable parent PDF with durable, user-selected, resumable page-range children. Do not implement by merely raising the current limits.
 
 ### Current constraints
@@ -117,9 +117,12 @@ BookDocument v1
   batch_id, original_filename, immutable_staged_path
   size_bytes, total_page_count, created_at
 
-PageRange v1
-  range_id = SHA-256("book-range:v1" + document_id + start_page + end_page)
-  document_id, batch_id, start_page, end_page
+PageRange v1 (3B.2)
+  range_id = SHA-256(NUL-join("recipe-importer:page-range:v1", parent_sha256, first_page, last_page))
+  document_id, batch_id, first_page, last_page, page_count
+  input_path, input_sha256, created_at, status, record_version
+
+RangeJob v1 (3B.3 target)
   status, attempt_count, attempts[], result_ids[], error
 ```
 
@@ -137,7 +140,7 @@ The existing Upload path calls `UploadedFile.getvalue()` and `BatchStore.stage()
 
 - Parent document identity is full original SHA-256, with immutable path, filename, length, total pages, and batch link. Verify digest before creating ranges or approving the resulting evidence.
 - User-created ranges use stable IDs from parent hash plus inclusive bounds. Re-adding the same range to the same book is idempotent. Overlapping ranges are allowed but explicitly shown.
-- Use bounded PyMuPDF page-copy into an ephemeral range input; do not alter the original. Validate page bounds and copied output size/page count. Hash the generated range bytes incrementally.
+- Use bounded PyMuPDF page-copy into a canonical persisted range input; do not alter the original. Validate page bounds and copied output size/page count. Hash the generated range bytes incrementally and retain them with a per-range recovery receipt so a manifest-write retry can recover the exact bytes.
 - Cache key binds original hash, range ID/bounds, generated range hash, extractor/OCR version, model and prompt/schema version where used. Preserve earlier range caches and attempts. A changed original invalidates its child ranges; it creates a new parent ID and never overwrites old results.
 - Each job range has independent waiting/processing/completed/failed/quota-paused status, attempt timestamps, outcome, candidate IDs, and error. Resume only unfinished ranges. Within a completed range, preserve successful recipe outcomes if another candidate needs attention.
 - Extraction may return several recipes for a range. Bind every candidate to its range location; no array-index matching. Same title on different pages and overlapping-range duplicate observations stay separate until explicit human reconciliation. Do not auto-deduplicate by title or suppress a recipe because a successful import exists elsewhere.
@@ -160,14 +163,14 @@ Add optional versioned parent/range metadata to new batches and job records, or 
 
 Rollback is feature-disablement, not data deletion: stop offering new parent/range intake and dispatch; retain originals, range events, attempts, and caches; keep readers for v1 metadata; let legacy file jobs continue. Do not restore an older binary that cannot read new metadata until compatibility is verified. Re-enabling requires a successful read/resume check on preserved synthetic records.
 
-### Phase 3B.1 implementation evidence and remaining milestones
+### Phase 3B implementation evidence and remaining milestones
 
 Use synthetic files only; no production recipe data or service writes.
 
 | Milestone | Boundary | Required evidence |
 |---|---|---|
 | **3B.1 Parent staging — completed** | Backend-only bounded path intake and additive `BatchStore` parent metadata | >50 MiB and >100-page PDFs within explicit cap; over-cap, low-disk, corrupt/encrypted, interrupted temporary copy, changed bytes; original unchanged; duplicate and recovery behavior; no parent-to-job dispatch. |
-| 3B.2 Range creation | Deterministic inclusive IDs and bounded PyMuPDF copy | Same range idempotent; bounds validated; overlap recorded; generated bytes hash and page count stable; parent hash/path preserved. |
+| **3B.2 Range creation - completed** | Deterministic inclusive IDs, bounded PyMuPDF copy, and additive parent range metadata | Same range idempotent; bounds validated; overlap recorded; generated bytes hash and page count verified; parent hash/path preserved; failure and retry recovery; no range-to-job dispatch. |
 | 3B.3 Range jobs/cache | JobService per-range attempts/resume and cache keys | Multi-range partial failure, completed ranges not repeated, interrupted resume, changed model/config/source invalidation, legacy jobs readable. |
 | 3B.4 Candidate and review provenance | Range-aware registration, source preview/page mapping, reconciliation | Multi-recipe pages, recipes spanning pages, duplicate titles, overlapping ranges; distinct candidates; exact source hash/revision approval; ambiguous duplicates held. |
 | 3B.5 Upload/review interaction | Range picker and progress/recovery UI | Streamlit AppTest plus synthetic Chromium for add/edit ranges, overlap, resume, page mapping, and recovery. Review checklist and accessibility evidence. |
@@ -177,9 +180,13 @@ Use synthetic files only; no production recipe data or service writes.
 
 **3B.1 verification:** 517 offline tests passed with 1 capability skip (`unittest discover -s tests`, 326.267 seconds, process exit 0). The batch/job subset passed 44/44. Targeted Python compilation, CLI `--help`, and `git diff --check` passed. Synthetic Chromium review/import and historical recovery journeys passed; the Windows `Offline verification` workflow passed for the exact implementation SHA in both the [push run](https://github.com/MayorofRapture/Recipe-Importer/actions/runs/40126488768) and [PR run](https://github.com/MayorofRapture/Recipe-Importer/actions/runs/40126492197). A synthetic 60 MiB staging probe measured a 2.16 MiB sampled working-set increase at 5 ms intervals; this is one observation, not a guaranteed upper bound.
 
-No UI picker, range creation, OCR, extraction, range job, review, or Mealie import for parent PDFs was added. Same-host native picker integration remains **Unverified** pending a headed Windows proof-of-concept. For remote browsers, a native dialog would select on the server host; any later remote selection needs an authenticated, bounded chunk-to-disk transfer and must never accept a browser-supplied server path. Details and official Streamlit/Tkinter references are in `docs/mealie-compatibility-and-large-pdf-capability.md`.
+**3B.2 implementation commit:** `aebd2be44c958a4c6f9d5c5a62454f05dec7ff08` (`Add deterministic cookbook page ranges`), pushed from baseline `f861914b86fb100741f942bb5f8cce9b9d4e2ef5`. Range IDs hash the NUL-delimited version string `recipe-importer:page-range:v1`, parent SHA-256, and canonical first/last page numbers. PDFs live at `parent_documents/ranges/<range_id>.pdf`; a per-range JSON receipt preserves the generated hash and record after a manifest-write failure. Default limits are 100 pages and 50 MiB per range PDF.
 
-Do not begin 3B.2 or later until the range identity, job/cache, candidate provenance, UI, and rollback contracts receive independent review and separate user approval.
+**3B.2 verification:** 528 offline tests passed with 1 capability skip (`unittest discover -s tests`, 337.731 seconds, process exit 0); the batch/job subset passed 55/55. Compilation, credential-free CLI `--help`, and `git diff --check` passed. The synthetic Chromium upload/review journeys passed, and the fixture runner passed 9/9. The Windows `Offline verification` workflow passed for the exact implementation SHA in the [push run](https://github.com/MayorofRapture/Recipe-Importer/actions/runs/40209789321). No live Gemini or Mealie behavior was exercised.
+
+Page-range creation is backend-only. No range job, OCR/extraction, candidate/review integration, Mealie import, picker UI, or browser path selection was added. Same-host native picker integration remains **Unverified** pending a headed Windows proof-of-concept. For remote browsers, a native dialog would select on the server host; any later remote selection needs an authenticated, bounded chunk-to-disk transfer and must never accept a browser-supplied server path. Details and official Streamlit/Tkinter references are in `docs/mealie-compatibility-and-large-pdf-capability.md`.
+
+Do not begin 3B.3 or later until range job/cache, candidate provenance, UI, and rollback contracts receive independent review and separate user approval.
 
 ## Phase 4 — CLI/UI primitive ownership (AUD-004)
 
@@ -197,7 +204,7 @@ The audit and Phase 1 browser journey do not establish that the entire interface
 
 - [x] Phase 1 changes are limited to draft feedback and its necessary regression journey/tests.
 - [x] Phase 2 source-text review is implemented and verified; Phase 3A remains a specification only.
-- [x] Phase 3B.1 implements backend-only parent staging; range handling, picker UI, OCR/extraction, parent job dispatch, and parent import remain unimplemented.
+- [x] Phases 3B.1 and 3B.2 implement backend-only parent staging and page-range creation; range jobs, picker UI, OCR/extraction, parent job dispatch, and parent import remain unimplemented.
 - [x] Phase 4 remains deferred maintenance.
 - [x] No live Gemini or Mealie calls were made.
 - [x] Production import/review histories, source scans, extraction caches, and recipe records were not modified.
@@ -206,4 +213,4 @@ The audit and Phase 1 browser journey do not establish that the entire interface
 
 ## Phase gates
 
-Phases 1 and 2 and Phase 3B.1 are complete with passing offline tests, synthetic Chromium journeys where applicable, compilation/help/diff checks, pushed implementation commits, and Windows CI verified at each implementation SHA. Phase 3B.2 onward awaits independent review of the remaining design and separate implementation approval. Phase 4 remains deferred unless a concrete maintenance benefit and compatibility plan are approved. No phase automatically authorizes the next.
+Phases 1 and 2 and Phases 3B.1 and 3B.2 are complete with passing offline tests, synthetic Chromium journeys where applicable, compilation/help/diff checks, pushed implementation commits, and Windows CI verified at each implementation SHA. Phase 3B.3 onward awaits independent review of the remaining design and separate implementation approval. Phase 4 remains deferred unless a concrete maintenance benefit and compatibility plan are approved. No phase automatically authorizes the next.
