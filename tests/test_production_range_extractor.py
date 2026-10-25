@@ -12,7 +12,7 @@ from recipe_quality import ExtractionBatch, RecipeCandidate
 from production_range_extractor import extract_range
 from batch_store import BatchStore
 from ui_job_service import JobService
-import fitz
+import pymupdf as fitz
 
 
 class ProductionRangeExtractorTests(unittest.TestCase):
@@ -47,7 +47,7 @@ class ProductionRangeExtractorTests(unittest.TestCase):
         router = ModelRouter([ModelConfig("model-a", rpd=3)], ledger, sleep=lambda _: None)
         calls = []
 
-        def fake_extract(path, api_key, model, gate=None, before_request=None):
+        def fake_extract(path, api_key, model, gate=None, before_request=None, before_upload=None):
             before_request(model, 11)
             calls.append(model)
             before_request(model, 11)  # models a bounded retry inside import_recipes.extract
@@ -64,6 +64,25 @@ class ProductionRangeExtractorTests(unittest.TestCase):
         usage = __import__("json").loads((self.output / "gemini_usage.json").read_text())
         self.assertEqual(sum(item[1] for item in usage["model_token_windows"]["model-a"]), 22)
         self.assertEqual(rows[0]["model"], "model-a")
+
+    def test_gemini_range_passes_cloud_authorization_before_file_upload(self):
+        authorized = []
+
+        def authorize(model):
+            authorized.append(model)
+
+        def fake_extract(path, api_key, model, gate=None, before_request=None, before_upload=None):
+            before_upload(model)
+            return ExtractionBatch(recipes=[self.candidate])
+
+        with patch("import_recipes.extract", side_effect=fake_extract):
+            extract_range(self.context, "gemini", {"api_key": "test"}, self.output,
+                          router=ModelRouter([ModelConfig("model-a")],
+                                             UsageLedger(self.output / "gemini_usage.json"),
+                                             sleep=lambda _: None),
+                          authorize_provider_request=authorize)
+
+        self.assertEqual(authorized, ["model-a"])
 
     def test_ocr_assisted_assembles_only_referenced_source_lines(self):
         ocr = OcrResult(text="Soup\n1 cup water\nBoil water.", engine="fake",
@@ -160,7 +179,8 @@ class ProductionRangeExtractorTests(unittest.TestCase):
             self.assertEqual(restored_config["model"], "model-a")
             self.assertEqual(restored_config["api_key"], "runtime-only-key")
 
-            def should_not_reach_provider(path, api_key, model, gate=None, before_request=None):
+            def should_not_reach_provider(path, api_key, model, gate=None, before_request=None,
+                                          before_upload=None):
                 before_request(model)
                 raise AssertionError("Provider call continued after the daily quota reservation failed")
 

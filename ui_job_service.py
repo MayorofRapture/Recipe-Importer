@@ -325,10 +325,13 @@ class JobService:
                                 router = self._range_router(current)
                                 before_request = lambda model, tokens=0: self._reserve_range_provider_request(
                                     job_id, model, router.ledger if router is not None else None, tokens)
+                                authorize_provider_request = lambda model: self._assert_range_cloud_consent(
+                                    job_id, model)
                                 result = extract_range(
                                     context, current["mode"], self._range_runtime_config(current),
                                     self.output_dir, router=router,
                                     before_provider_request=before_request,
+                                    authorize_provider_request=authorize_provider_request,
                                 )
                             else:
                                 result = self.extractor(context, current["mode"], dict(self.config or {}))

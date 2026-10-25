@@ -8,7 +8,8 @@ from recipe_quality import ExtractionBatch, is_complete
 
 
 def extract_range(context: dict, mode: str, config: dict, output_dir: Path,
-                  router=None, before_provider_request: Callable[..., None] | None = None) -> list[dict]:
+                  router=None, before_provider_request: Callable[..., None] | None = None,
+                  authorize_provider_request: Callable[[str], None] | None = None) -> list[dict]:
     """Extract candidates from the canonical range PDF without source-level persistence."""
     source = Path(context["input_path"])
     from hashlib import sha256
@@ -59,6 +60,7 @@ def extract_range(context: dict, mode: str, config: dict, output_dir: Path,
             return import_recipes.extract(
                 source, str(config["api_key"]), model.id,
                 before_request=before_provider_request,
+                before_upload=authorize_provider_request,
             )
 
         routed = router.run(extract, quality_check=import_recipes._quality_issue,

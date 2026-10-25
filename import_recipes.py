@@ -332,24 +332,44 @@ def _empty_response_reason(diagnostics: dict) -> str:
     return "OTHER"
 
 
+def estimate_request_tokens(path: Path) -> int:
+    """Estimate input TPM without treating compressed PDF bytes as text tokens."""
+    prompt_tokens = (len(PROMPT) + 3) // 4
+    if path.suffix.lower() == ".pdf":
+        try:
+            import pymupdf
+
+            with pymupdf.open(path) as document:
+                page_count = document.page_count
+                native_text = sum(len(page.get_text()) for page in document)
+            # Google documents 258 visual tokens per PDF page. Include native text
+            # conservatively; the exact provider count varies by model/API version.
+            return max(1, prompt_tokens + page_count * 258 + (native_text + 3) // 4)
+        except Exception:
+            # Keep malformed PDFs guarded until the provider returns a useful error.
+            return max(1, (len(PROMPT) + path.stat().st_size + 3) // 4)
+    return max(1, (len(PROMPT) + path.stat().st_size + 3) // 4)
+
+
 def extract(path: Path, api_key: str, model: str, gate: RateGate | None = None,
-            before_request=None) -> ExtractionBatch:
+            before_request=None, before_upload=None) -> ExtractionBatch:
     client = google_client(api_key)
     upload = None
+    batch = None
     try:
         if path.stat().st_size <= INLINE_MAX_BYTES:
             source = types.Part.from_bytes(data=path.read_bytes(), mime_type=file_mime(path))
         else:
-            if before_request is not None:
-                before_request(model, 0)
+            if before_upload is not None:
+                before_upload(model)
             upload = client.files.upload(file=str(path), config=types.UploadFileConfig(mime_type=file_mime(path)))
             source = upload
+        estimated_tokens = estimate_request_tokens(path)
         for attempt in range(5):
             try:
                 if gate is not None:
                     gate.wait_turn()
                 if before_request is not None:
-                    estimated_tokens = max(1, (len(PROMPT) + path.stat().st_size + 3) // 4)
                     before_request(model, estimated_tokens)
                 response = client.models.generate_content(
                     model=model, contents=[PROMPT, source],
@@ -363,7 +383,8 @@ def extract(path: Path, api_key: str, model: str, gate: RateGate | None = None,
                         f"Gemini returned no text ({diagnostics['reason']})",
                         model=model, diagnostics=diagnostics,
                     )
-                return ExtractionBatch.model_validate_json(response.text)
+                batch = ExtractionBatch.model_validate_json(response.text)
+                return batch
             except Exception as exc:
                 text = str(exc).lower()
                 if before_request is not None and any(
@@ -375,13 +396,25 @@ def extract(path: Path, api_key: str, model: str, gate: RateGate | None = None,
                 time.sleep(min(60.0, 3 * 2 ** attempt) + random.uniform(0, 1))
         raise RuntimeError("Gemini retry attempts exhausted")
     finally:
+        active_error = sys.exc_info()[1]
         if upload is not None and getattr(upload, "name", None):
             try:
-                if before_request is not None:
-                    before_request(model, 0)
                 client.files.delete(name=upload.name)
-            except Exception:
-                pass
+            except Exception as exc:
+                detail = f"Gemini uploaded-file cleanup failed: {_redact_error(exc, {'api_key': api_key})[:500]}"
+                if active_error is not None:
+                    diagnostics = getattr(active_error, "diagnostics", None)
+                    if not isinstance(diagnostics, dict):
+                        diagnostics = {}
+                    diagnostics["cleanup_error"] = detail
+                    try:
+                        setattr(active_error, "diagnostics", diagnostics)
+                    except Exception:
+                        print(detail, file=sys.stderr)
+                elif batch is not None:
+                    batch.general_warnings.append(detail)
+                else:
+                    print(detail, file=sys.stderr)
 
 
 def structure_ocr_text(text: str, api_key: str, model: str,
