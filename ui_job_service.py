@@ -166,9 +166,8 @@ class JobService:
         store = BatchStore(self.output_dir)
         verified_ranges = [store.validate_page_range(batch_id, range_id) for range_id in range_ids]
         verified_ranges.sort(key=lambda item: (item["parent_document_id"], item["first_page"], item["last_page"]))
+        config_fingerprint = self.range_config_fingerprint(mode)
         config = _range_config_snapshot(self.config or {}, extractor, None if production else self._unversioned_range_scope)
-        config_json = json.dumps(config, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-        config_fingerprint = sha256(config_json.encode("utf-8")).hexdigest()
         versioned = _range_extractor_is_versioned(config)
         timestamp = _now()
         selected_ids = [item["range_id"] for item in verified_ranges]
@@ -260,6 +259,17 @@ class JobService:
             else:
                 self._launch_background_range_worker(job_id)
         return self.range_snapshot(job_id) or _range_snapshot(job)
+
+    def range_config_fingerprint(self, mode: str) -> str:
+        """Return the canonical identity for the current range extractor configuration."""
+        production = self.extractor is None
+        if production:
+            self.config = self._production_config(mode)
+        extractor = self.extractor or _production_range_marker
+        config = _range_config_snapshot(
+            self.config or {}, extractor, None if production else self._unversioned_range_scope,
+        )
+        return _range_config_fingerprint(config)
 
     def run_range_pending(self, job_id: str) -> dict:
         """Run waiting range entries through their persisted execution backend."""
@@ -532,8 +542,7 @@ class JobService:
         extractor = _production_range_marker if production else self.extractor
         config = _range_config_snapshot(self.config or {}, extractor,
                                         None if production else self._unversioned_range_scope)
-        canonical = json.dumps(config, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-        fingerprint = sha256(canonical.encode("utf-8")).hexdigest()
+        fingerprint = _range_config_fingerprint(config)
         if fingerprint != job.get("config_fingerprint"):
             raise ValueError("Range job configuration fingerprint does not match the persisted job.")
 
@@ -1290,6 +1299,11 @@ def _range_config_snapshot(config: Mapping[str, Any], extractor: Callable,
     if code is not None:
         safe["extractor_implementation_sha256"] = sha256(marshal.dumps(_normalized_code(code))).hexdigest()
     return safe
+
+
+def _range_config_fingerprint(config: Mapping[str, Any]) -> str:
+    canonical = json.dumps(config, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return sha256(canonical.encode("utf-8")).hexdigest()
 
 
 def _range_extractor_is_versioned(config: Mapping[str, Any]) -> bool:

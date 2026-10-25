@@ -60,7 +60,8 @@ async function click(cdp, text, selector = 'button,a,[role="button"]') {
   await sleep(250);
 }
 async function setNumber(cdp, label, value) {
-  const pos = await evaluate(cdp, `(() => {const e=document.querySelector('input[aria-label=${JSON.stringify(label)}]');if(!e)return null;
+  const pos = await evaluate(cdp, `(() => {const e=[...document.querySelectorAll('input')].find(x=>
+    x.getAttribute('aria-label')===${JSON.stringify(label)}||x.closest('[data-testid="stNumberInput"]')?.innerText.includes(${JSON.stringify(label)}));if(!e)return null;
     e.scrollIntoView({block:'center'});const r=e.getBoundingClientRect();return{x:r.x+r.width/2,y:r.y+r.height/2};})()`);
   if (!pos) throw new Error(`Could not find numeric input ${label}`);
   await cdp.send('Input.dispatchMouseEvent', { type: 'mousePressed', x: pos.x, y: pos.y, button: 'left', clickCount: 1 });
@@ -101,6 +102,7 @@ try {
   await waitFor(cdp, `document.body.innerText.includes('Isolated browser fixture: ${fixture.runId}:${fixture.nonce}')`, 'attested synthetic application');
   await assertBrowserFixtureAttestation(cdp, fixture);
   await waitFor(cdp, `document.body.innerText.includes('synthetic-whole-cookbook.pdf') && document.body.innerText.includes('run_cookbook_selector.bat')`, 'staged cookbook discovery');
+  await waitFor(cdp, `[...document.querySelectorAll('input')].some(x=>x.closest('[data-testid="stNumberInput"]')?.innerText.includes('Last page'))`, 'page range controls');
   const artifacts = [await screenshot(cdp, 'cookbook-discovered-1440x1000.png')];
   await setNumber(cdp, 'Last page', 2);
   await click(cdp, 'Add range to selection');

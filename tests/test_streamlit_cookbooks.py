@@ -131,6 +131,27 @@ class StreamlitCookbookTests(unittest.TestCase):
             self.assertTrue(commit.disabled)
             self.assertTrue(any("I understand these page ranges overlap" == item.label for item in app.checkbox))
 
+    def test_overlap_acknowledgment_resets_when_pending_range_changes(self):
+        self.store.create_page_range(self.batch["batch_id"], self.parent["document_id"], 1, 2)
+
+        with self._run_page(UPLOAD_PAGE):
+            app = AppTest.from_file(str(UPLOAD_PAGE)).run(timeout=20)
+            next(item for item in app.number_input if item.label == "First page").set_value(2)
+            next(item for item in app.number_input if item.label == "Last page").set_value(3)
+            app = next(item for item in app.button if item.label == "Add range to selection").click().run(timeout=20)
+            checkbox = next(item for item in app.checkbox if item.label == "I understand these page ranges overlap")
+            app = checkbox.set_value(True).run(timeout=20)
+            self.assertFalse(next(item for item in app.button if item.label == "Commit selected page ranges").disabled)
+
+            app = next(item for item in app.button if item.label.startswith("Edit")).click().run(timeout=20)
+            next(item for item in app.number_input if item.label == "First page").set_value(1)
+            next(item for item in app.number_input if item.label == "Last page").set_value(3)
+            app = next(item for item in app.button if item.label == "Save range edit").click().run(timeout=20)
+
+            self.assertFalse(next(item for item in app.checkbox
+                                  if item.label == "I understand these page ranges overlap").value)
+            self.assertTrue(next(item for item in app.button if item.label == "Commit selected page ranges").disabled)
+
     def test_backend_range_rejection_is_shown_and_keeps_selection_for_retry(self):
         with self._run_page(UPLOAD_PAGE):
             app = AppTest.from_file(str(UPLOAD_PAGE)).run(timeout=20)
@@ -178,6 +199,8 @@ class StreamlitCookbookTests(unittest.TestCase):
             persisted = JobService(self.output).range_snapshot(first_job["job_id"])
             self.assertTrue(persisted["cloud_consent"])
             self.assertEqual(persisted["status"], "completed")
+            self.assertFalse(next(item for item in app.checkbox
+                                  if "simulated and sends no pages to Google" in item.label).value)
 
             start = next(item for item in app.button if item.label == "Start selected range extraction")
             self.assertTrue(start.disabled)
@@ -218,6 +241,67 @@ class StreamlitCookbookTests(unittest.TestCase):
         self.assertFalse(approved_view.import_ready)
         self.assertFalse(any(item.value == "Synthetic soup" for item in history.multiselect))
         self.assertTrue(any("cookbook range recipe(s) are excluded" in item.value for item in history.info))
+
+    def test_cookbook_cloud_consent_is_invalidated_when_selected_ranges_change(self):
+        first = self.store.create_page_range(self.batch["batch_id"], self.parent["document_id"], 1, 1)
+        second = self.store.create_page_range(self.batch["batch_id"], self.parent["document_id"], 2, 2)
+        other_batch = self.store.create("Another synthetic cookbook")
+        other_parent = self.store.stage_parent_pdf(other_batch["batch_id"], self.source)
+        self.store.create_page_range(other_batch["batch_id"], other_parent["document_id"], 1, 1)
+
+        with self._run_page(UPLOAD_PAGE):
+            app = AppTest.from_file(str(UPLOAD_PAGE)).run(timeout=20)
+            app = next(item for item in app.selectbox if item.label == "Select an existing batch").set_value(
+                self.batch["batch_id"]).run(timeout=20)
+            picker = next(item for item in app.multiselect if item.label == "Ranges to extract")
+            app = picker.set_value([first["range_id"]]).run(timeout=20)
+            app = next(item for item in app.segmented_control
+                       if item.label == "Cookbook extraction method").set_value("Gemini extraction").run(timeout=20)
+            consent = next(item for item in app.checkbox if "simulated and sends no pages to Google" in item.label)
+            app = consent.set_value(True).run(timeout=20)
+            self.assertFalse(next(item for item in app.button
+                                  if item.label == "Start selected range extraction").disabled)
+
+            app = next(item for item in app.segmented_control
+                       if item.label == "Cookbook extraction method").set_value("Local OCR").run(timeout=20)
+            app = next(item for item in app.segmented_control
+                       if item.label == "Cookbook extraction method").set_value("Gemini extraction").run(timeout=20)
+            self.assertFalse(next(item for item in app.checkbox
+                                  if "simulated and sends no pages to Google" in item.label).value)
+
+            app = next(item for item in app.checkbox
+                       if "simulated and sends no pages to Google" in item.label).set_value(True).run(timeout=20)
+            app = next(item for item in app.selectbox
+                       if item.label == "Select an existing batch").set_value(other_batch["batch_id"]).run(timeout=20)
+            app = next(item for item in app.selectbox
+                       if item.label == "Select an existing batch").set_value(self.batch["batch_id"]).run(timeout=20)
+            app = next(item for item in app.segmented_control
+                       if item.label == "Cookbook extraction method").set_value("Gemini extraction").run(timeout=20)
+            self.assertFalse(next(item for item in app.checkbox
+                                  if "simulated and sends no pages to Google" in item.label).value)
+
+            app = next(item for item in app.multiselect if item.label == "Ranges to extract").set_value(
+                [second["range_id"]]).run(timeout=20)
+            consent = next(item for item in app.checkbox if "simulated and sends no pages to Google" in item.label)
+            self.assertFalse(consent.value)
+            self.assertTrue(next(item for item in app.button
+                                 if item.label == "Start selected range extraction").disabled)
+
+    def test_changed_range_extraction_configuration_can_start_new_job(self):
+        page_range = self.store.create_page_range(self.batch["batch_id"], self.parent["document_id"], 1, 1)
+        extractor = lambda *_: [{"name": "Synthetic configuration result"}]
+        first_service = JobService(self.output, {"extractor_version": "fixture-range-v1"}, extractor)
+        first = first_service.start_range_job(self.batch["batch_id"], [page_range["range_id"]], "local_ocr")
+        first_service.run_range_pending(first["job_id"])
+
+        with self._run_page(UPLOAD_PAGE):
+            with patch.object(JobService, "range_config_fingerprint", return_value="2" * 64):
+                app = AppTest.from_file(str(UPLOAD_PAGE)).run(timeout=20)
+                self.assertFalse(app.exception)
+                app = next(item for item in app.multiselect if item.label == "Ranges to extract").set_value(
+                    [page_range["range_id"]]).run(timeout=20)
+                start = next(item for item in app.button if item.label == "Start selected range extraction")
+                self.assertFalse(start.disabled)
 
     def test_review_opens_at_range_start_and_explains_import_block(self):
         page_range = self.store.create_page_range(self.batch["batch_id"], self.parent["document_id"], 2, 3)

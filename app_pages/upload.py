@@ -313,11 +313,20 @@ def _render_cookbook_workflow(store: BatchStore, batch: dict, output_dir: Path) 
                for prior in pending[:index]):
             overlap_pairs.append(index)
     requires_overlap_confirmation = bool(overlap_pairs)
+    overlap_scope = tuple(
+        (index, int(pending[index]["first_page"]), int(pending[index]["last_page"]))
+        for index in sorted(set(overlap_pairs))
+    )
+    overlap_scope_key = f"cookbook_overlap_scope:{batch_id}:{selected_document_id}"
+    overlap_checkbox_key = f"cookbook_overlap_confirm:{batch_id}:{selected_document_id}"
+    if st.session_state.get(overlap_scope_key) != overlap_scope:
+        st.session_state[overlap_checkbox_key] = False
+        st.session_state[overlap_scope_key] = overlap_scope
     if requires_overlap_confirmation:
         st.warning("These page ranges overlap. Each selected range will be extracted as a separate occurrence; "
                    "review similar recipes yourself before deciding what to keep.")
     overlap_confirmed = st.checkbox(
-        "I understand these page ranges overlap", key=f"cookbook_overlap_confirm:{batch_id}:{selected_document_id}",
+        "I understand these page ranges overlap", key=overlap_checkbox_key,
         disabled=not requires_overlap_confirmation,
     )
     if pending and st.button(
@@ -370,7 +379,17 @@ def _render_cookbook_workflow(store: BatchStore, batch: dict, output_dir: Path) 
             key=f"cookbook_mode:{batch_id}:{selected_document_id}",
         )
         mode = mode_by_label.get(mode_label or "Local OCR", LOCAL_OCR)
+        service = _job_service(output_dir)
+        config_fingerprint = service.range_config_fingerprint(mode)
         cloud_consent = False
+        consent_widget_key = "cookbook_cloud_consent"
+        consent_scope_key = "cookbook_cloud_consent_scope"
+        consent_scope = (batch_id, selected_document_id, tuple(sorted(selected_ranges)), mode, config_fingerprint)
+        reset_consent_key = "cookbook_cloud_consent_reset"
+        reset_consent_for = st.session_state.pop(reset_consent_key, None)
+        if st.session_state.get(consent_scope_key) != consent_scope or reset_consent_for == consent_scope:
+            st.session_state[consent_widget_key] = False
+        st.session_state[consent_scope_key] = consent_scope
         if mode in {GEMINI, OCR_ASSISTED}:
             if fixture_mode():
                 st.info("Demonstration only: cloud modes use synthetic output and send no cookbook pages to Google.")
@@ -378,9 +397,8 @@ def _render_cookbook_workflow(store: BatchStore, batch: dict, output_dir: Path) 
             else:
                 st.warning("Cloud cookbook extraction sends selected pages, or their OCR text, to Google.")
                 consent_label = "I agree to send the selected cookbook pages to Google for extraction."
-            cloud_consent = st.checkbox(consent_label, key=f"cookbook_cloud_consent:{batch_id}")
+            cloud_consent = st.checkbox(consent_label, key=consent_widget_key)
 
-        service = _job_service(output_dir)
         jobs = [item for item in service.list_range_jobs()
                 if item.get("batch_id") == batch_id
                 and any(value.get("parent_document_id") == selected_document_id
@@ -389,7 +407,8 @@ def _render_cookbook_workflow(store: BatchStore, batch: dict, output_dir: Path) 
         active_job = next((item for item in jobs if item.get("status") in active_statuses), None)
         prior_selection = next((item for item in jobs
                                 if item.get("mode") == mode
-                                and set(item.get("range_ids", [])) == set(selected_ranges)), None)
+                                and set(item.get("range_ids", [])) == set(selected_ranges)
+                                and item.get("config_fingerprint") == config_fingerprint), None)
         if prior_selection and prior_selection.get("status") in {"completed", "completed_with_errors"}:
             st.info("These selected ranges already have saved extraction results. Review them or resume unfinished ranges; they will not be started again.")
         disabled = not selected_ranges or active_job is not None or prior_selection is not None or (
@@ -400,6 +419,8 @@ def _render_cookbook_workflow(store: BatchStore, batch: dict, output_dir: Path) 
             try:
                 job = service.start_range_job(batch_id, selected_ranges, mode, cloud_consent=cloud_consent)
                 st.session_state[f"cookbook_last_job:{batch_id}"] = job.get("job_id", "")
+                if mode in {GEMINI, OCR_ASSISTED}:
+                    st.session_state[reset_consent_key] = consent_scope
                 st.rerun()
             except (OSError, RuntimeError, ValueError) as exc:
                 st.error(f"Cookbook extraction could not start: {exc}")
