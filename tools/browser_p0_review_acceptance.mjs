@@ -66,16 +66,26 @@ async function click(cdp, text, selector = 'button,a,[role="button"],[role="radi
   await sleep(350);
 }
 async function jumpTo(cdp, title) {
-  if (!await evaluate(cdp, `(()=>{const e=document.querySelector('input[aria-label="Jump to recipe"]');if(!e)return false;const r=e.getBoundingClientRect();return r.width>0&&r.height>0})()`)) {
+  const visibleSelector = `(()=>{const e=document.querySelector('input[aria-label="Jump to recipe"]');if(!e)return false;const r=e.getBoundingClientRect();return r.width>0&&r.height>0&&r.left>=0&&r.top>=0&&r.right<=innerWidth&&r.bottom<=innerHeight})()`;
+  if (!await evaluate(cdp, visibleSelector)) {
+    if (await evaluate(cdp, `!!document.querySelector('input[aria-label="Jump to recipe"]')`)) {
+      await click(cdp, 'Queue');
+      await waitFor(cdp, `!document.querySelector('input[aria-label="Jump to recipe"]')`, 'clipped queue popover to close');
+    }
     await click(cdp, 'Queue');
+    await waitFor(cdp, visibleSelector, 'recipe selector to be fully visible');
   }
-  const point = await evaluate(cdp, `(() => {const e=document.querySelector('input[aria-label="Jump to recipe"]');if(!e)return null;e.scrollIntoView({block:'center'});const r=e.getBoundingClientRect();return{x:r.x+r.width/2,y:r.y+r.height/2}})()`);
+  const point = await evaluate(cdp, `(() => {const e=document.querySelector('input[aria-label="Jump to recipe"]');if(!e)return null;const r=e.getBoundingClientRect();return{x:r.x+r.width/2,y:r.y+r.height/2}})()`);
   if (!point) throw new Error('Recipe selector was not available.');
   await cdp.send('Input.dispatchMouseEvent', { type: 'mousePressed', x: point.x, y: point.y, button: 'left', clickCount: 1 });
   await cdp.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x: point.x, y: point.y, button: 'left', clickCount: 1 });
   await waitFor(cdp, `!![...document.querySelectorAll('[role="option"]')].find(e=>e.innerText.includes(${JSON.stringify(title)}))`, `recipe option ${title}`);
   await click(cdp, title, '[role="option"]');
   await waitFor(cdp, `document.querySelector('input[aria-label="Recipe title"]')?.value===${JSON.stringify(title)}`, `selected recipe ${title}`);
+  if (await evaluate(cdp, `!!document.querySelector('input[aria-label="Jump to recipe"]')`)) {
+    await click(cdp, 'Queue');
+    await waitFor(cdp, `!document.querySelector('input[aria-label="Jump to recipe"]')`, 'queue popover to close after selection');
+  }
 }
 async function screenshot(cdp, file) {
   const image = await cdp.send('Page.captureScreenshot', { format: 'png', captureBeyondViewport: false });
