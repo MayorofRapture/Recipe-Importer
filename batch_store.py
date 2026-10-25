@@ -565,7 +565,9 @@ class BatchStore:
                         return _rejected("page range", "Insufficient free disk space to create this range safely.")
 
                     temporary = range_dir / f".{range_id}.{uuid.uuid4().hex}.tmp"
-                    self._write_page_range_pdf(source_doc, temporary, first_page, last_page)
+                    self._write_page_range_pdf(
+                        source_doc, temporary, first_page, last_page, self.max_page_range_bytes,
+                    )
                 finally:
                     source_doc.close()
 
@@ -676,6 +678,8 @@ class BatchStore:
                         temporary.unlink()
                     except OSError:
                         pass
+        except ValueError as exc:
+            return _rejected("page range", str(exc))
         except Exception as exc:
             return _rejected("page range", f"Could not create this page range: {type(exc).__name__}.")
         finally:
@@ -686,12 +690,21 @@ class BatchStore:
                     pass
 
     @staticmethod
-    def _write_page_range_pdf(source_doc, temporary: Path, first_page: int, last_page: int) -> None:
+    def _write_page_range_pdf(source_doc, temporary: Path, first_page: int, last_page: int,
+                              max_bytes: int) -> None:
         output_doc = fitz.open()
         try:
             output_doc.insert_pdf(source_doc, from_page=first_page - 1,
                                   to_page=last_page - 1)
-            output_doc.save(temporary, garbage=3, deflate=True)
+            content = output_doc.tobytes(garbage=3, deflate=True)
+            if len(content) > max_bytes:
+                raise ValueError(f"Generated range PDF exceeds the configured {max_bytes}-byte limit.")
+            with temporary.open("xb") as handle:
+                view = memoryview(content)
+                for offset in range(0, len(view), _PARENT_COPY_CHUNK_BYTES):
+                    handle.write(view[offset:offset + _PARENT_COPY_CHUNK_BYTES])
+                handle.flush()
+                os.fsync(handle.fileno())
         finally:
             output_doc.close()
 

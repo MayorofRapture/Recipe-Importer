@@ -148,9 +148,26 @@ class BatchStoreTests(unittest.TestCase):
 
             range_dir = Path(parent["staged_path"]).parent / "ranges"
             self.assertEqual(result["status"], "rejected")
+            self.assertIn("byte limit", result["reason"].casefold())
             self.assertEqual(store.get(batch["batch_id"])["parent_documents"][0].get("ranges", []), [])
             self.assertEqual(list(range_dir.glob("*.pdf")), [])
             self.assertEqual(list(range_dir.glob(".*.tmp")), [])
+
+    def test_page_range_serializer_checks_size_before_creating_temporary_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = BatchStore(root / "output", parent_disk_reserve_bytes=0)
+            batch = store.create("Serializer size limit")
+            source = root / "book.pdf"
+            _write_pdf(source, 1)
+            parent = store.stage_parent_pdf(batch["batch_id"], source)
+            temporary_range = root / "range.tmp"
+
+            with fitz.open(parent["staged_path"]) as document:
+                with self.assertRaisesRegex(ValueError, "byte limit"):
+                    store._write_page_range_pdf(document, temporary_range, 1, 1, max_bytes=1)
+
+            self.assertFalse(temporary_range.exists())
 
     def test_page_range_blocks_parent_hash_mismatch(self):
         with tempfile.TemporaryDirectory() as tmp:
