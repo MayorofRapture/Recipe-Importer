@@ -58,7 +58,13 @@ except Exception as error:
 
 ready = {view.candidate_id: view for view in views if view.import_ready and view.revision > 0}
 views_by_id = {view.candidate_id: view for view in views}
+range_candidates = [view for view in views if view.range_provenance]
 st.subheader("Ready to import")
+if range_candidates:
+    st.info(
+        f"{len(range_candidates)} cookbook range recipe(s) are excluded from Mealie import in this phase. "
+        "They may be reviewed and approved, but their import remains disabled."
+    )
 if not ready:
     st.info("Approve a complete recipe in Review to make it available here.")
 if st.button("Select all eligible recipes", disabled=not ready):

@@ -884,6 +884,13 @@ def main() -> None:
     position = all_ids.index(selected_id) + 1
     st.title("Review")
     st.caption(f"{view.status} · {position} of {len(all_ids)}")
+    if view.range_provenance:
+        provenance = view.range_provenance
+        st.info(
+            f"Cookbook: {view.source_display_name} · original pages "
+            f"{provenance.get('first_page')}-{provenance.get('last_page')}. "
+            "You can review and approve this recipe, but cookbook range recipes cannot be imported into Mealie in this phase."
+        )
     _render_navigation(view)
     _render_suggestion_job_status(view)
     _render_queue(views, queue_page)
@@ -1420,6 +1427,8 @@ def _render_source(view, buffer) -> None:
     output, _ = paths()
     with st.container(border=True):
         st.markdown(f"**Source scan** · {view.source_display_name}")
+        if view.range_provenance:
+            st.caption("Source text is read-only and separate from the editable recipe fields and any AI suggestions.")
         if not view.source_verified or not view.source_available:
             st.warning("Original source unavailable. This recipe cannot be verified against its original scanned document.")
             if view.source_path:
@@ -1457,7 +1466,10 @@ def _render_source(view, buffer) -> None:
             return
         count("preview_renders")
         page_key = f"page:{view.candidate_id}"
-        st.session_state.setdefault(page_key, int(load_resume_pointer().get("source_page", 1)))
+        range_first_page = view.range_provenance.get("first_page")
+        initial_page = (int(range_first_page) if type(range_first_page) is int
+                        else int(load_resume_pointer().get("source_page", 1)))
+        st.session_state.setdefault(page_key, initial_page)
         page = int(st.session_state.get(page_key, 1))
         zoom_key = f"zoom:{view.candidate_id}"
         zoom_options = {"Fit": 1.0, "Inspect": 1.5, "More detail": 2.0}

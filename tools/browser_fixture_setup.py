@@ -11,7 +11,9 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from PIL import Image, ImageDraw
+import pymupdf as fitz
 
+from batch_store import BatchStore
 from import_recipes import file_digest
 from recipe_quality import ExtractionBatch, RecipeCandidate, Suggestion, schema_recipe
 from review_store import ReviewStore, _candidate_payload, _canonical, extraction_identity
@@ -39,12 +41,29 @@ def prepare(root: Path, scenario: str, run_id: str, nonce: str) -> dict:
     invalid_file = upload_root / "invalid-scan.pdf"
     invalid_file.write_text("Synthetic invalid upload.", encoding="utf-8")
 
-    if scenario == "upload":
+    cookbook_batch_id = ""
+    cookbook_filename = ""
+    if scenario in {"upload", "cookbook"}:
         # A first-run Upload journey needs an empty synthetic library so app startup does not redirect to Review.
         for cached_batch in (output / "extracted").glob("*.json"):
             cached_batch.unlink()
         for ledger_name in ("review_events.jsonl", "import_state.jsonl"):
             (output / ledger_name).unlink(missing_ok=True)
+
+    if scenario == "cookbook":
+        cookbook_source = root / "synthetic-whole-cookbook.pdf"
+        document = fitz.open()
+        for page_number in range(1, 4):
+            page = document.new_page(width=600, height=800)
+            page.insert_text((72, 72), f"Synthetic whole cookbook page {page_number}")
+            page.insert_text((72, 115), "Synthetic lentil soup\\n2 cups synthetic lentils\\nSimmer until tender.")
+        document.save(cookbook_source)
+        document.close()
+        batch_store = BatchStore(output, parent_disk_reserve_bytes=0)
+        cookbook_batch = batch_store.create("Synthetic cookbook batch")
+        staged_cookbook = batch_store.stage_parent_pdf(cookbook_batch["batch_id"], cookbook_source)
+        cookbook_batch_id = cookbook_batch["batch_id"]
+        cookbook_filename = staged_cookbook["original_filename"]
 
     if scenario == "p0":
         manual_source = sources / "synthetic-manual-instructions.png"
@@ -179,6 +198,7 @@ def prepare(root: Path, scenario: str, run_id: str, nonce: str) -> dict:
         "invalid_file": str(invalid_file.resolve()), "source_file": str(fixture["source"]),
         "candidates": marker_candidates, "candidate_ids": candidate_ids,
         "manual_candidate_id": manual_candidate_id,
+        "cookbook_batch_id": cookbook_batch_id, "cookbook_filename": cookbook_filename,
     }
 
 

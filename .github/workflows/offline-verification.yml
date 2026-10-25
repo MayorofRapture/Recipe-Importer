@@ -66,6 +66,17 @@ jobs:
         shell: pwsh
         run: node --test tests/browser_fixture_runner.test.mjs
 
+      - name: Run synthetic cookbook browser journey
+        shell: pwsh
+        run: |
+          $chrome = @(
+            (Join-Path $env:ProgramFiles 'Google\Chrome\Application\chrome.exe'),
+            (Join-Path ${env:ProgramFiles(x86)} 'Google\Chrome\Application\chrome.exe')
+          ) | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+          if (-not $chrome) { throw 'A Chrome executable is required for the synthetic cookbook journey.' }
+          node tools/browser_cookbook_journey.mjs "--executable=$chrome" --evidence-dir=.test-tmp/browser-evidence/cookbook
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
       - name: Set up a fresh synthetic browser fixture
         shell: pwsh
         run: |

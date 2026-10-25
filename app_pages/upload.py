@@ -162,6 +162,304 @@ def _job_summary(job: dict) -> str:
     return "All files finished extraction. Review the candidates before approval."
 
 
+def _ranges_overlap(first_page: int, last_page: int, other_first: int, other_last: int) -> bool:
+    return first_page <= other_last and other_first <= last_page
+
+
+def _set_range_edit(batch_id: str, document_id: str, index: int, pending: list[dict]) -> None:
+    selected = pending[index]
+    st.session_state[f"cookbook_first:{batch_id}:{document_id}"] = selected["first_page"]
+    st.session_state[f"cookbook_last:{batch_id}:{document_id}"] = selected["last_page"]
+    st.session_state[f"cookbook_edit:{batch_id}:{document_id}"] = index
+
+
+def _remove_pending_range(batch_id: str, document_id: str, index: int) -> None:
+    key = f"cookbook_pending:{batch_id}:{document_id}"
+    pending = st.session_state.get(key, [])
+    if 0 <= index < len(pending):
+        pending.pop(index)
+    st.session_state[f"cookbook_edit:{batch_id}:{document_id}"] = None
+
+
+def _render_cookbook_workflow(store: BatchStore, batch: dict, output_dir: Path) -> None:
+    """Connect staged parent PDFs to the existing page-range and range-job APIs."""
+    batch_id = str(batch["batch_id"])
+    st.markdown("#### Cookbook PDFs")
+    st.markdown(
+        "For a whole cookbook, launch `run_cookbook_selector.bat` from Windows, "
+        "choose this batch and a PDF, then refresh this list. The selector runs "
+        "as a separate desktop app; this page never opens a file dialog or accepts a local path."
+    )
+    st.button("Refresh staged cookbooks", key=f"refresh_cookbooks:{batch_id}")
+
+    batch = store.get(batch_id) or batch
+    parents = batch.get("parent_documents", [])
+    if not parents:
+        st.info("No cookbook PDFs are staged for this batch yet. Ordinary recipe uploads above are unchanged.")
+        return
+
+    parent_ids = [str(item.get("document_id", "")) for item in parents]
+    parent_by_id = {str(item.get("document_id", "")): item for item in parents}
+    selected_document_id = st.selectbox(
+        "Staged cookbook PDF", parent_ids,
+        format_func=lambda value: parent_by_id[value].get("original_filename", "Cookbook PDF"),
+        key=f"cookbook_parent:{batch_id}",
+    )
+    parent = parent_by_id[selected_document_id]
+    page_count = int(parent.get("page_count", 0))
+    size_bytes = int(parent.get("size_bytes", 0))
+    st.caption(
+        f"Original file: {parent.get('original_filename', 'Cookbook PDF')} · "
+        f"{size_bytes:,} bytes · {page_count:,} pages · {parent.get('status', 'staged')}"
+    )
+    if page_count < 1:
+        st.error("This staged cookbook has no usable pages. Refresh the list or inspect its batch record.")
+        return
+
+    notice_key = f"cookbook_range_notice:{batch_id}:{selected_document_id}"
+    notice = st.session_state.get(notice_key)
+    if notice:
+        if notice[0] == "error":
+            st.error(notice[1])
+        else:
+            st.success(notice[1])
+
+    preview_page = st.number_input(
+        "Preview original page", min_value=1, max_value=page_count, value=1, step=1,
+        key=f"cookbook_preview:{batch_id}:{selected_document_id}",
+    )
+    preview = render_source_page(Path(parent["staged_path"]), int(preview_page), zoom=1)
+    if preview.image is not None:
+        st.image(preview.image, alt=f"Original cookbook page {preview.page_number}")
+    else:
+        st.warning(preview.message or "The selected cookbook page could not be previewed.")
+
+    st.caption(
+        f"Choose inclusive page bounds. Each range is limited to {store.max_page_range_pages} pages "
+        f"and {store.max_page_range_bytes // (1024 * 1024)} MiB. Keep a multi-page recipe in one range; "
+        "one range may contain multiple recipes. The app will not split recipes automatically."
+    )
+    first_key = f"cookbook_first:{batch_id}:{selected_document_id}"
+    last_key = f"cookbook_last:{batch_id}:{selected_document_id}"
+    st.session_state.setdefault(first_key, 1)
+    st.session_state.setdefault(last_key, 1)
+    first_page = int(st.number_input("First page", min_value=1, max_value=page_count,
+                                    step=1, key=first_key))
+    last_page = int(st.number_input("Last page", min_value=1, max_value=page_count,
+                                   step=1, key=last_key))
+    proposed_count = last_page - first_page + 1
+    valid_bounds = first_page <= last_page and proposed_count <= store.max_page_range_pages
+    if valid_bounds:
+        st.caption(f"Proposed range: pages {first_page}-{last_page} · {proposed_count} pages")
+    elif first_page > last_page:
+        st.error("The last page must be the same as or after the first page.")
+    else:
+        st.error(f"A page range can contain at most {store.max_page_range_pages} pages.")
+
+    pending_key = f"cookbook_pending:{batch_id}:{selected_document_id}"
+    pending = st.session_state.setdefault(pending_key, [])
+    edit_key = f"cookbook_edit:{batch_id}:{selected_document_id}"
+    edit_index = st.session_state.get(edit_key)
+    action_label = "Save range edit" if edit_index is not None else "Add range to selection"
+    if st.button(action_label, key=f"cookbook_add:{batch_id}:{selected_document_id}",
+                 disabled=not valid_bounds):
+        proposed = {"first_page": first_page, "last_page": last_page}
+        duplicate_pending = any(index != edit_index and item == proposed
+                                for index, item in enumerate(pending))
+        if duplicate_pending:
+            st.error("That exact page range is already in the uncommitted selection.")
+        elif edit_index is not None and 0 <= edit_index < len(pending):
+            pending[edit_index] = proposed
+            st.session_state[edit_key] = None
+            st.rerun()
+        else:
+            pending.append(proposed)
+            st.rerun()
+
+    if pending:
+        st.markdown("**Uncommitted ranges**")
+        for index, item in enumerate(pending):
+            columns = st.columns([3, 1, 1], vertical_alignment="center")
+            columns[0].write(f"Pages {item['first_page']}-{item['last_page']} · "
+                             f"{item['last_page'] - item['first_page'] + 1} pages")
+            columns[1].button(
+                "Edit", key=f"cookbook_edit_button:{batch_id}:{selected_document_id}:{index}",
+                on_click=_set_range_edit, args=(batch_id, selected_document_id, index, pending),
+                width="stretch",
+            )
+            columns[2].button(
+                "Remove selected range", key=f"cookbook_remove:{batch_id}:{selected_document_id}:{index}",
+                on_click=_remove_pending_range, args=(batch_id, selected_document_id, index),
+                width="stretch",
+            )
+
+    ranges = sorted(parent.get("ranges", []), key=lambda item: (item.get("first_page", 0), item.get("last_page", 0)))
+    if ranges:
+        st.markdown("**Previously committed ranges**")
+        for item in ranges:
+            st.caption(
+                f"Pages {item.get('first_page')}-{item.get('last_page')} · "
+                f"{item.get('page_count')} pages · {item.get('status', 'saved')} · "
+                f"ID `{item.get('range_id', '')}`"
+            )
+
+    overlap_pairs = []
+    committed = [(int(item.get("first_page", 0)), int(item.get("last_page", 0))) for item in ranges]
+    for index, item in enumerate(pending):
+        bounds = (int(item["first_page"]), int(item["last_page"]))
+        if any(_ranges_overlap(*bounds, *prior) for prior in committed):
+            overlap_pairs.append(index)
+        if any(_ranges_overlap(*bounds, int(prior["first_page"]), int(prior["last_page"]))
+               for prior in pending[:index]):
+            overlap_pairs.append(index)
+    requires_overlap_confirmation = bool(overlap_pairs)
+    if requires_overlap_confirmation:
+        st.warning("These page ranges overlap. Each selected range will be extracted as a separate occurrence; "
+                   "review similar recipes yourself before deciding what to keep.")
+    overlap_confirmed = st.checkbox(
+        "I understand these page ranges overlap", key=f"cookbook_overlap_confirm:{batch_id}:{selected_document_id}",
+        disabled=not requires_overlap_confirmation,
+    )
+    if pending and st.button(
+        "Commit selected page ranges", type="primary",
+        key=f"cookbook_commit:{batch_id}:{selected_document_id}",
+        disabled=requires_overlap_confirmation and not overlap_confirmed,
+    ):
+        remaining = []
+        failures = []
+        saved_count = 0
+        for item in pending:
+            result = store.create_page_range(
+                batch_id, selected_document_id, item["first_page"], item["last_page"],
+            )
+            if result.get("status") == "rejected":
+                remaining.append(item)
+                failures.append(f"Pages {item['first_page']}-{item['last_page']}: "
+                                f"{result.get('message', 'The range was rejected.')}")
+            else:
+                saved_count += 1
+        st.session_state[pending_key] = remaining
+        st.session_state[edit_key] = None
+        if failures:
+            prefix = (f"{saved_count} range(s) were saved; " if saved_count else "")
+            st.session_state[notice_key] = (
+                "error", prefix + "some page ranges were not saved: " + " ".join(failures)
+                + " The rejected selections remain available to edit or retry."
+            )
+        else:
+            st.session_state[notice_key] = (
+                "success", "Selected page ranges were saved. The original cookbook remains unchanged."
+            )
+        st.rerun()
+
+    if ranges:
+        range_ids = [str(item["range_id"]) for item in ranges]
+        range_by_id = {str(item["range_id"]): item for item in ranges}
+        selected_ranges = st.multiselect(
+            "Ranges to extract", range_ids,
+            format_func=lambda value: f"Pages {range_by_id[value]['first_page']}-"
+                                      f"{range_by_id[value]['last_page']} · "
+                                      f"{range_by_id[value]['page_count']} pages",
+            key=f"cookbook_extract_ranges:{batch_id}:{selected_document_id}",
+        )
+        mode_labels = ["Local OCR", "Gemini extraction", "OCR-assisted review"]
+        mode_by_label = {"Local OCR": LOCAL_OCR, "Gemini extraction": GEMINI,
+                         "OCR-assisted review": OCR_ASSISTED}
+        mode_label = st.segmented_control(
+            "Cookbook extraction method", mode_labels, default="Local OCR",
+            key=f"cookbook_mode:{batch_id}:{selected_document_id}",
+        )
+        mode = mode_by_label.get(mode_label or "Local OCR", LOCAL_OCR)
+        cloud_consent = False
+        if mode in {GEMINI, OCR_ASSISTED}:
+            if fixture_mode():
+                st.info("Demonstration only: cloud modes use synthetic output and send no cookbook pages to Google.")
+                consent_label = "I understand this cloud mode is simulated and sends no pages to Google."
+            else:
+                st.warning("Cloud cookbook extraction sends selected pages, or their OCR text, to Google.")
+                consent_label = "I agree to send the selected cookbook pages to Google for extraction."
+            cloud_consent = st.checkbox(consent_label, key=f"cookbook_cloud_consent:{batch_id}")
+
+        service = _job_service(output_dir)
+        jobs = [item for item in service.list_range_jobs()
+                if item.get("batch_id") == batch_id
+                and any(value.get("parent_document_id") == selected_document_id
+                        for value in item.get("ranges", []))]
+        active_statuses = {"queued", "waiting_for_worker", "running", "pausing", "paused", "quota_paused"}
+        active_job = next((item for item in jobs if item.get("status") in active_statuses), None)
+        prior_selection = next((item for item in jobs
+                                if item.get("mode") == mode
+                                and set(item.get("range_ids", [])) == set(selected_ranges)), None)
+        if prior_selection and prior_selection.get("status") in {"completed", "completed_with_errors"}:
+            st.info("These selected ranges already have saved extraction results. Review them or resume unfinished ranges; they will not be started again.")
+        disabled = not selected_ranges or active_job is not None or prior_selection is not None or (
+            mode in {GEMINI, OCR_ASSISTED} and not cloud_consent
+        )
+        if st.button("Start selected range extraction", type="primary",
+                     key=f"cookbook_start:{batch_id}:{selected_document_id}", disabled=disabled):
+            try:
+                job = service.start_range_job(batch_id, selected_ranges, mode, cloud_consent=cloud_consent)
+                st.session_state[f"cookbook_last_job:{batch_id}"] = job.get("job_id", "")
+                st.rerun()
+            except (OSError, RuntimeError, ValueError) as exc:
+                st.error(f"Cookbook extraction could not start: {exc}")
+
+        for job in jobs[:8]:
+            _render_range_job(job, service, str(parent.get("original_filename", "Cookbook PDF")))
+
+
+@st.fragment(run_every="2s")
+def _render_range_job(job: dict, service: JobService, parent_filename: str) -> None:
+    job_id = str(job.get("job_id", ""))
+    current = service.range_snapshot(job_id) or job
+    st.markdown("#### Cookbook extraction progress")
+    status_copy = {
+        "queued": "Waiting to start", "waiting_for_worker": "Waiting for an available worker",
+        "running": "Reading selected pages", "pausing": "Finishing the current range before pausing",
+        "paused": "Paused; finished ranges are saved", "quota_paused": "Paused at a Gemini request limit",
+        "completed": "Extraction finished", "completed_with_errors": "Finished with ranges needing attention",
+        "failed": "Extraction stopped; unfinished ranges can be resumed",
+    }
+    st.info(status_copy.get(current.get("status"), "Cookbook extraction status is available below."))
+    ranges = current.get("ranges", [])
+    st.caption(f"Original cookbook: {parent_filename} · selected inclusive page ranges")
+    completed = sum(item.get("status") in {"completed", "no_recipe"} for item in ranges)
+    st.progress(completed / len(ranges) if ranges else 0.0,
+                text=f"{completed} of {len(ranges)} ranges finished")
+    st.caption(f"{sum(int(item.get('result_count', 0)) for item in ranges)} recipes extracted · "
+               f"Job {job_id}")
+    for item in ranges:
+        label = {"waiting": "Waiting", "processing": "Being read", "completed": "Complete",
+                 "no_recipe": "No recipe detected", "failed": "Needs attention",
+                 "quota_paused": "Waiting for Gemini"}.get(item.get("status"), item.get("status", "Waiting"))
+        st.write(f"Pages {item.get('first_page')}-{item.get('last_page')} · {label} · "
+                 f"{item.get('result_count', 0)} recipes")
+        if item.get("error"):
+            st.warning(item["error"])
+
+    if current.get("status") in {"completed", "completed_with_errors"}:
+        try:
+            registered = service.register_completed_ranges(job_id)
+            count = len(registered)
+            if count:
+                st.success(f"{count} cookbook recipes are ready for review.")
+            elif completed:
+                st.success("Completed cookbook results are registered for Review.")
+        except (OSError, RuntimeError, ValueError) as exc:
+            st.error(f"Completed results could not be registered for Review: {exc}")
+        st.caption("Cookbook range recipes can be reviewed and approved, but Mealie import remains disabled.")
+        st.caption("Open Review from the app navigation to check these candidates against their original pages.")
+
+    if current.get("status") in {"queued", "waiting_for_worker", "running", "pausing"}:
+        if st.button("Pause after current range", key=f"pause_range:{job_id}"):
+            service.pause_range_job(job_id)
+            st.rerun(scope="app")
+    elif current.get("status") in {"paused", "quota_paused", "completed_with_errors", "failed"}:
+        if st.button("Resume unfinished ranges", key=f"resume_range:{job_id}"):
+            service.resume_range_job(job_id)
+            st.rerun(scope="app")
+
+
 st.title("Upload recipes")
 st.caption("Add recipe scans, choose how to read them, then review the results before any import.")
 
@@ -312,3 +610,5 @@ if service is not None:
                 st.error(f"Extraction could not start: {exc}")
     else:
         _render_job_panel(output_dir, selected_id)
+
+_render_cookbook_workflow(store, batch, output_dir)
