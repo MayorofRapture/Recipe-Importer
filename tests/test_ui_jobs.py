@@ -63,6 +63,9 @@ class JobServiceTests(unittest.TestCase):
         parent_path = Path(self.tmp.name) / "book.pdf"
         _write_parent_pdf(parent_path)
         parent = self.store.stage_parent_pdf(batch["batch_id"], parent_path)
+        page_range = self.store.create_page_range(
+            batch["batch_id"], parent["document_id"], 1, 1,
+        )
         service = JobService(self.output, extractor=_recipe_rows)
 
         with self.assertRaisesRegex(ValueError, "accepted source file"):
@@ -73,8 +76,10 @@ class JobServiceTests(unittest.TestCase):
         job = service.start(batch["batch_id"], "local_ocr")
 
         self.assertEqual(parent["status"], "staged")
+        self.assertEqual(page_range["status"], "staged")
         self.assertEqual([source["source_id"] for source in job["sources"]], [scan["source_id"]])
         self.assertNotIn(parent["document_id"], {source.get("document_id") for source in job["sources"]})
+        self.assertNotIn(page_range["range_id"], {source.get("range_id") for source in job["sources"]})
 
     def test_start_is_durable_and_second_tab_returns_same_nonterminal_job(self):
         batch = _batch(self.store, "Weekend", _png())

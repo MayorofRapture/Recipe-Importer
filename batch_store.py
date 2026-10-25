@@ -30,6 +30,8 @@ _PARENT_DISK_CHECK_BYTES = 16 * 1024 * 1024
 _DEFAULT_PARENT_FILE_BYTES = 256 * 1024 * 1024
 _DEFAULT_PARENT_PDF_PAGES = 2_000
 _DEFAULT_PARENT_DISK_RESERVE_BYTES = 64 * 1024 * 1024
+_DEFAULT_PAGE_RANGE_PAGES = 100
+_DEFAULT_PAGE_RANGE_FILE_BYTES = 50 * 1024 * 1024
 _LOCKS_GUARD = threading.Lock()
 _THREAD_LOCKS: dict[str, threading.Lock] = {}
 
@@ -116,11 +118,14 @@ class BatchStore:
                  max_pdf_pages: int = 100, max_image_pixels: int = 100_000_000,
                  max_parent_file_bytes: int = _DEFAULT_PARENT_FILE_BYTES,
                  max_parent_pdf_pages: int = _DEFAULT_PARENT_PDF_PAGES,
-                 parent_disk_reserve_bytes: int = _DEFAULT_PARENT_DISK_RESERVE_BYTES):
+                 parent_disk_reserve_bytes: int = _DEFAULT_PARENT_DISK_RESERVE_BYTES,
+                 max_page_range_pages: int = _DEFAULT_PAGE_RANGE_PAGES,
+                 max_page_range_bytes: int = _DEFAULT_PAGE_RANGE_FILE_BYTES):
         if (max_file_bytes <= 0 or max_pdf_pages <= 0 or max_image_pixels <= 0
                 or max_parent_file_bytes <= 0 or max_parent_pdf_pages <= 0
-                or parent_disk_reserve_bytes < 0):
-            raise ValueError("file, page, and image limits must be positive; parent disk reserve cannot be negative")
+                or parent_disk_reserve_bytes < 0 or max_page_range_pages <= 0
+                or max_page_range_bytes <= 0):
+            raise ValueError("file, page, image, and range limits must be positive; parent disk reserve cannot be negative")
         self.output_dir = Path(output_dir).expanduser().resolve()
         self.root = self.output_dir / "ui_batches"
         self.manifest_path = self.root / "batches.json"
@@ -131,6 +136,8 @@ class BatchStore:
         self.max_parent_file_bytes = int(max_parent_file_bytes)
         self.max_parent_pdf_pages = int(max_parent_pdf_pages)
         self.parent_disk_reserve_bytes = int(parent_disk_reserve_bytes)
+        self.max_page_range_pages = int(max_page_range_pages)
+        self.max_page_range_bytes = int(max_page_range_bytes)
 
     def create(self, name: str, tag: str = "") -> dict:
         clean_name = str(name or "").strip()
@@ -400,6 +407,294 @@ class BatchStore:
             except FileNotFoundError:
                 pass
 
+    def create_page_range(self, batch_id: str, document_id: str,
+                          first_page: int, last_page: int) -> dict:
+        """Create and durably record an inclusive, one-based range from a staged parent PDF."""
+        batch_key = str(batch_id)
+        try:
+            if (isinstance(first_page, bool) or isinstance(last_page, bool)
+                    or int(first_page) != first_page or int(last_page) != last_page):
+                raise ValueError
+            first_page = int(first_page)
+            last_page = int(last_page)
+        except (TypeError, ValueError, OverflowError):
+            return _rejected("page range", "Page bounds must be integers.")
+        if first_page < 1 or last_page < first_page:
+            return _rejected("page range", "Page bounds must be positive and ordered.")
+        page_count = last_page - first_page + 1
+        if page_count > self.max_page_range_pages:
+            return _rejected(
+                "page range", f"Range exceeds the {self.max_page_range_pages}-page limit.",
+            )
+
+        with _file_lock(self.lock_path):
+            manifest = self._read_manifest()
+            batch = manifest["batches"].get(batch_key)
+            parent = next((item for item in (batch or {}).get("parent_documents", [])
+                           if item.get("document_id") == str(document_id)), None)
+        if batch is None:
+            return _rejected("page range", "Batch was not found.")
+        if parent is None:
+            return _rejected("page range", "Parent cookbook PDF was not found in this batch.")
+        parent_digest = str(parent.get("sha256", ""))
+        if (not re.fullmatch(r"[0-9a-f]{64}", parent_digest)
+                or parent.get("document_id") != parent_digest):
+            return _rejected("page range", "Parent document identity metadata is invalid.")
+        if last_page > int(parent.get("page_count", 0)):
+            return _rejected("page range", "Page bounds exceed the parent document.")
+        range_id = _page_range_id(parent_digest, first_page, last_page)
+        parent_path = self.root / batch_key / "parent_documents" / f"{parent_digest}.pdf"
+        range_dir = self.root / batch_key / "parent_documents" / "ranges"
+        input_path = range_dir / f"{range_id}.pdf"
+        receipt_path = range_dir / f"{range_id}.json"
+        lock_path = self.root / batch_key / "locks" / f"range-{range_id}.lock"
+        temporary: Path | None = None
+
+        try:
+            with _file_lock(lock_path):
+                with _file_lock(self.lock_path):
+                    manifest = self._read_manifest()
+                    batch = manifest["batches"].get(batch_key)
+                    parent = next((item for item in (batch or {}).get("parent_documents", [])
+                                   if item.get("document_id") == str(document_id)), None)
+                if batch is None or parent is None:
+                    return _rejected("page range", "Parent cookbook PDF was not found in this batch.")
+                if (parent.get("sha256") != parent_digest
+                        or parent.get("document_id") != parent_digest
+                        or parent.get("batch_id") != batch_key):
+                    return _rejected("page range", "Parent document identity changed during range creation.")
+                try:
+                    recorded_path = Path(str(parent.get("staged_path", ""))).resolve(strict=True)
+                    expected_path = parent_path.resolve()
+                    recorded_path.relative_to(self.root.resolve())
+                except (OSError, ValueError):
+                    return _rejected("page range", "The staged parent PDF path is unavailable or unsafe.")
+                if (parent_path.is_symlink() or recorded_path != expected_path
+                        or not parent_path.is_file()):
+                    return _rejected("page range", "The staged parent PDF path is unavailable or unsafe.")
+                if _digest_file(parent_path) != parent_digest:
+                    return _rejected("page range", "The staged parent PDF hash does not match its identity.")
+                existing_range = next((item for item in parent.get("ranges", [])
+                                       if item.get("range_id") == range_id), None)
+                if existing_range is not None:
+                    existing_path = Path(str(existing_range.get("input_path", "")))
+                    if (existing_path == input_path and not input_path.is_symlink()
+                            and input_path.is_file()
+                            and _digest_file(input_path) == existing_range.get("input_sha256")):
+                        try:
+                            with fitz.open(input_path) as existing_doc:
+                                valid_existing = len(existing_doc) == page_count and not existing_doc.needs_pass
+                        except Exception:
+                            valid_existing = False
+                        if valid_existing:
+                            return {**existing_range, "status": "duplicate"}
+                receipt_record = None
+                if receipt_path.exists():
+                    if receipt_path.is_symlink():
+                        return _rejected("page range", "The range recovery receipt path is unsafe.")
+                    try:
+                        receipt_record = json.loads(receipt_path.read_text(encoding="utf-8"))["record"]
+                    except (OSError, json.JSONDecodeError, KeyError, TypeError):
+                        return _rejected("page range", "The range recovery receipt is damaged.")
+                    if (receipt_record.get("range_id") != range_id
+                            or receipt_record.get("record_version") != 1
+                            or receipt_record.get("schema_version") != 1
+                            or receipt_record.get("kind") != "page_range"
+                            or receipt_record.get("parent_sha256") != parent_digest
+                            or receipt_record.get("document_id") != parent_digest
+                            or receipt_record.get("batch_id") != batch_key
+                            or receipt_record.get("first_page") != first_page
+                            or receipt_record.get("last_page") != last_page
+                            or receipt_record.get("page_count") != page_count
+                            or receipt_record.get("status") != "waiting"
+                            or receipt_record.get("input_path") != str(input_path)
+                            or not isinstance(receipt_record.get("size_bytes"), int)
+                            or receipt_record.get("size_bytes", 0) <= 0
+                            or not re.fullmatch(r"[0-9a-f]{64}", str(receipt_record.get("input_sha256", "")))):
+                        return _rejected("page range", "The range recovery receipt does not match this request.")
+                    if (not input_path.is_symlink() and input_path.is_file()
+                            and _digest_file(input_path) == receipt_record["input_sha256"]):
+                        try:
+                            with fitz.open(input_path) as recovered_doc:
+                                valid_recovered = len(recovered_doc) == page_count and not recovered_doc.needs_pass
+                        except Exception:
+                            valid_recovered = False
+                        if valid_recovered:
+                            if existing_range is not None:
+                                return {**existing_range, "status": "repaired"}
+                            with _file_lock(self.lock_path):
+                                current_manifest = self._read_manifest()
+                                current_batch = current_manifest["batches"].get(batch_key)
+                                current_parent = next((item for item in (current_batch or {}).get("parent_documents", [])
+                                                       if item.get("document_id") == str(document_id)), None)
+                                if current_batch is None or current_parent is None:
+                                    return _rejected("page range", "Parent cookbook PDF was not found in this batch.")
+                                current_ranges = current_parent.setdefault("ranges", [])
+                                current_existing = next((item for item in current_ranges
+                                                         if item.get("range_id") == range_id), None)
+                                if current_existing is None:
+                                    current_ranges.append(receipt_record)
+                                    current_batch["updated_at"] = _now()
+                                    try:
+                                        self._write_manifest(current_manifest)
+                                    except Exception as exc:
+                                        return _rejected(
+                                            "page range",
+                                            f"Range metadata recovery failed: {type(exc).__name__}.",
+                                        )
+                                    return {**receipt_record, "status": "recovered"}
+                                if current_existing.get("input_sha256") != receipt_record.get("input_sha256"):
+                                    return _rejected("page range", "Range metadata conflicts with its recovery receipt.")
+                                return {**current_existing, "status": "duplicate"}
+                try:
+                    source_doc = fitz.open(parent_path)
+                except Exception:
+                    return _rejected("page range", "The staged parent PDF cannot be opened.")
+                try:
+                    if (source_doc.needs_pass or source_doc.is_encrypted
+                            or len(source_doc) != int(parent.get("page_count", -1))):
+                        return _rejected("page range", "The staged parent PDF metadata does not match its content.")
+                    if last_page > len(source_doc):
+                        return _rejected("page range", "Page bounds exceed the parent document.")
+                    range_dir.mkdir(parents=True, exist_ok=True)
+                    try:
+                        free_bytes = shutil.disk_usage(range_dir).free
+                    except OSError:
+                        return _rejected("page range", "Could not check free disk space for this range.")
+                    if free_bytes < self.max_page_range_bytes + self.parent_disk_reserve_bytes:
+                        return _rejected("page range", "Insufficient free disk space to create this range safely.")
+
+                    temporary = range_dir / f".{range_id}.{uuid.uuid4().hex}.tmp"
+                    self._write_page_range_pdf(source_doc, temporary, first_page, last_page)
+                finally:
+                    source_doc.close()
+
+                try:
+                    size_bytes = temporary.stat().st_size
+                    if size_bytes <= 0 or size_bytes > self.max_page_range_bytes:
+                        return _rejected(
+                            "page range",
+                            f"Generated range PDF exceeds the {self.max_page_range_bytes}-byte limit.",
+                        )
+                    with temporary.open("r+b") as handle:
+                        os.fsync(handle.fileno())
+                    generated_digest = _digest_file(temporary)
+                    try:
+                        with fitz.open(temporary) as generated:
+                            if len(generated) != page_count or generated.needs_pass:
+                                return _rejected("page range", "Generated range PDF failed validation.")
+                    except Exception:
+                        return _rejected("page range", "Generated range PDF failed validation.")
+                    if _digest_file(parent_path) != parent_digest:
+                        return _rejected("page range", "The staged parent PDF changed during range creation.")
+
+                    with _file_lock(self.lock_path):
+                        manifest = self._read_manifest()
+                        batch = manifest["batches"].get(batch_key)
+                        parent = next((item for item in (batch or {}).get("parent_documents", [])
+                                       if item.get("document_id") == str(document_id)), None)
+                        if batch is None or parent is None or parent.get("sha256") != parent_digest:
+                            return _rejected("page range", "Parent cookbook PDF changed before metadata commit.")
+                        ranges = parent.setdefault("ranges", [])
+                        existing = next((item for item in ranges
+                                         if item.get("range_id") == range_id), None)
+                        expected_digest = (existing or receipt_record or {}).get("input_sha256")
+                        if expected_digest is not None and expected_digest != generated_digest:
+                            return _rejected(
+                                "page range", "Regenerated bytes differ from the recorded range input; it was preserved."
+                            )
+                        if existing is not None:
+                            if (existing.get("input_sha256") != generated_digest
+                                    or existing.get("input_path") != str(input_path)):
+                                return _rejected(
+                                    "page range", "The existing range input cannot be restored with its recorded bytes."
+                                )
+                        input_was_present = input_path.exists()
+                        if input_path.is_symlink() or (input_was_present and not input_path.is_file()):
+                            return _rejected("page range", "A conflicting file occupies this range identity.")
+                        if input_path.exists():
+                            if _digest_file(input_path) != generated_digest:
+                                if expected_digest is None:
+                                    return _rejected("page range", "A conflicting file occupies this range identity.")
+                                if expected_digest != generated_digest:
+                                    return _rejected(
+                                        "page range", "Regenerated bytes differ from the recorded range input; it was preserved."
+                                    )
+                                os.replace(temporary, input_path)
+                            else:
+                                temporary.unlink()
+                        else:
+                            os.replace(temporary, input_path)
+
+                        if existing is not None:
+                            return {
+                                **existing,
+                                "status": "repaired",
+                                "message": "The missing or damaged range input was restored with its recorded SHA-256.",
+                            }
+                        record = receipt_record or {
+                            "record_version": 1,
+                            "schema_version": 1,
+                            "kind": "page_range",
+                            "range_id": range_id,
+                            "document_id": parent_digest,
+                            "parent_sha256": parent_digest,
+                            "batch_id": batch_key,
+                            "first_page": first_page,
+                            "last_page": last_page,
+                            "page_count": page_count,
+                            "input_path": str(input_path),
+                            "input_sha256": generated_digest,
+                            "size_bytes": size_bytes,
+                            "created_at": _now(),
+                            "status": "waiting",
+                        }
+                        if receipt_record is None:
+                            try:
+                                _atomic_json(receipt_path, {"record": record})
+                            except Exception as exc:
+                                if not input_was_present:
+                                    try:
+                                        input_path.unlink()
+                                    except OSError:
+                                        pass
+                                return _rejected(
+                                    "page range", f"Range recovery receipt could not be saved: {type(exc).__name__}."
+                                )
+                        ranges.append(record)
+                        batch["updated_at"] = _now()
+                        try:
+                            self._write_manifest(manifest)
+                        except Exception as exc:
+                            return _rejected(
+                                "page range",
+                                f"Range input was saved but metadata could not be committed: {type(exc).__name__}.",
+                            )
+                        return {**record, "status": "staged"}
+                finally:
+                    try:
+                        temporary.unlink()
+                    except OSError:
+                        pass
+        except Exception as exc:
+            return _rejected("page range", f"Could not create this page range: {type(exc).__name__}.")
+        finally:
+            if temporary is not None:
+                try:
+                    temporary.unlink()
+                except OSError:
+                    pass
+
+    @staticmethod
+    def _write_page_range_pdf(source_doc, temporary: Path, first_page: int, last_page: int) -> None:
+        output_doc = fitz.open()
+        try:
+            output_doc.insert_pdf(source_doc, from_page=first_page - 1,
+                                  to_page=last_page - 1)
+            output_doc.save(temporary, garbage=3, deflate=True)
+        finally:
+            output_doc.close()
+
     def _existing_parent_pdf_result(self, manifest: dict, digest: str, size_bytes: int,
                                     filename: str, temporary: Path) -> dict | None:
         """Return a duplicate/relink result, restoring only its owned content path."""
@@ -598,6 +893,16 @@ def _matches_image_signature(data: bytes, kind: str) -> bool:
 
 def _rejected(filename: str, reason: str) -> dict:
     return {"status": "rejected", "accepted": False, "filename": filename, "reason": reason}
+
+
+def _page_range_id(parent_sha256: str, first_page: int, last_page: int) -> str:
+    identity = b"\0".join((
+        b"recipe-importer:page-range:v1",
+        parent_sha256.encode("ascii"),
+        str(first_page).encode("ascii"),
+        str(last_page).encode("ascii"),
+    ))
+    return sha256(identity).hexdigest()
 
 
 def _digest_file(path: Path) -> str:

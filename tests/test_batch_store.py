@@ -42,6 +42,231 @@ def _write_pdf(path: Path, pages: int = 1, *, encrypted: bool = False) -> None:
 
 
 class BatchStoreTests(unittest.TestCase):
+    def test_page_range_materializes_only_selected_pages_and_keeps_original_provenance(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = BatchStore(root / "output", parent_disk_reserve_bytes=0)
+            batch = store.create("Page ranges")
+            source = root / "book.pdf"
+            _write_pdf(source, 105)
+            original_hash = hashlib.sha256(source.read_bytes()).hexdigest()
+            parent = store.stage_parent_pdf(batch["batch_id"], source)
+
+            result = store.create_page_range(batch["batch_id"], parent["document_id"], 101, 103)
+            range_path = Path(result["input_path"])
+            with fitz.open(range_path) as document:
+                text = [page.get_text().strip() for page in document]
+
+            reopened = store.get(batch["batch_id"])
+            record = reopened["parent_documents"][0]["ranges"][0]
+            self.assertEqual(result["status"], "staged")
+            self.assertEqual(len(text), 3)
+            self.assertIn("page 101", text[0])
+            self.assertIn("page 102", text[1])
+            self.assertIn("page 103", text[2])
+            self.assertEqual(record["first_page"], 101)
+            self.assertEqual(record["last_page"], 103)
+            self.assertEqual(record["page_count"], 3)
+            self.assertEqual(record["parent_sha256"], original_hash)
+            self.assertEqual(record["input_sha256"], hashlib.sha256(range_path.read_bytes()).hexdigest())
+            self.assertEqual(record["status"], "waiting")
+            self.assertEqual(reopened["sources"], [])
+            self.assertEqual(source.read_bytes(), Path(parent["staged_path"]).read_bytes())
+
+    def test_page_range_identity_is_versioned_and_idempotent_while_overlaps_are_separate(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = BatchStore(root / "output", parent_disk_reserve_bytes=0)
+            batch = store.create("Overlapping ranges")
+            source = root / "book.pdf"
+            _write_pdf(source, 4)
+            parent = store.stage_parent_pdf(batch["batch_id"], source)
+
+            first = store.create_page_range(batch["batch_id"], parent["document_id"], 1, 3)
+            repeated = store.create_page_range(batch["batch_id"], parent["document_id"], 1, 3)
+            overlap = store.create_page_range(batch["batch_id"], parent["document_id"], 2, 4)
+            expected = hashlib.sha256(b"\0".join((
+                b"recipe-importer:page-range:v1", parent["sha256"].encode("ascii"),
+                b"1", b"3",
+            ))).hexdigest()
+
+            ranges = store.get(batch["batch_id"])["parent_documents"][0]["ranges"]
+            self.assertEqual(first["range_id"], expected)
+            self.assertEqual(first["record_version"], 1)
+            self.assertEqual(repeated["status"], "duplicate")
+            self.assertEqual(repeated["input_sha256"], first["input_sha256"])
+            self.assertNotEqual(first["range_id"], overlap["range_id"])
+            self.assertEqual(len(ranges), 2)
+
+    def test_page_ranges_from_different_parent_hashes_have_distinct_ids(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = BatchStore(root / "output", parent_disk_reserve_bytes=0)
+            batch = store.create("Different parents")
+            paths = [root / "one.pdf", root / "two.pdf"]
+            _write_pdf(paths[0], 1)
+            doc = fitz.open()
+            doc.new_page().insert_text((72, 72), "Synthetic cookbook page 1")
+            doc.set_metadata({"author": "different source"})
+            doc.save(paths[1])
+            doc.close()
+            parents = [store.stage_parent_pdf(batch["batch_id"], path) for path in paths]
+
+            ranges = [store.create_page_range(batch["batch_id"], item["document_id"], 1, 1)
+                      for item in parents]
+
+            self.assertNotEqual(parents[0]["sha256"], parents[1]["sha256"])
+            self.assertNotEqual(ranges[0]["range_id"], ranges[1]["range_id"])
+
+    def test_page_range_rejects_invalid_bounds_and_configured_limits(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = BatchStore(root / "output", parent_disk_reserve_bytes=0,
+                               max_page_range_pages=2, max_page_range_bytes=1024)
+            batch = store.create("Bounds")
+            source = root / "book.pdf"
+            _write_pdf(source, 3)
+            parent = store.stage_parent_pdf(batch["batch_id"], source)
+
+            outcomes = [store.create_page_range(batch["batch_id"], parent["document_id"], a, b)
+                        for a, b in [(0, 1), (-1, 1), (2, 1), (1, 4), (1, 3)]]
+
+            self.assertTrue(all(item["status"] == "rejected" for item in outcomes))
+            self.assertEqual(store.get(batch["batch_id"])["parent_documents"][0].get("ranges", []), [])
+
+    def test_page_range_enforces_generated_file_size_limit_before_publication(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = BatchStore(root / "output", parent_disk_reserve_bytes=0,
+                               max_page_range_bytes=1)
+            batch = store.create("Range size limit")
+            source = root / "book.pdf"
+            _write_pdf(source, 1)
+            parent = store.stage_parent_pdf(batch["batch_id"], source)
+
+            result = store.create_page_range(batch["batch_id"], parent["document_id"], 1, 1)
+
+            range_dir = Path(parent["staged_path"]).parent / "ranges"
+            self.assertEqual(result["status"], "rejected")
+            self.assertEqual(store.get(batch["batch_id"])["parent_documents"][0].get("ranges", []), [])
+            self.assertEqual(list(range_dir.glob("*.pdf")), [])
+            self.assertEqual(list(range_dir.glob(".*.tmp")), [])
+
+    def test_page_range_blocks_parent_hash_mismatch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = BatchStore(root / "output", parent_disk_reserve_bytes=0)
+            batch = store.create("Corrupt parent")
+            source = root / "book.pdf"
+            _write_pdf(source, 2)
+            parent = store.stage_parent_pdf(batch["batch_id"], source)
+            Path(parent["staged_path"]).write_bytes(b"tampered")
+
+            result = store.create_page_range(batch["batch_id"], parent["document_id"], 1, 1)
+
+            self.assertEqual(result["status"], "rejected")
+            self.assertIn("hash", result["reason"].casefold())
+            self.assertEqual(store.get(batch["batch_id"])["parent_documents"][0].get("ranges", []), [])
+
+    def test_page_range_manifest_failure_recovers_without_duplicate_records(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = BatchStore(root / "output", parent_disk_reserve_bytes=0)
+            batch = store.create("Metadata recovery")
+            source = root / "book.pdf"
+            _write_pdf(source, 2)
+            parent = store.stage_parent_pdf(batch["batch_id"], source)
+
+            with patch.object(store, "_write_manifest", side_effect=OSError("metadata unavailable")):
+                failed = store.create_page_range(batch["batch_id"], parent["document_id"], 1, 2)
+            recovered = store.create_page_range(batch["batch_id"], parent["document_id"], 1, 2)
+
+            self.assertEqual(failed["status"], "rejected")
+            self.assertEqual(recovered["status"], "recovered")
+            self.assertEqual(len(store.get(batch["batch_id"])["parent_documents"][0]["ranges"]), 1)
+
+    def test_page_range_generation_interruption_leaves_no_record_or_temporary_input(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = BatchStore(root / "output", parent_disk_reserve_bytes=0)
+            batch = store.create("Interrupted generation")
+            source = root / "book.pdf"
+            _write_pdf(source, 2)
+            parent = store.stage_parent_pdf(batch["batch_id"], source)
+
+            with patch.object(store, "_write_page_range_pdf", side_effect=OSError("interrupted")):
+                result = store.create_page_range(batch["batch_id"], parent["document_id"], 1, 2)
+
+            range_dir = Path(parent["staged_path"]).parent / "ranges"
+            self.assertEqual(result["status"], "rejected")
+            self.assertEqual(store.get(batch["batch_id"])["parent_documents"][0].get("ranges", []), [])
+            self.assertEqual(list(range_dir.glob(".*.tmp")), [])
+
+    def test_page_range_does_not_accept_or_overwrite_missing_or_damaged_input_with_new_bytes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = BatchStore(root / "output", parent_disk_reserve_bytes=0)
+            batch = store.create("Range recovery")
+            source = root / "book.pdf"
+            _write_pdf(source, 2)
+            parent = store.stage_parent_pdf(batch["batch_id"], source)
+            first = store.create_page_range(batch["batch_id"], parent["document_id"], 1, 2)
+            range_path = Path(first["input_path"])
+            expected_hash = first["input_sha256"]
+            range_path.write_bytes(b"damaged")
+
+            damaged = store.create_page_range(batch["batch_id"], parent["document_id"], 1, 2)
+
+            self.assertEqual(damaged["status"], "rejected")
+            self.assertEqual(range_path.read_bytes(), b"damaged")
+            range_path.unlink()
+            missing = store.create_page_range(batch["batch_id"], parent["document_id"], 1, 2)
+            self.assertEqual(missing["status"], "rejected")
+            self.assertFalse(range_path.exists())
+            self.assertEqual(store.get(batch["batch_id"])["parent_documents"][0]["ranges"][0]["input_sha256"], expected_hash)
+
+    def test_concurrent_identical_page_range_creation_keeps_one_record(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = BatchStore(root / "output", parent_disk_reserve_bytes=0)
+            batch = store.create("Concurrent ranges")
+            source = root / "book.pdf"
+            _write_pdf(source, 4)
+            parent = store.stage_parent_pdf(batch["batch_id"], source)
+            results = []
+            threads = [threading.Thread(target=lambda: results.append(
+                store.create_page_range(batch["batch_id"], parent["document_id"], 2, 4)))
+                for _ in range(4)]
+
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=5)
+
+            self.assertTrue(all(not thread.is_alive() for thread in threads))
+            self.assertEqual(sorted(item["status"] for item in results),
+                             ["duplicate", "duplicate", "duplicate", "staged"])
+            self.assertEqual(len(store.get(batch["batch_id"])["parent_documents"][0]["ranges"]), 1)
+
+    def test_page_range_reads_legacy_parent_metadata_and_rejects_corrupt_materialized_input(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = BatchStore(root / "output", parent_disk_reserve_bytes=0)
+            batch = store.create("Legacy parent")
+            source = root / "book.pdf"
+            _write_pdf(source, 1)
+            parent = store.stage_parent_pdf(batch["batch_id"], source)
+            legacy = {key: value for key, value in batch.items() if key != "parent_documents"}
+            legacy["parent_documents"] = [{key: value for key, value in parent.items()
+                                           if key != "ranges"}]
+            store._write_manifest({"schema_version": 1,
+                                   "batches": {batch["batch_id"]: legacy}})
+
+            result = store.create_page_range(batch["batch_id"], parent["document_id"], 1, 1)
+
+            self.assertEqual(result["status"], "staged")
+            self.assertEqual(store.get(batch["batch_id"])["parent_documents"][0]["ranges"][0]["schema_version"], 1)
+
     def test_parent_pdf_stages_in_separate_versioned_metadata_without_changing_sources(self):
         temporary_directory = tempfile.TemporaryDirectory()
         self.addCleanup(temporary_directory.cleanup)
