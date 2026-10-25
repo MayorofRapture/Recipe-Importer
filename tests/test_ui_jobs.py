@@ -199,6 +199,93 @@ class JobServiceTests(unittest.TestCase):
         self.assertNotEqual(first_done["ranges"][0]["cache_path"], second_done["ranges"][0]["cache_path"])
         self.assertEqual(calls, ["one", "two"])
 
+    def test_range_cache_does_not_cross_unversioned_closure_instances(self):
+        batch = self.store.create("Range closure identity")
+        parent_path = Path(self.tmp.name) / "closure-book.pdf"
+        _write_parent_pdf(parent_path)
+        parent = self.store.stage_parent_pdf(batch["batch_id"], parent_path)
+        page_range = self.store.create_page_range(batch["batch_id"], parent["document_id"], 1, 1)
+
+        def make_extractor(value):
+            def extractor(context, mode, config):
+                return [{"name": value}]
+            return extractor
+
+        first_service = JobService(self.output, extractor=make_extractor("first"))
+        first = first_service.start_range_job(batch["batch_id"], [page_range["range_id"]], "local_ocr")
+        first_done = first_service.run_range_pending(first["job_id"])
+        second_service = JobService(self.output, extractor=make_extractor("second"))
+        second = second_service.start_range_job(batch["batch_id"], [page_range["range_id"]], "local_ocr")
+        second_done = second_service.run_range_pending(second["job_id"])
+
+        first_record = json.loads(Path(first_done["ranges"][0]["cache_path"]).read_text(encoding="utf-8"))
+        second_record = json.loads(Path(second_done["ranges"][0]["cache_path"]).read_text(encoding="utf-8"))
+        self.assertNotEqual(first["job_id"], second["job_id"])
+        self.assertEqual(first_record["results"][0]["name"], "first")
+        self.assertEqual(second_record["results"][0]["name"], "second")
+
+    def test_explicit_range_extractor_version_reuses_same_config_and_separates_upgrades(self):
+        batch = self.store.create("Range explicit version")
+        parent_path = Path(self.tmp.name) / "explicit-version-book.pdf"
+        _write_parent_pdf(parent_path)
+        parent = self.store.stage_parent_pdf(batch["batch_id"], parent_path)
+        page_range = self.store.create_page_range(batch["batch_id"], parent["document_id"], 1, 1)
+        calls = []
+
+        def extractor(context, mode, config):
+            calls.append(config["extractor_version"])
+            return [{"name": config["extractor_version"]}]
+
+        one = JobService(self.output, {"extractor_version": "v1"}, extractor)
+        first = one.start_range_job(batch["batch_id"], [page_range["range_id"]], "local_ocr")
+        first_done = one.run_range_pending(first["job_id"])
+        restarted = JobService(self.output, {"extractor_version": "v1"}, extractor)
+        resumed = restarted.resume_range_job(first["job_id"])
+        same = JobService(self.output, {"extractor_version": "v1"}, extractor)
+        reused = same.start_range_job(batch["batch_id"], [page_range["range_id"]], "local_ocr")
+        two = JobService(self.output, {"extractor_version": "v2"}, extractor)
+        upgraded = two.start_range_job(batch["batch_id"], [page_range["range_id"]], "local_ocr")
+        upgraded_done = two.run_range_pending(upgraded["job_id"])
+
+        self.assertEqual(reused["job_id"], first["job_id"])
+        self.assertEqual(resumed["status"], "completed")
+        self.assertNotEqual(first_done["ranges"][0]["cache_path"], upgraded_done["ranges"][0]["cache_path"])
+        self.assertEqual(calls, ["v1", "v2"])
+
+    def test_unsupported_range_config_value_fails_closed(self):
+        batch = self.store.create("Range unsupported config")
+        parent_path = Path(self.tmp.name) / "unsupported-config-book.pdf"
+        _write_parent_pdf(parent_path)
+        parent = self.store.stage_parent_pdf(batch["batch_id"], parent_path)
+        page_range = self.store.create_page_range(batch["batch_id"], parent["document_id"], 1, 1)
+
+        with self.assertRaisesRegex(ValueError, "safely fingerprinted"):
+            JobService(self.output, {"extractor_version": "v1", "effective_mode": object()}, _recipe_rows).start_range_job(
+                batch["batch_id"], [page_range["range_id"]], "local_ocr")
+
+    def test_same_range_extractor_version_with_different_config_does_not_reuse_cache(self):
+        batch = self.store.create("Range config values")
+        parent_path = Path(self.tmp.name) / "config-values-book.pdf"
+        _write_parent_pdf(parent_path)
+        parent = self.store.stage_parent_pdf(batch["batch_id"], parent_path)
+        page_range = self.store.create_page_range(batch["batch_id"], parent["document_id"], 1, 1)
+        calls = []
+
+        def extractor(context, mode, config):
+            calls.append(config["effective_setting"])
+            return [{"name": config["effective_setting"]}]
+
+        first_service = JobService(self.output, {"extractor_version": "v1", "effective_setting": "A"}, extractor)
+        first = first_service.start_range_job(batch["batch_id"], [page_range["range_id"]], "local_ocr")
+        first_done = first_service.run_range_pending(first["job_id"])
+        second_service = JobService(self.output, {"extractor_version": "v1", "effective_setting": "B"}, extractor)
+        second = second_service.start_range_job(batch["batch_id"], [page_range["range_id"]], "local_ocr")
+        second_done = second_service.run_range_pending(second["job_id"])
+
+        self.assertNotEqual(first["job_id"], second["job_id"])
+        self.assertNotEqual(first_done["ranges"][0]["cache_path"], second_done["ranges"][0]["cache_path"])
+        self.assertEqual(calls, ["A", "B"])
+
     def test_range_job_refuses_runtime_config_different_from_persisted_fingerprint(self):
         batch = self.store.create("Range runtime config")
         parent_path = Path(self.tmp.name) / "runtime-config-book.pdf"
@@ -384,7 +471,7 @@ class JobServiceTests(unittest.TestCase):
             calls.append(1)
             return [{"name": "Synthetic cache result", "candidate_id": "must-not-persist"}]
 
-        service = JobService(self.output, config={"api_key": "private-test-key"}, extractor=extractor)
+        service = JobService(self.output, config={"api_key": "private-test-key", "extractor_version": "fixture-v1"}, extractor=extractor)
         first = service.start_range_job(batch["batch_id"], [page_range["range_id"]], "local_ocr")
         completed = service.run_range_pending(first["job_id"])
         cache_path = Path(completed["ranges"][0]["cache_path"])
@@ -393,12 +480,120 @@ class JobServiceTests(unittest.TestCase):
         self.assertNotIn("private-test-key", service.range_manifest_path.read_text(encoding="utf-8"))
 
         cache_path.write_text("{broken", encoding="utf-8")
-        second = JobService(self.output, config={"api_key": "private-test-key"}, extractor=extractor).start_range_job(
+        second = JobService(self.output, config={"api_key": "private-test-key", "extractor_version": "fixture-v1"}, extractor=extractor).start_range_job(
             batch["batch_id"], [page_range["range_id"]], "local_ocr")
         self.assertNotEqual(first["job_id"], second["job_id"])
-        rerun = JobService(self.output, config={"api_key": "private-test-key"}, extractor=extractor).run_range_pending(
+        rerun = JobService(self.output, config={"api_key": "private-test-key", "extractor_version": "fixture-v1"}, extractor=extractor).run_range_pending(
             second["job_id"])
         self.assertEqual(rerun["status"], "completed")
+        self.assertEqual(len(calls), 2)
+
+    def test_valid_checksum_cannot_authorize_contradictory_range_provenance(self):
+        batch = self.store.create("Range provenance integrity")
+        parent_path = Path(self.tmp.name) / "provenance-book.pdf"
+        _write_parent_pdf(parent_path)
+        parent = self.store.stage_parent_pdf(batch["batch_id"], parent_path)
+        page_range = self.store.create_page_range(batch["batch_id"], parent["document_id"], 1, 1)
+        calls = []
+
+        def extractor(context, mode, config):
+            calls.append(context["range_id"])
+            return [{"name": "Synthetic provenance result"}]
+
+        def resign(record):
+            payload = {key: value for key, value in record.items() if key != "record_sha256"}
+            canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+            record["record_sha256"] = ui_job_service.sha256(canonical.encode("utf-8")).hexdigest()
+
+        service = JobService(self.output, {"extractor_version": "v1"}, extractor)
+        job = service.start_range_job(batch["batch_id"], [page_range["range_id"]], "local_ocr")
+        done = service.run_range_pending(job["job_id"])
+        mutations = {
+            "schema_version": 2,
+            "kind": "other_record",
+            "batch_id": "other-batch",
+            "parent_document_id": "other-parent",
+            "parent_sha256": "0" * 64,
+            "range_id": "other-range",
+            "first_page": 9,
+            "last_page": 9,
+            "input_sha256": "1" * 64,
+            "mode": "gemini",
+            "config_fingerprint": "2" * 64,
+            "cache_identity": "3" * 64,
+        }
+
+        for field, value in mutations.items():
+            with self.subTest(field=field):
+                cache_path = Path(done["ranges"][0]["cache_path"])
+                record = json.loads(cache_path.read_text(encoding="utf-8"))
+                record[field] = value
+                resign(record)
+                cache_path.write_text(json.dumps(record), encoding="utf-8")
+
+                retry_service = JobService(self.output, {"extractor_version": "v1"}, extractor)
+                retry = retry_service.start_range_job(batch["batch_id"], [page_range["range_id"]], "local_ocr")
+                retried = retry_service.run_range_pending(retry["job_id"])
+
+                self.assertNotEqual(retry["job_id"], job["job_id"])
+                self.assertEqual(retried["status"], "completed")
+                self.assertEqual(len(calls), 2 + list(mutations).index(field))
+                job, done = retry, retried
+
+    def test_range_cache_checksum_mismatch_is_rejected(self):
+        batch = self.store.create("Range checksum integrity")
+        parent_path = Path(self.tmp.name) / "checksum-book.pdf"
+        _write_parent_pdf(parent_path)
+        parent = self.store.stage_parent_pdf(batch["batch_id"], parent_path)
+        page_range = self.store.create_page_range(batch["batch_id"], parent["document_id"], 1, 1)
+        calls = []
+
+        def extractor(context, mode, config):
+            calls.append(1)
+            return [{"name": "Synthetic checksum result"}]
+
+        service = JobService(self.output, {"extractor_version": "v1"}, extractor)
+        first = service.start_range_job(batch["batch_id"], [page_range["range_id"]], "local_ocr")
+        done = service.run_range_pending(first["job_id"])
+        cache_path = Path(done["ranges"][0]["cache_path"])
+        record = json.loads(cache_path.read_text(encoding="utf-8"))
+        record["results"][0]["name"] = "tampered without updating checksum"
+        cache_path.write_text(json.dumps(record), encoding="utf-8")
+
+        retry_service = JobService(self.output, {"extractor_version": "v1"}, extractor)
+        retry = retry_service.start_range_job(batch["batch_id"], [page_range["range_id"]], "local_ocr")
+        retried = retry_service.run_range_pending(retry["job_id"])
+
+        self.assertNotEqual(first["job_id"], retry["job_id"])
+        self.assertEqual(retried["status"], "completed")
+        self.assertEqual(len(calls), 2)
+
+    def test_range_cache_rejects_unowned_filename(self):
+        batch = self.store.create("Range cache ownership")
+        parent_path = Path(self.tmp.name) / "ownership-book.pdf"
+        _write_parent_pdf(parent_path)
+        parent = self.store.stage_parent_pdf(batch["batch_id"], parent_path)
+        page_range = self.store.create_page_range(batch["batch_id"], parent["document_id"], 1, 1)
+        calls = []
+
+        def extractor(context, mode, config):
+            calls.append(1)
+            return [{"name": "Synthetic owned result"}]
+
+        service = JobService(self.output, {"extractor_version": "v1"}, extractor)
+        first = service.start_range_job(batch["batch_id"], [page_range["range_id"]], "local_ocr")
+        done = service.run_range_pending(first["job_id"])
+        cache_path = Path(done["ranges"][0]["cache_path"])
+        record = json.loads(cache_path.read_text(encoding="utf-8"))
+        unowned_path = cache_path.with_name(f"{record['cache_identity']}--unowned.json")
+        cache_path.rename(unowned_path)
+
+        retry_service = JobService(self.output, {"extractor_version": "v1"}, extractor)
+        retry = retry_service.start_range_job(batch["batch_id"], [page_range["range_id"]], "local_ocr")
+        retried = retry_service.run_range_pending(retry["job_id"])
+
+        self.assertNotEqual(first["job_id"], retry["job_id"])
+        self.assertEqual(retried["status"], "completed")
         self.assertEqual(len(calls), 2)
 
     def test_range_no_recipe_is_durable_and_cached_as_no_recipe(self):
@@ -422,13 +617,13 @@ class JobServiceTests(unittest.TestCase):
                 return [{"status": "NO_RECIPE", "note": "No recipe in synthetic range."}]
             return [{"name": "Synthetic recipe on second page"}]
 
-        service = JobService(self.output, extractor=extractor)
+        service = JobService(self.output, config={"extractor_version": "fixture-v1"}, extractor=extractor)
         job = service.start_range_job(batch["batch_id"],
                                       [page_range["range_id"], recipe_range["range_id"]], "local_ocr")
-        queued_subset = JobService(self.output, extractor=extractor).start_range_job(
+        queued_subset = JobService(self.output, config={"extractor_version": "fixture-v1"}, extractor=extractor).start_range_job(
             batch["batch_id"], [page_range["range_id"]], "local_ocr")
         done = service.run_range_pending(job["job_id"])
-        cached = JobService(self.output, extractor=extractor).run_range_pending(queued_subset["job_id"])
+        cached = JobService(self.output, config={"extractor_version": "fixture-v1"}, extractor=extractor).run_range_pending(queued_subset["job_id"])
 
         self.assertEqual({item["range_id"]: item["status"] for item in done["ranges"]}[page_range["range_id"]], "no_recipe")
         self.assertEqual(cached["ranges"][0]["status"], "no_recipe")

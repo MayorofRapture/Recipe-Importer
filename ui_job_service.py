@@ -8,6 +8,7 @@ import json
 import marshal
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 import threading
@@ -57,6 +58,7 @@ class JobService:
         self.config = dict(config) if config is not None else None
         self.extractor = extractor
         self.background = bool(background)
+        self._unversioned_range_scope = uuid.uuid4().hex
 
     def start(self, batch_id: str, mode: str, cloud_consent: bool = False) -> dict:
         mode = str(mode or "").strip().lower()
@@ -157,9 +159,10 @@ class JobService:
         store = BatchStore(self.output_dir)
         verified_ranges = [store.validate_page_range(batch_id, range_id) for range_id in range_ids]
         verified_ranges.sort(key=lambda item: (item["parent_document_id"], item["first_page"], item["last_page"]))
-        config = _range_config_snapshot(self.config or {}, self.extractor)
+        config = _range_config_snapshot(self.config or {}, self.extractor, self._unversioned_range_scope)
         config_json = json.dumps(config, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         config_fingerprint = sha256(config_json.encode("utf-8")).hexdigest()
+        versioned = _range_extractor_is_versioned(config)
         timestamp = _now()
         selected_ids = [item["range_id"] for item in verified_ranges]
 
@@ -175,17 +178,20 @@ class JobService:
             active = next((job for job in prior if job.get("status") in _ACTIVE_STATES), None)
             if active is not None:
                 return _range_snapshot(active)
-            if prior and prior[0].get("status") == "completed":
-                caches = [self._find_range_cache(item.get("cache_identity", ""))
-                          for item in prior[0].get("ranges", [])]
+            if versioned and prior and prior[0].get("status") == "completed":
+                prior_job = prior[0]
+                caches = [self._find_job_range_cache(item, prior_job)
+                          for item in prior_job.get("ranges", [])]
                 if all(caches):
-                    return _range_snapshot(prior[0])
+                    return _range_snapshot(prior_job)
 
             job_id = str(uuid.uuid4())
             ranges = []
             for item in verified_ranges:
                 cache_identity = _range_cache_identity(item, str(batch_id), mode, config_fingerprint)
-                cached = self._find_range_cache(cache_identity)
+                cache_context = _range_cache_context(
+                    item, str(batch_id), mode, config_fingerprint, versioned, job_id)
+                cached = self._find_range_cache(cache_identity, cache_context)
                 ranges.append({
                     "parent_document_id": item["parent_document_id"],
                     "parent_sha256": item["parent_sha256"],
@@ -273,7 +279,11 @@ class JobService:
                     try:
                         verified = BatchStore(self.output_dir).validate_page_range(current["batch_id"], range_id)
                         _assert_range_matches_job(item, verified)
-                        cached = self._find_range_cache(item["cache_identity"])
+                        cache_context = _range_cache_context(
+                            verified, current["batch_id"], current["mode"],
+                            item["config_fingerprint"], _range_extractor_is_versioned(current["config"]),
+                            job_id)
+                        cached = self._find_range_cache(item["cache_identity"], cache_context)
                         if cached:
                             outcome = cached["status"]
                             cache_path, result_count = cached["cache_path"], cached["result_count"]
@@ -326,7 +336,7 @@ class JobService:
         if job is None:
             raise ValueError("Range job was not found.")
         if (job.get("status") == "completed"
-                and all(self._find_range_cache(item.get("cache_identity", ""))
+                and all(self._find_job_range_cache(item, job)
                         for item in job.get("ranges", []))):
             return job
         if self.extractor is None:
@@ -360,7 +370,7 @@ class JobService:
                 item["status"] = "waiting"
                 item["error"] = ""
             elif item.get("status") in {"completed", "no_recipe"}:
-                cached = self._find_range_cache(item.get("cache_identity", ""))
+                cached = self._find_job_range_cache(item, job)
                 if not cached:
                     item["status"] = "waiting"
                     item["error"] = "The durable range result cache is missing or corrupt; this explicit resume will retry the range."
@@ -373,7 +383,7 @@ class JobService:
         _finish_range_job(job)
 
     def _assert_range_runtime_config(self, job: dict) -> None:
-        config = _range_config_snapshot(self.config or {}, self.extractor)
+        config = _range_config_snapshot(self.config or {}, self.extractor, self._unversioned_range_scope)
         canonical = json.dumps(config, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         fingerprint = sha256(canonical.encode("utf-8")).hexdigest()
         if fingerprint != job.get("config_fingerprint"):
@@ -404,7 +414,17 @@ class JobService:
             self._write_range_manifest(manifest)
             return _range_snapshot(job)
 
-    def _find_range_cache(self, cache_identity: str) -> dict | None:
+    def _find_job_range_cache(self, item: dict, job: dict) -> dict | None:
+        verified = BatchStore(self.output_dir).validate_page_range(job["batch_id"], item["range_id"])
+        _assert_range_matches_job(item, verified)
+        versioned = _range_extractor_is_versioned(job.get("config", {}))
+        expected = _range_cache_context(verified, job["batch_id"], job["mode"],
+                                        item["config_fingerprint"], versioned, job["job_id"])
+        if item.get("cache_identity") != expected["cache_identity"]:
+            return None
+        return self._find_range_cache(expected["cache_identity"], expected)
+
+    def _find_range_cache(self, cache_identity: str, expected: dict) -> dict | None:
         cache_dir = self._range_cache_dir(create=False)
         if cache_dir is None:
             return None
@@ -415,14 +435,26 @@ class JobService:
                 record = json.loads(path.read_text(encoding="utf-8"))
                 payload = {key: value for key, value in record.items() if key != "record_sha256"}
                 canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-                if (record.get("cache_identity") == cache_identity
+                owned_path = (path.resolve(strict=True).parent == cache_dir.resolve(strict=True)
+                              and re.fullmatch(re.escape(cache_identity) + r"--[0-9a-f]{32}\.json", path.name) is not None)
+                provenance_fields = (
+                    "cache_identity", "batch_id", "parent_document_id", "parent_sha256", "range_id",
+                    "first_page", "last_page", "input_sha256", "mode", "config_fingerprint",
+                )
+                provenance_matches = all(record.get(key) == expected.get(key) for key in provenance_fields)
+                if (type(record.get("schema_version")) is int and record["schema_version"] == 1
+                        and record.get("kind") == "synthetic_range_result"
+                        and record.get("cache_identity") == cache_identity
+                        and provenance_matches and owned_path
+                        and (expected.get("extractor_versioned")
+                             or record.get("job_id") == expected.get("job_id"))
                         and record.get("record_sha256") == sha256(canonical.encode("utf-8")).hexdigest()
                         and isinstance(record.get("results"), list)):
                     status = record.get("status")
                     if status not in {"completed", "no_recipe"}:
                         continue
                     return {"cache_path": str(path), "result_count": len(record["results"]), "status": status}
-            except (OSError, json.JSONDecodeError, AttributeError, TypeError):
+            except (OSError, json.JSONDecodeError, AttributeError, TypeError, ValueError, RuntimeError):
                 continue
         return None
 
@@ -442,6 +474,7 @@ class JobService:
             "input_sha256": item["input_sha256"],
             "mode": job["mode"],
             "config_fingerprint": item["config_fingerprint"],
+            "job_id": job["job_id"],
             "status": outcome,
             "results": results,
             "created_at": _now(),
@@ -1020,7 +1053,8 @@ def _quota_note(rows: list[dict]) -> str:
                  for row in rows if _is_quota_result(row)), "Request allowance reached; resume when quota is available.")
 
 
-def _range_config_snapshot(config: Mapping[str, Any], extractor: Callable) -> dict:
+def _range_config_snapshot(config: Mapping[str, Any], extractor: Callable,
+                           unversioned_scope: str | None = None) -> dict:
     safe = {}
     for key, value in config.items():
         name = str(key)
@@ -1028,11 +1062,13 @@ def _range_config_snapshot(config: Mapping[str, Any], extractor: Callable) -> di
             continue
         try:
             clean_value = _range_json_value(value)
-            json.dumps(clean_value, ensure_ascii=False, sort_keys=True)
+            json.dumps(clean_value, ensure_ascii=False, sort_keys=True, allow_nan=False)
         except (TypeError, ValueError):
-            continue
+            raise ValueError("Range extraction config contains a value that cannot be safely fingerprinted.") from None
         safe[name] = clean_value
     safe.setdefault("extractor_version", str(getattr(extractor, "__range_extractor_version__", "")))
+    if not _range_extractor_is_versioned(safe) and unversioned_scope:
+        safe["unversioned_scope"] = unversioned_scope
     safe["extractor"] = f"{getattr(extractor, '__module__', '')}.{getattr(extractor, '__qualname__', type(extractor).__qualname__)}"
     code = getattr(extractor, "__code__", None)
     if code is None:
@@ -1041,6 +1077,30 @@ def _range_config_snapshot(config: Mapping[str, Any], extractor: Callable) -> di
     if code is not None:
         safe["extractor_implementation_sha256"] = sha256(marshal.dumps(_normalized_code(code))).hexdigest()
     return safe
+
+
+def _range_extractor_is_versioned(config: Mapping[str, Any]) -> bool:
+    version = config.get("extractor_version")
+    return isinstance(version, str) and bool(version.strip())
+
+
+def _range_cache_context(item: dict, batch_id: str, mode: str, config_fingerprint: str,
+                         versioned: bool, job_id: str) -> dict:
+    identity = _range_cache_identity(item, str(batch_id), mode, config_fingerprint)
+    return {
+        "cache_identity": identity,
+        "batch_id": str(batch_id),
+        "parent_document_id": item["parent_document_id"],
+        "parent_sha256": item["parent_sha256"],
+        "range_id": item["range_id"],
+        "first_page": item["first_page"],
+        "last_page": item["last_page"],
+        "input_sha256": item["input_sha256"],
+        "mode": mode,
+        "config_fingerprint": config_fingerprint,
+        "extractor_versioned": versioned,
+        "job_id": job_id,
+    }
 
 
 def _normalized_code(code: CodeType) -> CodeType:
