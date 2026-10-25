@@ -851,6 +851,89 @@ class BatchStore:
             batch = self._read_manifest()["batches"].get(str(batch_id))
             return json.loads(json.dumps(batch)) if batch is not None else None
 
+    def validate_page_range(self, batch_id: str, range_id: str) -> dict:
+        """Return a page range only after its parent, metadata, path, bytes, and PDF agree."""
+        batch_key = str(batch_id)
+        with _file_lock(self.lock_path):
+            batch = self._read_manifest()["batches"].get(batch_key)
+            if batch is None:
+                raise ValueError("Batch was not found.")
+            parent = next((item for item in batch.get("parent_documents", [])
+                           if any(isinstance(record, dict) and record.get("range_id") == str(range_id)
+                                  for record in item.get("ranges", []))), None)
+            if parent is None:
+                raise ValueError("Page range was not found in this batch.")
+            record = next(item for item in parent.get("ranges", [])
+                          if isinstance(item, dict) and item.get("range_id") == str(range_id))
+            record = json.loads(json.dumps(record))
+
+        parent_digest = str(parent.get("sha256", ""))
+        if (parent.get("batch_id") != batch_key or parent.get("document_id") != parent_digest
+                or parent.get("kind") != "parent_pdf" or type(parent.get("record_version")) is not int
+                or parent.get("record_version") != 1
+                or type(parent.get("size_bytes")) is not int or parent.get("size_bytes", 0) <= 0
+                or type(parent.get("page_count")) is not int or parent.get("page_count", 0) <= 0
+                or not re.fullmatch(r"[0-9a-f]{64}", parent_digest)):
+            raise ValueError("Parent document identity metadata is invalid.")
+        first_page = record.get("first_page")
+        last_page = record.get("last_page")
+        page_count = record.get("page_count")
+        if (type(first_page) is not int or type(last_page) is not int or type(page_count) is not int
+                or first_page < 1 or last_page < first_page or last_page > parent.get("page_count", 0)
+                or page_count != last_page - first_page + 1):
+            raise ValueError("Range metadata is invalid.")
+        expected_id = _page_range_id(parent_digest, first_page, last_page)
+        expected_parent = self.root / batch_key / "parent_documents" / f"{parent_digest}.pdf"
+        expected_range = self.root / batch_key / "parent_documents" / "ranges" / f"{expected_id}.pdf"
+        if str(range_id) != expected_id:
+            raise ValueError("Range identity does not match its parent and page bounds.")
+        if not _page_range_record_matches(record, expected_id, parent_digest, batch_key,
+                                          first_page, last_page, page_count, expected_range):
+            raise ValueError("Range metadata is contradictory or unsupported.")
+
+        try:
+            parent_path = Path(str(parent.get("staged_path", "")))
+            range_path = Path(str(record.get("input_path", "")))
+            if (parent_path.is_symlink() or range_path.is_symlink()
+                    or parent_path.resolve(strict=True) != Path(os.path.abspath(expected_parent))
+                    or range_path.resolve(strict=True) != Path(os.path.abspath(expected_range))
+                    or not parent_path.is_file() or not range_path.is_file()):
+                raise ValueError
+            parent_path.resolve().relative_to(self.root.resolve())
+            range_path.resolve().relative_to(self.root.resolve())
+            if (_digest_file(parent_path) != parent_digest
+                    or parent_path.stat().st_size != parent["size_bytes"]
+                    or _digest_file(range_path) != record["input_sha256"]
+                    or range_path.stat().st_size != record["size_bytes"]):
+                raise ValueError
+            with fitz.open(parent_path) as document:
+                if document.needs_pass or document.is_encrypted or len(document) != parent["page_count"]:
+                    raise ValueError
+            receipt_path = expected_range.with_suffix(".json")
+            if receipt_path.exists():
+                if receipt_path.is_symlink():
+                    raise ValueError
+                receipt = json.loads(receipt_path.read_text(encoding="utf-8"))["record"]
+                fields = ("record_version", "schema_version", "kind", "range_id", "document_id",
+                          "parent_sha256", "batch_id", "first_page", "last_page", "page_count",
+                          "input_path", "input_sha256", "size_bytes")
+                if (not _page_range_record_matches(receipt, expected_id, parent_digest, batch_key,
+                                                   first_page, last_page, page_count, expected_range)
+                        or any(receipt.get(key) != record.get(key) for key in fields)):
+                    raise ValueError
+            with fitz.open(range_path) as document:
+                if document.needs_pass or document.is_encrypted or len(document) != page_count:
+                    raise ValueError
+        except (OSError, RuntimeError, ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
+            raise ValueError("The staged range input is missing, damaged, redirected, or contradictory.") from exc
+
+        return {
+            **record,
+            "parent_document_id": parent_digest,
+            "parent_path": str(expected_parent),
+            "input_path": str(expected_range),
+        }
+
     def _inspect(self, data: bytes, extension: str) -> tuple[str, int, str] | str:
         expected = _IMAGE_TYPES.get(extension)
         if extension == ".pdf":

@@ -3,7 +3,9 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from datetime import datetime, timezone
+from hashlib import sha256
 import json
+import marshal
 import os
 from pathlib import Path
 import subprocess
@@ -11,6 +13,7 @@ import sys
 import threading
 import time
 import uuid
+from types import CodeType
 from typing import Any, Callable, Mapping
 
 from batch_store import BatchStore, _LockBusy, _atomic_json, _file_lock
@@ -48,6 +51,8 @@ class JobService:
         self.root = self.output_dir / "ui_jobs"
         self.manifest_path = self.root / "jobs.json"
         self.manifest_lock = self.root / "locks" / "manifest.lock"
+        self.range_manifest_path = self.root / "range_jobs.json"
+        self.range_manifest_lock = self.root / "locks" / "range-jobs.lock"
         self.global_worker_lock = self.root / "locks" / "extraction-worker.lock"
         self.config = dict(config) if config is not None else None
         self.extractor = extractor
@@ -136,6 +141,376 @@ class JobService:
             except Exception as exc:
                 self._mutate_job(job_id, lambda value: _mark_job_failed(value, _redact(exc, self.config)))
         return self.snapshot(job_id) or _snapshot(job)
+
+    def start_range_job(self, batch_id: str, range_ids: list[str], mode: str) -> dict:
+        """Persist a synthetic-only job for verified staged page ranges."""
+        mode = str(mode or "").strip().lower()
+        if mode not in _VALID_MODES:
+            raise ValueError("Unsupported extraction mode.")
+        if self.extractor is None:
+            raise RuntimeError("Range execution requires an explicitly injected synthetic extractor.")
+        if not isinstance(range_ids, list) or not range_ids or any(not isinstance(item, str) or not item for item in range_ids):
+            raise ValueError("Select one or more page ranges.")
+        if len(set(range_ids)) != len(range_ids):
+            raise ValueError("A page range may be selected only once.")
+
+        store = BatchStore(self.output_dir)
+        verified_ranges = [store.validate_page_range(batch_id, range_id) for range_id in range_ids]
+        verified_ranges.sort(key=lambda item: (item["parent_document_id"], item["first_page"], item["last_page"]))
+        config = _range_config_snapshot(self.config or {}, self.extractor)
+        config_json = json.dumps(config, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        config_fingerprint = sha256(config_json.encode("utf-8")).hexdigest()
+        timestamp = _now()
+        selected_ids = [item["range_id"] for item in verified_ranges]
+
+        with _file_lock(self.range_manifest_lock):
+            manifest = self._read_range_manifest()
+            prior = sorted((job for job in manifest["jobs"].values()
+                            if job.get("batch_id") == str(batch_id)
+                            and job.get("range_ids") == selected_ids
+                            and job.get("mode") == mode
+                            and job.get("config_fingerprint") == config_fingerprint),
+                           key=lambda job: (job.get("created_at", ""), job.get("job_id", "")),
+                           reverse=True)
+            active = next((job for job in prior if job.get("status") in _ACTIVE_STATES), None)
+            if active is not None:
+                return _range_snapshot(active)
+            if prior and prior[0].get("status") == "completed":
+                caches = [self._find_range_cache(item.get("cache_identity", ""))
+                          for item in prior[0].get("ranges", [])]
+                if all(caches):
+                    return _range_snapshot(prior[0])
+
+            job_id = str(uuid.uuid4())
+            ranges = []
+            for item in verified_ranges:
+                cache_identity = _range_cache_identity(item, str(batch_id), mode, config_fingerprint)
+                cached = self._find_range_cache(cache_identity)
+                ranges.append({
+                    "parent_document_id": item["parent_document_id"],
+                    "parent_sha256": item["parent_sha256"],
+                    "range_id": item["range_id"],
+                    "first_page": item["first_page"],
+                    "last_page": item["last_page"],
+                    "page_count": item["page_count"],
+                    "input_path": item["input_path"],
+                    "input_sha256": item["input_sha256"],
+                    "size_bytes": item["size_bytes"],
+                    "mode": mode,
+                    "config_fingerprint": config_fingerprint,
+                    "cache_identity": cache_identity,
+                    "status": cached.get("status", "completed") if cached else "waiting",
+                    "attempt_count": 0,
+                    "attempts": [],
+                    "result_count": cached["result_count"] if cached else 0,
+                    "cache_path": cached["cache_path"] if cached else "",
+                    "error": "",
+                    "created_at": timestamp,
+                    "started_at": None,
+                    "completed_at": timestamp if cached else None,
+                })
+            job = {
+                "job_id": job_id,
+                "job_type": "page_ranges",
+                "batch_id": str(batch_id),
+                "range_ids": selected_ids,
+                "mode": mode,
+                "config_fingerprint": config_fingerprint,
+                "config": config,
+                "status": "queued",
+                "created_at": timestamp,
+                "updated_at": timestamp,
+                "started_at": None,
+                "completed_at": None,
+                "pause_requested": False,
+                "quota_paused": False,
+                "quota_note": "",
+                "current_range_id": None,
+                "error": "",
+                "ranges": ranges,
+            }
+            _finish_range_job(job)
+            manifest["jobs"][job_id] = job
+            self._write_range_manifest(manifest)
+
+        if self.background and job["status"] == "queued":
+            self._launch_background_range_worker(job_id)
+        return self.range_snapshot(job_id) or _range_snapshot(job)
+
+    def run_range_pending(self, job_id: str) -> dict:
+        """Run waiting range entries through only the injected synthetic extractor."""
+        if self.extractor is None:
+            raise RuntimeError("Live range execution is disabled; an explicitly injected synthetic extractor is required.")
+        job = self.range_snapshot(job_id)
+        if job is None:
+            raise ValueError("Range job was not found.")
+        try:
+            self._assert_range_runtime_config(job)
+        except ValueError as exc:
+            self._mutate_range_job(job_id, lambda value: _mark_range_job_failed(value, str(exc)))
+            raise
+        with _file_lock(self.root / "locks" / f"range-job-{job_id}.lock", blocking=False):
+            with self._range_worker_lease(job_id) as acquired:
+                if not acquired:
+                    return self.range_snapshot(job_id) or job
+                self._mutate_range_job(job_id, _recover_interrupted_ranges)
+                self._mutate_range_job(job_id, _begin_range_job)
+                while True:
+                    current = self.range_snapshot(job_id)
+                    if current is None:
+                        raise RuntimeError("Range job disappeared while it was running.")
+                    if current.get("quota_paused"):
+                        break
+                    if current.get("pause_requested"):
+                        self._mutate_range_job(job_id, _mark_range_job_paused)
+                        break
+                    item = next((value for value in current["ranges"] if value["status"] == "waiting"), None)
+                    if item is None:
+                        break
+                    range_id = item["range_id"]
+                    attempt_started = _now()
+                    self._mutate_range_job(job_id, lambda value: _begin_range(value, range_id, attempt_started))
+                    try:
+                        verified = BatchStore(self.output_dir).validate_page_range(current["batch_id"], range_id)
+                        _assert_range_matches_job(item, verified)
+                        cached = self._find_range_cache(item["cache_identity"])
+                        if cached:
+                            outcome = cached["status"]
+                            cache_path, result_count = cached["cache_path"], cached["result_count"]
+                        else:
+                            context = {
+                                **verified,
+                                "batch_id": current["batch_id"],
+                                "job_id": job_id,
+                                "mode": current["mode"],
+                                "config_fingerprint": item["config_fingerprint"],
+                            }
+                            result = self.extractor(context, current["mode"], dict(self.config or {}))
+                            rows = _normalize_range_results(result)
+                            if _range_quota_result(rows):
+                                outcome, cache_path, result_count = "quota_paused", "", len(rows)
+                            elif _range_failure_result(rows):
+                                message = _range_failure_note(rows)
+                                self._mutate_range_job(job_id, lambda value: _fail_range(
+                                    value, range_id, "failed", message, attempt_started))
+                                continue
+                            else:
+                                result_count = len(rows)
+                                outcome = "no_recipe" if _range_no_recipe(rows) else "completed"
+                                cache_path = self._write_range_cache(item, current, rows, outcome)
+                        self._mutate_range_job(job_id, lambda value: _finish_range(
+                            value, range_id, outcome, cache_path, result_count, attempt_started))
+                    except Exception as exc:
+                        message = _redact(exc, self.config)
+                        outcome = "quota_paused" if _is_quota_error(message) else "failed"
+                        self._mutate_range_job(job_id, lambda value: _fail_range(
+                            value, range_id, outcome, message, attempt_started))
+                    latest = self.range_snapshot(job_id)
+                    if latest and latest.get("quota_paused"):
+                        break
+                self._mutate_range_job(job_id, _finish_range_job)
+        return self.range_snapshot(job_id) or {}
+
+    def pause_range_job(self, job_id: str) -> dict:
+        def pause(job: dict) -> None:
+            if job.get("status") in {"completed", "completed_with_errors", "failed"}:
+                return
+            job["pause_requested"] = True
+            processing = any(item.get("status") == "processing" for item in job.get("ranges", []))
+            job["status"] = "pausing" if processing else "paused"
+        self._mutate_range_job(job_id, pause)
+        return self.range_snapshot(job_id) or {}
+
+    def resume_range_job(self, job_id: str) -> dict:
+        job = self.range_snapshot(job_id)
+        if job is None:
+            raise ValueError("Range job was not found.")
+        if (job.get("status") == "completed"
+                and all(self._find_range_cache(item.get("cache_identity", ""))
+                        for item in job.get("ranges", []))):
+            return job
+        if self.extractor is None:
+            raise RuntimeError("Live range execution is disabled; an explicitly injected synthetic extractor is required.")
+        self._assert_range_runtime_config(job)
+        try:
+            with _file_lock(self.root / "locks" / f"range-job-{job_id}.lock", blocking=False):
+                self._mutate_range_job(job_id, _recover_interrupted_ranges)
+                self._mutate_range_job(job_id, self._prepare_range_resume)
+        except _LockBusy:
+            return self.range_snapshot(job_id) or job
+        current = self.range_snapshot(job_id) or job
+        if self.background and current.get("status") == "queued":
+            self._launch_background_range_worker(job_id)
+        return self.range_snapshot(job_id) or current
+
+    def range_snapshot(self, job_id: str) -> dict | None:
+        with _file_lock(self.range_manifest_lock):
+            job = self._read_range_manifest()["jobs"].get(str(job_id))
+            return _range_snapshot(job) if job is not None else None
+
+    def list_range_jobs(self) -> list[dict]:
+        with _file_lock(self.range_manifest_lock):
+            jobs = list(self._read_range_manifest()["jobs"].values())
+        return sorted((_range_snapshot(item) for item in jobs),
+                      key=lambda item: (item.get("created_at", ""), item["job_id"]), reverse=True)
+
+    def _prepare_range_resume(self, job: dict) -> None:
+        for item in job.get("ranges", []):
+            if item.get("status") in {"failed", "quota_paused"}:
+                item["status"] = "waiting"
+                item["error"] = ""
+            elif item.get("status") in {"completed", "no_recipe"}:
+                cached = self._find_range_cache(item.get("cache_identity", ""))
+                if not cached:
+                    item["status"] = "waiting"
+                    item["error"] = "The durable range result cache is missing or corrupt; this explicit resume will retry the range."
+                else:
+                    item["cache_path"] = cached["cache_path"]
+        job["pause_requested"] = False
+        job["quota_paused"] = False
+        job["quota_note"] = ""
+        job["completed_at"] = None
+        _finish_range_job(job)
+
+    def _assert_range_runtime_config(self, job: dict) -> None:
+        config = _range_config_snapshot(self.config or {}, self.extractor)
+        canonical = json.dumps(config, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        fingerprint = sha256(canonical.encode("utf-8")).hexdigest()
+        if fingerprint != job.get("config_fingerprint"):
+            raise ValueError("Range job configuration fingerprint does not match the persisted job.")
+
+    def _read_range_manifest(self) -> dict:
+        if not self.range_manifest_path.exists():
+            return {"schema_version": 1, "jobs": {}}
+        try:
+            data = json.loads(self.range_manifest_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise RuntimeError("Range job history is unavailable; existing range data was preserved.") from exc
+        if not isinstance(data, dict) or not isinstance(data.get("jobs"), dict):
+            raise RuntimeError("Range job history has an unsupported shape.")
+        return data
+
+    def _write_range_manifest(self, data: dict) -> None:
+        _atomic_json(self.range_manifest_path, data)
+
+    def _mutate_range_job(self, job_id: str, operation: Callable[[dict], None]) -> dict:
+        with _file_lock(self.range_manifest_lock):
+            manifest = self._read_range_manifest()
+            job = manifest["jobs"].get(str(job_id))
+            if job is None:
+                raise ValueError("Range job was not found.")
+            operation(job)
+            job["updated_at"] = _now()
+            self._write_range_manifest(manifest)
+            return _range_snapshot(job)
+
+    def _find_range_cache(self, cache_identity: str) -> dict | None:
+        cache_dir = self._range_cache_dir(create=False)
+        if cache_dir is None:
+            return None
+        for path in sorted(cache_dir.glob(f"{cache_identity}--*.json")):
+            if path.is_symlink() or not path.is_file():
+                continue
+            try:
+                record = json.loads(path.read_text(encoding="utf-8"))
+                payload = {key: value for key, value in record.items() if key != "record_sha256"}
+                canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+                if (record.get("cache_identity") == cache_identity
+                        and record.get("record_sha256") == sha256(canonical.encode("utf-8")).hexdigest()
+                        and isinstance(record.get("results"), list)):
+                    status = record.get("status")
+                    if status not in {"completed", "no_recipe"}:
+                        continue
+                    return {"cache_path": str(path), "result_count": len(record["results"]), "status": status}
+            except (OSError, json.JSONDecodeError, AttributeError, TypeError):
+                continue
+        return None
+
+    def _write_range_cache(self, item: dict, job: dict, results: list[dict], outcome: str) -> str:
+        cache_dir = self._range_cache_dir(create=True)
+        path = cache_dir / f"{item['cache_identity']}--{uuid.uuid4().hex}.json"
+        payload = {
+            "schema_version": 1,
+            "kind": "synthetic_range_result",
+            "cache_identity": item["cache_identity"],
+            "batch_id": job["batch_id"],
+            "parent_document_id": item["parent_document_id"],
+            "parent_sha256": item["parent_sha256"],
+            "range_id": item["range_id"],
+            "first_page": item["first_page"],
+            "last_page": item["last_page"],
+            "input_sha256": item["input_sha256"],
+            "mode": job["mode"],
+            "config_fingerprint": item["config_fingerprint"],
+            "status": outcome,
+            "results": results,
+            "created_at": _now(),
+        }
+        canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        payload["record_sha256"] = sha256(canonical.encode("utf-8")).hexdigest()
+        _atomic_json(path, payload)
+        return str(path)
+
+    def _range_cache_dir(self, *, create: bool) -> Path | None:
+        cache_dir = self.root / "range_cache"
+        if create:
+            cache_dir.mkdir(parents=True, exist_ok=True)
+        if cache_dir.is_symlink() or not cache_dir.exists():
+            if cache_dir.exists() or cache_dir.is_symlink():
+                raise ValueError("Range cache storage path is unsafe.")
+            return None
+        try:
+            resolved = cache_dir.resolve(strict=True)
+            resolved.relative_to(self.output_dir)
+        except (OSError, ValueError) as exc:
+            raise ValueError("Range cache storage path is unsafe.") from exc
+        if resolved != Path(os.path.abspath(cache_dir)):
+            raise ValueError("Range cache storage path is redirected or unsafe.")
+        return cache_dir
+
+    @contextmanager
+    def _range_worker_lease(self, job_id: str):
+        while True:
+            current = self.range_snapshot(job_id)
+            if current is None or current.get("pause_requested"):
+                yield False
+                return
+            lease = _file_lock(self.global_worker_lock, blocking=False)
+            try:
+                lease.__enter__()
+                break
+            except _LockBusy:
+                self._mutate_range_job(job_id, _mark_range_waiting_for_worker)
+                time.sleep(0.1)
+        try:
+            yield True
+        finally:
+            lease.__exit__(None, None, None)
+
+    def _launch_background_range_worker(self, job_id: str) -> None:
+        key = f"range:{job_id}"
+        with _BACKGROUND_LOCK:
+            existing = _BACKGROUND_THREADS.get(key)
+            if existing is not None and existing.is_alive():
+                return
+            def run() -> None:
+                try:
+                    self.run_range_pending(job_id)
+                except _LockBusy:
+                    pass
+                except Exception as exc:
+                    try:
+                        self._mutate_range_job(job_id, lambda value: _mark_range_job_failed(
+                            value, _redact(exc, self.config)))
+                    except Exception:
+                        pass
+                finally:
+                    with _BACKGROUND_LOCK:
+                        if _BACKGROUND_THREADS.get(key) is threading.current_thread():
+                            _BACKGROUND_THREADS.pop(key, None)
+            thread = threading.Thread(target=run, name=f"recipe-range-fixture-{job_id[:8]}", daemon=True)
+            _BACKGROUND_THREADS[key] = thread
+            thread.start()
 
     def pause(self, job_id: str) -> dict:
         def pause_job(job: dict) -> None:
@@ -643,6 +1018,274 @@ def _is_quota_result(row: dict) -> bool:
 def _quota_note(rows: list[dict]) -> str:
     return next((str(row.get("note") or row.get("failure_reason") or "")[:500]
                  for row in rows if _is_quota_result(row)), "Request allowance reached; resume when quota is available.")
+
+
+def _range_config_snapshot(config: Mapping[str, Any], extractor: Callable) -> dict:
+    safe = {}
+    for key, value in config.items():
+        name = str(key)
+        if any(part in name.casefold() for part in ("key", "token", "secret", "password", "credential")):
+            continue
+        try:
+            clean_value = _range_json_value(value)
+            json.dumps(clean_value, ensure_ascii=False, sort_keys=True)
+        except (TypeError, ValueError):
+            continue
+        safe[name] = clean_value
+    safe.setdefault("extractor_version", str(getattr(extractor, "__range_extractor_version__", "")))
+    safe["extractor"] = f"{getattr(extractor, '__module__', '')}.{getattr(extractor, '__qualname__', type(extractor).__qualname__)}"
+    code = getattr(extractor, "__code__", None)
+    if code is None:
+        call = getattr(type(extractor), "__call__", None)
+        code = getattr(call, "__code__", None)
+    if code is not None:
+        safe["extractor_implementation_sha256"] = sha256(marshal.dumps(_normalized_code(code))).hexdigest()
+    return safe
+
+
+def _normalized_code(code: CodeType) -> CodeType:
+    constants = tuple(_normalized_code(value) if isinstance(value, CodeType)
+                      else tuple(_normalized_code(child) if isinstance(child, CodeType) else child
+                                 for child in value) if isinstance(value, tuple) else value
+                      for value in code.co_consts)
+    return code.replace(co_consts=constants, co_filename="", co_firstlineno=1,
+                        co_linetable=b"", co_exceptiontable=b"")
+
+
+def _range_cache_identity(item: dict, batch_id: str, mode: str, config_fingerprint: str) -> str:
+    identity = {
+        "schema_version": 1,
+        "batch_id": batch_id,
+        "parent_sha256": item["parent_sha256"],
+        "range_id": item["range_id"],
+        "first_page": item["first_page"],
+        "last_page": item["last_page"],
+        "input_sha256": item["input_sha256"],
+        "mode": mode,
+        "config_fingerprint": config_fingerprint,
+    }
+    canonical = json.dumps(identity, sort_keys=True, separators=(",", ":"))
+    return sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _assert_range_matches_job(item: dict, verified: dict) -> None:
+    fields = {
+        "parent_document_id": "parent_document_id",
+        "parent_sha256": "parent_sha256",
+        "range_id": "range_id",
+        "first_page": "first_page",
+        "last_page": "last_page",
+        "page_count": "page_count",
+        "input_path": "input_path",
+        "input_sha256": "input_sha256",
+        "size_bytes": "size_bytes",
+    }
+    if any(item.get(key) != verified.get(value) for key, value in fields.items()):
+        raise ValueError("The verified range input no longer matches the durable job identity.")
+
+
+def _normalize_range_results(result: Any) -> list[dict]:
+    if isinstance(result, Mapping):
+        values = result.get("results", result.get("recipes"))
+        if values is None:
+            values = [result]
+    else:
+        values = getattr(result, "recipes", None)
+        if values is None and hasattr(result, "model_dump"):
+            dumped = result.model_dump(mode="json")
+            values = dumped.get("results", dumped.get("recipes")) if isinstance(dumped, Mapping) else None
+        if values is None:
+            values = result
+    if values is None:
+        raise TypeError("Synthetic range extractor must return one or more result mappings.")
+    if not isinstance(values, (list, tuple)):
+        values = [values]
+    rows = []
+    for value in values:
+        if hasattr(value, "model_dump"):
+            value = value.model_dump(mode="json")
+        if not isinstance(value, Mapping):
+            raise TypeError("Synthetic range results must be mappings or JSON model objects.")
+        row = _range_json_value(dict(value))
+        if not isinstance(row, dict):
+            raise TypeError("Synthetic range results must be JSON objects.")
+        for key in ("candidate_id", "candidate_ids", "source_path", "source_hash"):
+            row.pop(key, None)
+        rows.append(row)
+    return rows
+
+
+def _range_json_value(value: Any) -> Any:
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, Mapping):
+        return {str(key): _range_json_value(item) for key, item in value.items()
+                if not any(part in str(key).casefold() for part in ("key", "token", "secret", "password", "credential"))}
+    if isinstance(value, (list, tuple)):
+        return [_range_json_value(item) for item in value]
+    raise TypeError("Synthetic range results must contain JSON-compatible values.")
+
+
+def _range_quota_result(rows: list[dict]) -> bool:
+    return any(_is_quota_result(row) for row in rows)
+
+
+def _range_failure_result(rows: list[dict]) -> bool:
+    return any(str(row.get("status", "")).upper() in _FAILED_RESULT_STATES for row in rows)
+
+
+def _range_failure_note(rows: list[dict]) -> str:
+    return next((str(row.get("note") or row.get("failure_reason") or "Range extraction failed.")[:500]
+                 for row in rows if str(row.get("status", "")).upper() in _FAILED_RESULT_STATES),
+                "Range extraction failed.")
+
+
+def _is_quota_error(message: str) -> bool:
+    text = str(message).casefold()
+    return "quota" in text or "resource_exhausted" in text or "429" in text
+
+
+def _range_no_recipe(rows: list[dict]) -> bool:
+    return not rows or all(str(row.get("status", "")).upper() in _NO_RECIPE_STATES for row in rows)
+
+
+def _range_snapshot(job: dict) -> dict:
+    value = json.loads(json.dumps(job))
+    terminal = {"completed", "no_recipe", "failed", "quota_paused"}
+    completed = sum(1 for item in value.get("ranges", []) if item.get("status") in terminal)
+    value["progress"] = {
+        "total": len(value.get("ranges", [])),
+        "completed": completed,
+        "remaining": max(0, len(value.get("ranges", [])) - completed),
+    }
+    value["ranges"] = sorted(value.get("ranges", []), key=lambda item: (
+        item.get("parent_document_id", ""), item.get("first_page", 0), item.get("last_page", 0),
+    ))
+    value["result_count"] = sum(int(item.get("result_count", 0)) for item in value["ranges"])
+    value["failure_count"] = sum(item.get("status") == "failed" for item in value["ranges"])
+    return value
+
+
+def _find_range(job: dict, range_id: str) -> dict:
+    item = next((value for value in job.get("ranges", []) if value.get("range_id") == range_id), None)
+    if item is None:
+        raise ValueError("Page range was not found in this job.")
+    return item
+
+
+def _begin_range_job(job: dict) -> None:
+    if job.get("status") in {"completed", "completed_with_errors", "failed", "paused", "quota_paused"}:
+        return
+    job["status"] = "running"
+    job["started_at"] = job.get("started_at") or _now()
+    job["error"] = ""
+
+
+def _mark_range_waiting_for_worker(job: dict) -> None:
+    if job.get("status") == "queued" and not job.get("pause_requested"):
+        job["status"] = "waiting_for_worker"
+
+
+def _recover_interrupted_ranges(job: dict) -> None:
+    for item in job.get("ranges", []):
+        if item.get("status") != "processing":
+            continue
+        item["status"] = "waiting"
+        item["error"] = "Previous range worker stopped before this range completed."
+        attempts = item.get("attempts", [])
+        if attempts and attempts[-1].get("status") == "processing":
+            attempts[-1].update({"status": "interrupted", "completed_at": _now(), "error": item["error"]})
+    job["current_range_id"] = None
+    if job.get("status") in {"running", "pausing", "waiting_for_worker"}:
+        job["status"] = "paused" if job.get("pause_requested") else "queued"
+
+
+def _begin_range(job: dict, range_id: str, started_at: str) -> None:
+    item = _find_range(job, range_id)
+    item["status"] = "processing"
+    item["error"] = ""
+    item["attempt_count"] = int(item.get("attempt_count", 0)) + 1
+    item["result_count"] = 0
+    item["completed_at"] = None
+    item.setdefault("attempts", []).append({
+        "attempt": item["attempt_count"], "started_at": started_at, "status": "processing",
+    })
+    item["started_at"] = started_at
+    job["current_range_id"] = range_id
+    job["status"] = "running"
+
+
+def _finish_range(job: dict, range_id: str, outcome: str, cache_path: str,
+                  result_count: int, started_at: str) -> None:
+    item = _find_range(job, range_id)
+    item["status"] = outcome
+    item["result_count"] = result_count
+    if cache_path:
+        item["cache_path"] = cache_path
+    item["error"] = ""
+    item["completed_at"] = _now()
+    item["attempts"][-1].update({
+        "status": outcome, "completed_at": item["completed_at"], "result_count": result_count,
+    })
+    job["current_range_id"] = None
+    if outcome == "quota_paused":
+        item["error"] = "Request allowance reached; resume when quota is available."
+        job["quota_paused"] = True
+        job["quota_note"] = item["error"]
+        job["status"] = "quota_paused"
+    elif job.get("pause_requested"):
+        job["status"] = "paused"
+
+
+def _fail_range(job: dict, range_id: str, outcome: str, error: str, started_at: str) -> None:
+    item = _find_range(job, range_id)
+    item["status"] = outcome
+    item["error"] = error[:500]
+    item["completed_at"] = _now()
+    if item.get("attempts"):
+        item["attempts"][-1].update({"status": outcome, "completed_at": item["completed_at"],
+                                    "error": item["error"]})
+    job["current_range_id"] = None
+    if outcome == "quota_paused":
+        job["quota_paused"] = True
+        job["quota_note"] = item["error"]
+        job["status"] = "quota_paused"
+    elif job.get("pause_requested"):
+        job["status"] = "paused"
+
+
+def _mark_range_job_paused(job: dict) -> None:
+    job["status"] = "paused"
+    job["pause_requested"] = True
+    job["current_range_id"] = None
+
+
+def _mark_range_job_failed(job: dict, error: str) -> None:
+    job["status"] = "failed"
+    job["error"] = error[:500]
+    job["completed_at"] = _now()
+
+
+def _finish_range_job(job: dict) -> None:
+    job["current_range_id"] = None
+    statuses = [item.get("status") for item in job.get("ranges", [])]
+    if job.get("quota_paused") or "quota_paused" in statuses:
+        job["status"] = "quota_paused"
+        job["quota_paused"] = True
+        job["completed_at"] = None
+    elif job.get("pause_requested"):
+        job["status"] = "paused"
+        job["completed_at"] = None
+    elif "waiting" in statuses or "processing" in statuses:
+        job["status"] = "queued"
+        job["completed_at"] = None
+    elif "failed" in statuses:
+        job["status"] = "completed_with_errors"
+        job["completed_at"] = _now()
+    else:
+        job["status"] = "completed"
+        job["completed_at"] = _now()
+    job["updated_at"] = _now()
 
 
 def _redact(error: Exception, config: Mapping[str, Any] | None) -> str:

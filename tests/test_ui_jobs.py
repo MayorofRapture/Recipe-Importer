@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import tempfile
 import threading
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import patch
 
@@ -34,9 +36,9 @@ def _batch(store: BatchStore, name: str, *contents: bytes) -> dict:
     return batch
 
 
-def _write_parent_pdf(path: Path) -> None:
+def _write_parent_pdf(path: Path, text: str = "Synthetic parent page") -> None:
     document = fitz.open()
-    document.new_page().insert_text((72, 72), "Synthetic parent page")
+    document.new_page().insert_text((72, 72), text)
     document.save(path)
     document.close()
 
@@ -46,6 +48,12 @@ def _recipe_rows(source: dict, mode: str, config: dict):
         "status": "EXTRACTED_ONLY", "title": f"Synthetic {source['original_filename']}",
         "candidate_id": f"candidate-{source['digest'][:8]}", "route_reason": mode,
     }]
+
+
+def _stable_fingerprint_extractor(context, mode, config):
+    def name():
+        return "stable"
+    return [{"name": name()}]
 
 
 class JobServiceTests(unittest.TestCase):
@@ -80,6 +88,351 @@ class JobServiceTests(unittest.TestCase):
         self.assertEqual([source["source_id"] for source in job["sources"]], [scan["source_id"]])
         self.assertNotIn(parent["document_id"], {source.get("document_id") for source in job["sources"]})
         self.assertNotIn(page_range["range_id"], {source.get("range_id") for source in job["sources"]})
+
+    def test_range_jobs_cache_synthetic_results_without_registering_candidates(self):
+        batch = self.store.create("Range synthetic boundary")
+        parent_path = Path(self.tmp.name) / "range-book.pdf"
+        _write_parent_pdf(parent_path)
+        parent = self.store.stage_parent_pdf(batch["batch_id"], parent_path)
+        page_range = self.store.create_page_range(batch["batch_id"], parent["document_id"], 1, 1)
+        calls = []
+
+        def extractor(context, mode, config):
+            calls.append((context["range_id"], mode))
+            self.assertTrue(Path(context["input_path"]).is_file())
+            return [{"name": "Synthetic soup", "ingredients": ["1 cup water"]},
+                    {"name": "Synthetic bread", "ingredients": ["2 cups flour"]}]
+
+        service = JobService(self.output, config={"extractor_version": "fixture-v1"}, extractor=extractor)
+        with patch("review_store.ReviewStore.register_candidates") as register:
+            job = service.start_range_job(batch["batch_id"], [page_range["range_id"]], "local_ocr")
+            completed = service.run_range_pending(job["job_id"])
+        register.assert_not_called()
+        repeated = JobService(self.output, config={"extractor_version": "fixture-v1"},
+                              extractor=extractor).start_range_job(
+                                  batch["batch_id"], [page_range["range_id"]], "local_ocr")
+
+        self.assertEqual(completed["status"], "completed")
+        self.assertEqual(completed["ranges"][0]["status"], "completed")
+        self.assertEqual(completed["ranges"][0]["result_count"], 2)
+        self.assertTrue(completed["ranges"][0]["cache_path"])
+        self.assertEqual(repeated["job_id"], job["job_id"])
+        self.assertEqual(len(calls), 1)
+        self.assertFalse((self.output / "review_events.jsonl").exists())
+        self.assertFalse((self.output / "import_state.jsonl").exists())
+        self.assertFalse((self.output / "extracted").exists())
+        self.assertFalse((self.output / "ui_jobs" / "jobs.json").exists())
+
+    def test_range_jobs_retry_only_failed_range_and_preserve_completed_cache(self):
+        batch = self.store.create("Range retry")
+        parent_path = Path(self.tmp.name) / "retry-book.pdf"
+        _write_parent_pdf(parent_path)
+        parent = self.store.stage_parent_pdf(batch["batch_id"], parent_path)
+        first = self.store.create_page_range(batch["batch_id"], parent["document_id"], 1, 1)
+        parent_path2 = Path(self.tmp.name) / "retry-book-2.pdf"
+        _write_parent_pdf(parent_path2, "Synthetic retry parent page")
+        parent2 = self.store.stage_parent_pdf(batch["batch_id"], parent_path2)
+        second = self.store.create_page_range(batch["batch_id"], parent2["document_id"], 1, 1)
+        calls = []
+        failed_once = {second["range_id"]}
+
+        def extractor(context, mode, config):
+            calls.append(context["range_id"])
+            if context["range_id"] in failed_once:
+                failed_once.remove(context["range_id"])
+                raise RuntimeError("synthetic transient failure")
+            return [{"name": f"Recipe {context['range_id'][:6]}", "steps": ["mix"]}]
+
+        service = JobService(self.output, config={"extractor_version": "fixture-v1"}, extractor=extractor)
+        job = service.start_range_job(batch["batch_id"], [first["range_id"], second["range_id"]], "local_ocr")
+        partial = service.run_range_pending(job["job_id"])
+        self.assertEqual(partial["status"], "completed_with_errors")
+        states = {item["range_id"]: item for item in partial["ranges"]}
+        self.assertEqual(states[first["range_id"]]["status"], "completed")
+        self.assertEqual(states[second["range_id"]]["status"], "failed")
+        first_cache = states[first["range_id"]]["cache_path"]
+
+        resumed = service.resume_range_job(job["job_id"])
+        complete = service.run_range_pending(job["job_id"])
+
+        self.assertEqual(resumed["status"], "queued")
+        self.assertEqual(complete["status"], "completed")
+        final_states = {item["range_id"]: item for item in complete["ranges"]}
+        self.assertEqual(final_states[first["range_id"]]["cache_path"], first_cache)
+        self.assertEqual(calls.count(first["range_id"]), 1)
+        self.assertEqual(calls.count(second["range_id"]), 2)
+
+    def test_range_jobs_fail_closed_without_injected_extractor_and_reject_corrupt_input(self):
+        batch = self.store.create("Range validation")
+        parent_path = Path(self.tmp.name) / "validation-book.pdf"
+        _write_parent_pdf(parent_path)
+        parent = self.store.stage_parent_pdf(batch["batch_id"], parent_path)
+        page_range = self.store.create_page_range(batch["batch_id"], parent["document_id"], 1, 1)
+        with self.assertRaisesRegex(RuntimeError, "synthetic extractor"):
+            JobService(self.output).start_range_job(batch["batch_id"], [page_range["range_id"]], "local_ocr")
+        input_path = Path(page_range["input_path"])
+        input_path.write_bytes(b"not a pdf")
+        with self.assertRaisesRegex(ValueError, "range input"):
+            JobService(self.output, extractor=_recipe_rows).start_range_job(
+                batch["batch_id"], [page_range["range_id"]], "local_ocr")
+
+    def test_changed_range_extraction_config_uses_distinct_job_and_cache(self):
+        batch = self.store.create("Range config identity")
+        parent_path = Path(self.tmp.name) / "config-book.pdf"
+        _write_parent_pdf(parent_path)
+        parent = self.store.stage_parent_pdf(batch["batch_id"], parent_path)
+        page_range = self.store.create_page_range(batch["batch_id"], parent["document_id"], 1, 1)
+        calls = []
+
+        def extractor(context, mode, config):
+            calls.append(config["extractor_version"])
+            return [{"name": "Synthetic versioned result"}]
+
+        first_service = JobService(self.output, config={"extractor_version": "one"}, extractor=extractor)
+        first = first_service.start_range_job(batch["batch_id"], [page_range["range_id"]], "local_ocr")
+        first_done = first_service.run_range_pending(first["job_id"])
+        second_service = JobService(self.output, config={"extractor_version": "two"}, extractor=extractor)
+        second = second_service.start_range_job(batch["batch_id"], [page_range["range_id"]], "local_ocr")
+        second_done = second_service.run_range_pending(second["job_id"])
+
+        self.assertNotEqual(first["job_id"], second["job_id"])
+        self.assertNotEqual(first_done["ranges"][0]["cache_path"], second_done["ranges"][0]["cache_path"])
+        self.assertEqual(calls, ["one", "two"])
+
+    def test_range_job_refuses_runtime_config_different_from_persisted_fingerprint(self):
+        batch = self.store.create("Range runtime config")
+        parent_path = Path(self.tmp.name) / "runtime-config-book.pdf"
+        _write_parent_pdf(parent_path)
+        parent = self.store.stage_parent_pdf(batch["batch_id"], parent_path)
+        page_range = self.store.create_page_range(batch["batch_id"], parent["document_id"], 1, 1)
+        calls = []
+
+        def extractor(context, mode, config):
+            calls.append(config.get("extractor_version"))
+            return [{"name": "Synthetic mismatched result"}]
+
+        created = JobService(self.output, config={"extractor_version": "config-a"}, extractor=extractor)
+        job = created.start_range_job(batch["batch_id"], [page_range["range_id"]], "local_ocr")
+        changed = JobService(self.output, config={"extractor_version": "config-b"}, extractor=extractor)
+
+        with self.assertRaisesRegex(ValueError, "fingerprint"):
+            changed.run_range_pending(job["job_id"])
+        self.assertEqual(calls, [])
+
+    def test_range_extractor_fingerprint_is_stable_across_processes(self):
+        import sys
+
+        local = ui_job_service._range_config_snapshot(
+            {}, _stable_fingerprint_extractor)["extractor_implementation_sha256"]
+        script = (
+            "from ui_job_service import _range_config_snapshot; "
+            "from tests.test_ui_jobs import _stable_fingerprint_extractor; "
+            "print(_range_config_snapshot({}, _stable_fingerprint_extractor)['extractor_implementation_sha256'])"
+        )
+        external = subprocess.check_output([sys.executable, "-c", script], text=True).strip().splitlines()[-1]
+
+        self.assertEqual(local, external)
+
+    def test_range_extraction_failure_rows_are_failed_and_never_cached(self):
+        batch = self.store.create("Range extraction failure")
+        parent_path = Path(self.tmp.name) / "failed-range-book.pdf"
+        _write_parent_pdf(parent_path)
+        parent = self.store.stage_parent_pdf(batch["batch_id"], parent_path)
+        page_range = self.store.create_page_range(batch["batch_id"], parent["document_id"], 1, 1)
+        service = JobService(self.output, extractor=lambda context, mode, config: [{
+            "status": "EXTRACTION_FAILED", "note": "Synthetic extraction failed.",
+        }])
+        job = service.start_range_job(batch["batch_id"], [page_range["range_id"]], "local_ocr")
+
+        done = service.run_range_pending(job["job_id"])
+
+        self.assertEqual(done["status"], "completed_with_errors")
+        self.assertEqual(done["ranges"][0]["status"], "failed")
+        self.assertEqual(done["ranges"][0]["cache_path"], "")
+
+    def test_concurrent_range_job_starts_share_one_durable_job(self):
+        batch = self.store.create("Range concurrent starts")
+        parent_path = Path(self.tmp.name) / "concurrent-book.pdf"
+        _write_parent_pdf(parent_path)
+        parent = self.store.stage_parent_pdf(batch["batch_id"], parent_path)
+        page_range = self.store.create_page_range(batch["batch_id"], parent["document_id"], 1, 1)
+
+        def start(_):
+            return JobService(self.output, config={"extractor_version": "fixture-v1"},
+                              extractor=_recipe_rows).start_range_job(
+                                  batch["batch_id"], [page_range["range_id"]], "local_ocr")["job_id"]
+
+        with ThreadPoolExecutor(max_workers=6) as executor:
+            job_ids = list(executor.map(start, range(6)))
+
+        self.assertEqual(len(set(job_ids)), 1)
+        self.assertEqual(len(JobService(self.output, extractor=_recipe_rows).list_range_jobs()), 1)
+
+    def test_range_resume_recovers_interrupted_attempt_without_repeating_completed_range(self):
+        batch = self.store.create("Range interrupted")
+        parent_path = Path(self.tmp.name) / "interrupted-book.pdf"
+        _write_parent_pdf(parent_path)
+        parent = self.store.stage_parent_pdf(batch["batch_id"], parent_path)
+        first = self.store.create_page_range(batch["batch_id"], parent["document_id"], 1, 1)
+        parent_path2 = Path(self.tmp.name) / "interrupted-book-2.pdf"
+        _write_parent_pdf(parent_path2, "Synthetic second parent page")
+        parent2 = self.store.stage_parent_pdf(batch["batch_id"], parent_path2)
+        second = self.store.create_page_range(batch["batch_id"], parent2["document_id"], 1, 1)
+        calls = []
+
+        def extractor(context, mode, config):
+            calls.append(context["range_id"])
+            if context["range_id"] == second["range_id"] and calls.count(second["range_id"]) == 1:
+                raise RuntimeError("synthetic interruption precursor")
+            return [{"name": "Synthetic recovered recipe"}]
+
+        service = JobService(self.output, extractor=extractor)
+        job = service.start_range_job(batch["batch_id"], [first["range_id"], second["range_id"]], "local_ocr")
+        partial = service.run_range_pending(job["job_id"])
+        self.assertEqual(partial["status"], "completed_with_errors")
+        with _file_lock(service.range_manifest_lock):
+            manifest = service._read_range_manifest()
+            target = manifest["jobs"][job["job_id"]]
+            interrupted = next(item for item in target["ranges"] if item["range_id"] == second["range_id"])
+            interrupted["status"] = "processing"
+            interrupted["attempts"].append({"attempt": 2, "status": "processing", "started_at": "synthetic"})
+            target["status"] = "running"
+            service._write_range_manifest(manifest)
+
+        resumed = service.resume_range_job(job["job_id"])
+        done = service.run_range_pending(job["job_id"])
+        states = {item["range_id"]: item for item in done["ranges"]}
+
+        resumed_states = {item["range_id"]: item for item in resumed["ranges"]}
+        self.assertEqual(resumed_states[second["range_id"]]["attempts"][-1]["status"], "interrupted")
+        self.assertEqual(states[second["range_id"]]["attempts"][-1]["status"], "completed")
+        self.assertEqual(calls.count(first["range_id"]), 1)
+        self.assertEqual(calls.count(second["range_id"]), 2)
+
+    def test_range_pause_and_quota_resume_preserve_completed_work(self):
+        batch = self.store.create("Range pause quota")
+        parent_path = Path(self.tmp.name) / "pause-book.pdf"
+        _write_parent_pdf(parent_path)
+        parent = self.store.stage_parent_pdf(batch["batch_id"], parent_path)
+        first = self.store.create_page_range(batch["batch_id"], parent["document_id"], 1, 1)
+        parent_path2 = Path(self.tmp.name) / "pause-book-2.pdf"
+        _write_parent_pdf(parent_path2, "Synthetic second pause page")
+        parent2 = self.store.stage_parent_pdf(batch["batch_id"], parent_path2)
+        second = self.store.create_page_range(batch["batch_id"], parent2["document_id"], 1, 1)
+        service = None
+        job = None
+        calls = []
+
+        def pausing_extractor(context, mode, config):
+            calls.append(context["range_id"])
+            if len(calls) == 1:
+                service.pause_range_job(job["job_id"])
+            return [{"name": "Synthetic paused result"}]
+
+        service = JobService(self.output, extractor=pausing_extractor)
+        job = service.start_range_job(batch["batch_id"], [first["range_id"], second["range_id"]], "local_ocr")
+        paused = service.run_range_pending(job["job_id"])
+        self.assertEqual(paused["status"], "paused")
+        resumed = service.resume_range_job(job["job_id"])
+        done = service.run_range_pending(job["job_id"])
+        self.assertEqual(resumed["status"], "queued")
+        self.assertEqual(done["status"], "completed")
+        self.assertEqual(calls.count(first["range_id"]), 1)
+        self.assertEqual(calls.count(second["range_id"]), 1)
+
+        quota_batch = self.store.create("Range quota")
+        quota_parent_path = Path(self.tmp.name) / "quota-book.pdf"
+        _write_parent_pdf(quota_parent_path, "Synthetic quota parent page")
+        quota_doc = fitz.open(quota_parent_path)
+        quota_doc.new_page().insert_text((72, 72), "Synthetic quota second page")
+        quota_two_page_path = Path(self.tmp.name) / "quota-book-two-pages.pdf"
+        quota_doc.save(quota_two_page_path)
+        quota_doc.close()
+        quota_parent = self.store.stage_parent_pdf(quota_batch["batch_id"], quota_two_page_path)
+        quota_range = self.store.create_page_range(quota_batch["batch_id"], quota_parent["document_id"], 1, 1)
+        quota_range_two = self.store.create_page_range(quota_batch["batch_id"], quota_parent["document_id"], 2, 2)
+        quota_calls = []
+
+        def quota_extractor(context, mode, config):
+            quota_calls.append(1)
+            if len(quota_calls) == 1:
+                return [{"status": "QUOTA_EXHAUSTED", "note": "Synthetic quota pause"}]
+            return [{"name": "Synthetic after quota"}]
+
+        quota_service = JobService(self.output, extractor=quota_extractor)
+        quota_job = quota_service.start_range_job(
+            quota_batch["batch_id"], [quota_range["range_id"], quota_range_two["range_id"]], "gemini")
+        quota_paused = quota_service.run_range_pending(quota_job["job_id"])
+        self.assertEqual(quota_paused["status"], "quota_paused")
+        still_paused = quota_service.run_range_pending(quota_job["job_id"])
+        self.assertEqual(still_paused["status"], "quota_paused")
+        self.assertEqual(len(quota_calls), 1)
+        quota_service.resume_range_job(quota_job["job_id"])
+        quota_done = quota_service.run_range_pending(quota_job["job_id"])
+        self.assertEqual(quota_done["status"], "completed")
+        self.assertEqual(len(quota_calls), 3)
+
+    def test_missing_or_corrupt_range_cache_reprocesses_only_after_new_start(self):
+        batch = self.store.create("Range cache integrity")
+        parent_path = Path(self.tmp.name) / "cache-book.pdf"
+        _write_parent_pdf(parent_path)
+        parent = self.store.stage_parent_pdf(batch["batch_id"], parent_path)
+        page_range = self.store.create_page_range(batch["batch_id"], parent["document_id"], 1, 1)
+        calls = []
+
+        def extractor(context, mode, config):
+            calls.append(1)
+            return [{"name": "Synthetic cache result", "candidate_id": "must-not-persist"}]
+
+        service = JobService(self.output, config={"api_key": "private-test-key"}, extractor=extractor)
+        first = service.start_range_job(batch["batch_id"], [page_range["range_id"]], "local_ocr")
+        completed = service.run_range_pending(first["job_id"])
+        cache_path = Path(completed["ranges"][0]["cache_path"])
+        record = json.loads(cache_path.read_text(encoding="utf-8"))
+        self.assertNotIn("candidate_id", record["results"][0])
+        self.assertNotIn("private-test-key", service.range_manifest_path.read_text(encoding="utf-8"))
+
+        cache_path.write_text("{broken", encoding="utf-8")
+        second = JobService(self.output, config={"api_key": "private-test-key"}, extractor=extractor).start_range_job(
+            batch["batch_id"], [page_range["range_id"]], "local_ocr")
+        self.assertNotEqual(first["job_id"], second["job_id"])
+        rerun = JobService(self.output, config={"api_key": "private-test-key"}, extractor=extractor).run_range_pending(
+            second["job_id"])
+        self.assertEqual(rerun["status"], "completed")
+        self.assertEqual(len(calls), 2)
+
+    def test_range_no_recipe_is_durable_and_cached_as_no_recipe(self):
+        batch = self.store.create("Range no recipe")
+        parent_path = Path(self.tmp.name) / "no-recipe-book.pdf"
+        _write_parent_pdf(parent_path, "Synthetic first page")
+        doc = fitz.open(parent_path)
+        doc.new_page().insert_text((72, 72), "Synthetic second page")
+        replacement = Path(self.tmp.name) / "no-recipe-book-two-pages.pdf"
+        doc.save(replacement)
+        doc.close()
+        parent_path = replacement
+        parent = self.store.stage_parent_pdf(batch["batch_id"], parent_path)
+        page_range = self.store.create_page_range(batch["batch_id"], parent["document_id"], 1, 1)
+        recipe_range = self.store.create_page_range(batch["batch_id"], parent["document_id"], 2, 2)
+        calls = []
+
+        def extractor(context, mode, config):
+            calls.append(context["range_id"])
+            if context["range_id"] == page_range["range_id"]:
+                return [{"status": "NO_RECIPE", "note": "No recipe in synthetic range."}]
+            return [{"name": "Synthetic recipe on second page"}]
+
+        service = JobService(self.output, extractor=extractor)
+        job = service.start_range_job(batch["batch_id"],
+                                      [page_range["range_id"], recipe_range["range_id"]], "local_ocr")
+        queued_subset = JobService(self.output, extractor=extractor).start_range_job(
+            batch["batch_id"], [page_range["range_id"]], "local_ocr")
+        done = service.run_range_pending(job["job_id"])
+        cached = JobService(self.output, extractor=extractor).run_range_pending(queued_subset["job_id"])
+
+        self.assertEqual({item["range_id"]: item["status"] for item in done["ranges"]}[page_range["range_id"]], "no_recipe")
+        self.assertEqual(cached["ranges"][0]["status"], "no_recipe")
+        self.assertEqual(calls.count(page_range["range_id"]), 1)
 
     def test_start_is_durable_and_second_tab_returns_same_nonterminal_job(self):
         batch = _batch(self.store, "Weekend", _png())

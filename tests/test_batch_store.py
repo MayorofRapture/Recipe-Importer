@@ -611,6 +611,70 @@ class BatchStoreTests(unittest.TestCase):
         self.assertIn("page", result["reason"].casefold())
         self.assertEqual(store.get(batch["batch_id"]).get("parent_documents", []), [])
 
+    def test_validate_page_range_returns_verified_canonical_context_and_rejects_corruption(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            output = root / "output"
+            store = BatchStore(output)
+            batch = store.create("Validate range")
+            parent_path = root / "source.pdf"
+            _write_pdf(parent_path)
+            parent = store.stage_parent_pdf(batch["batch_id"], parent_path)
+            page_range = store.create_page_range(batch["batch_id"], parent["document_id"], 1, 1)
+
+            verified = store.validate_page_range(batch["batch_id"], page_range["range_id"])
+            self.assertEqual(verified["input_sha256"], page_range["input_sha256"])
+            self.assertEqual(Path(verified["input_path"]), Path(page_range["input_path"]))
+            self.assertEqual(verified["parent_sha256"], parent["sha256"])
+
+            Path(page_range["input_path"]).write_bytes(b"broken")
+            with self.assertRaisesRegex(ValueError, "range input"):
+                store.validate_page_range(batch["batch_id"], page_range["range_id"])
+
+    def test_validate_page_range_rejects_receipt_identity_conflict(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            store = BatchStore(root / "output")
+            batch = store.create("Receipt conflict")
+            parent_path = root / "source.pdf"
+            _write_pdf(parent_path)
+            parent = store.stage_parent_pdf(batch["batch_id"], parent_path)
+            page_range = store.create_page_range(batch["batch_id"], parent["document_id"], 1, 1)
+            receipt = Path(page_range["input_path"]).with_suffix(".json")
+            record = json.loads(receipt.read_text(encoding="utf-8"))
+            record["record"]["first_page"] = 2
+            receipt.write_text(json.dumps(record), encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "range input"):
+                store.validate_page_range(batch["batch_id"], page_range["range_id"])
+
+    def test_validate_page_range_rejects_redirected_ranges_directory_within_store(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            store = BatchStore(root / "output")
+            batch = store.create("In-store redirect")
+            parent_path = root / "source.pdf"
+            _write_pdf(parent_path)
+            parent = store.stage_parent_pdf(batch["batch_id"], parent_path)
+            page_range = store.create_page_range(batch["batch_id"], parent["document_id"], 1, 1)
+            range_path = Path(page_range["input_path"])
+            redirected = range_path.parent.parent / "alternate_ranges"
+            redirected.mkdir()
+            redirected_input = redirected / range_path.name
+            redirected_input.write_bytes(range_path.read_bytes())
+            resolve = Path.resolve
+
+            def redirected_resolve(path, strict=False):
+                try:
+                    relative = path.relative_to(range_path.parent)
+                except ValueError:
+                    return resolve(path, strict=strict)
+                return resolve(redirected / relative, strict=strict)
+
+            with patch.object(Path, "resolve", redirected_resolve):
+                with self.assertRaisesRegex(ValueError, "range input"):
+                    store.validate_page_range(batch["batch_id"], page_range["range_id"])
+
     def test_parent_pdf_rejects_insufficient_space_before_copying(self):
         temporary_directory = tempfile.TemporaryDirectory()
         self.addCleanup(temporary_directory.cleanup)
