@@ -130,6 +130,29 @@ class JobServiceTests(unittest.TestCase):
         self.assertFalse((self.output / "extracted").exists())
         self.assertFalse((self.output / "ui_jobs" / "jobs.json").exists())
 
+    def test_cloud_range_consent_is_required_and_survives_reload(self):
+        batch = self.store.create("Cloud consent range")
+        parent_path = Path(self.tmp.name) / "consent-book.pdf"
+        _write_parent_pdf(parent_path)
+        parent = self.store.stage_parent_pdf(batch["batch_id"], parent_path)
+        page_range = self.store.create_page_range(batch["batch_id"], parent["document_id"], 1, 1)
+        service = JobService(self.output, config={"extractor_version": "fixture-v1"},
+                             extractor=_recipe_rows)
+        with self.assertRaisesRegex(ValueError, "explicit consent"):
+            service.start_range_job(batch["batch_id"], [page_range["range_id"]], "gemini")
+        job = service.start_range_job(batch["batch_id"], [page_range["range_id"]], "gemini",
+                                      cloud_consent=True)
+        self.assertIs(job["cloud_consent"], True)
+        self.assertTrue(job["cloud_consent_at"])
+        restarted = JobService(self.output, config={"extractor_version": "fixture-v1"},
+                               extractor=_recipe_rows)
+        persisted = restarted.range_snapshot(job["job_id"])
+        self.assertIs(persisted["cloud_consent"], True)
+        self.assertEqual(persisted["cloud_consent_at"], job["cloud_consent_at"])
+        restarted._mutate_range_job(job["job_id"], lambda value: value.update(cloud_consent=False))
+        with self.assertRaisesRegex(ValueError, "consent"):
+            restarted.run_range_pending(job["job_id"])
+
     def test_range_jobs_retry_only_failed_range_and_preserve_completed_cache(self):
         batch = self.store.create("Range retry")
         parent_path = Path(self.tmp.name) / "retry-book.pdf"
@@ -455,7 +478,8 @@ class JobServiceTests(unittest.TestCase):
 
         quota_service = JobService(self.output, extractor=quota_extractor)
         quota_job = quota_service.start_range_job(
-            quota_batch["batch_id"], [quota_range["range_id"], quota_range_two["range_id"]], "gemini")
+            quota_batch["batch_id"], [quota_range["range_id"], quota_range_two["range_id"]], "gemini",
+            cloud_consent=True)
         quota_paused = quota_service.run_range_pending(quota_job["job_id"])
         self.assertEqual(quota_paused["status"], "quota_paused")
         still_paused = quota_service.run_range_pending(quota_job["job_id"])

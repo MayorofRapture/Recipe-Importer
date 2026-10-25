@@ -332,19 +332,25 @@ def _empty_response_reason(diagnostics: dict) -> str:
     return "OTHER"
 
 
-def extract(path: Path, api_key: str, model: str, gate: RateGate | None = None) -> ExtractionBatch:
+def extract(path: Path, api_key: str, model: str, gate: RateGate | None = None,
+            before_request=None) -> ExtractionBatch:
     client = google_client(api_key)
     upload = None
     try:
         if path.stat().st_size <= INLINE_MAX_BYTES:
             source = types.Part.from_bytes(data=path.read_bytes(), mime_type=file_mime(path))
         else:
+            if before_request is not None:
+                before_request(model, 0)
             upload = client.files.upload(file=str(path), config=types.UploadFileConfig(mime_type=file_mime(path)))
             source = upload
         for attempt in range(5):
             try:
                 if gate is not None:
                     gate.wait_turn()
+                if before_request is not None:
+                    estimated_tokens = max(1, (len(PROMPT) + path.stat().st_size + 3) // 4)
+                    before_request(model, estimated_tokens)
                 response = client.models.generate_content(
                     model=model, contents=[PROMPT, source],
                     config=types.GenerateContentConfig(response_mime_type="application/json",
@@ -360,6 +366,9 @@ def extract(path: Path, api_key: str, model: str, gate: RateGate | None = None) 
                 return ExtractionBatch.model_validate_json(response.text)
             except Exception as exc:
                 text = str(exc).lower()
+                if before_request is not None and any(
+                        term in text for term in ("429", "resource_exhausted", "quota", "rate limit")):
+                    raise
                 transient = any(term in text for term in ("429", "resource_exhausted", "rate limit", "503", "502", "504", "unavailable", "deadline exceeded", "timeout"))
                 if not transient or attempt == 4:
                     raise
@@ -368,19 +377,24 @@ def extract(path: Path, api_key: str, model: str, gate: RateGate | None = None) 
     finally:
         if upload is not None and getattr(upload, "name", None):
             try:
+                if before_request is not None:
+                    before_request(model, 0)
                 client.files.delete(name=upload.name)
             except Exception:
                 pass
 
 
 def structure_ocr_text(text: str, api_key: str, model: str,
-                       gate: RateGate | None = None) -> OcrLineReferences:
+                       gate: RateGate | None = None, before_request=None) -> OcrLineReferences:
     """Ask Gemini for source line locations only; assemble recipe text locally."""
     client = google_client(api_key)
     for attempt in range(5):
         try:
             if gate is not None:
                 gate.wait_turn()
+            if before_request is not None:
+                request_text = OCR_STRUCTURE_PROMPT + numbered_lines(text)
+                before_request(model, max(1, (len(request_text) + 3) // 4))
             response = client.models.generate_content(
                 model=model,
                 contents=[OCR_STRUCTURE_PROMPT, numbered_lines(text)],
@@ -399,6 +413,9 @@ def structure_ocr_text(text: str, api_key: str, model: str,
             return OcrLineReferences.model_validate_json(response.text)
         except Exception as exc:
             text_lower = str(exc).lower()
+            if before_request is not None and any(
+                    term in text_lower for term in ("429", "resource_exhausted", "quota", "rate limit")):
+                raise
             transient = any(term in text_lower for term in (
                 "429", "resource_exhausted", "rate limit", "503", "502", "504",
                 "unavailable", "deadline exceeded", "timeout",

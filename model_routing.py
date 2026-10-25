@@ -213,7 +213,7 @@ class ModelRouter:
     def run(self, attempt: Callable[[ModelConfig], Any],
             quality_check: Callable[[Any], bool] | None = None,
             *, retry_transient: bool = True, stop_on_transient: bool = False,
-            request_tokens: int = 0) -> RouteResult:
+            request_tokens: int = 0, reserve_requests: bool = True) -> RouteResult:
         remaining = list(self.models)
         route_reason = "primary"
         total_attempts = 0
@@ -225,7 +225,8 @@ class ModelRouter:
             try:
                 value = self._run_model(model, attempt, retry_transient=retry_transient,
                                         stop_on_transient=stop_on_transient,
-                                        request_tokens=request_tokens)
+                                        request_tokens=request_tokens,
+                                        reserve_requests=reserve_requests)
                 total_attempts += 1
                 if quality_check is not None and quality_check(value):
                     quality = next((item for item in remaining if item.role == "quality_escalation"), None)
@@ -265,12 +266,13 @@ class ModelRouter:
 
     def _run_model(self, model: ModelConfig, attempt: Callable[[ModelConfig], Any], *,
                    retry_transient: bool = True, stop_on_transient: bool = False,
-                   request_tokens: int = 0) -> Any:
+                   request_tokens: int = 0, reserve_requests: bool = True) -> Any:
         tries = 0
         while True:
-            self.ledger.reserve_scheduled(model.id, model.rpd, model_rpm=model.rpm,
-                                          global_rpm=self.global_rpm, tpm=model.tpm,
-                                          tokens=request_tokens, sleep=self.sleep)
+            if reserve_requests:
+                self.ledger.reserve_scheduled(model.id, model.rpd, model_rpm=model.rpm,
+                                              global_rpm=self.global_rpm, tpm=model.tpm,
+                                              tokens=request_tokens, sleep=self.sleep)
             try:
                 return attempt(model)
             except Exception as exc:
@@ -305,7 +307,8 @@ def _safe_error(exc: Exception) -> str:
 
 def _is_quota_error(exc: Exception) -> bool:
     text = str(exc).lower()
-    return any(term in text for term in ("429", "quota", "resource_exhausted", "rate limit"))
+    return any(term in text for term in ("429", "quota", "resource_exhausted", "rate limit",
+                                         "daily request limit", "tpm allowance"))
 
 
 def _is_transient_error(exc: Exception) -> bool:

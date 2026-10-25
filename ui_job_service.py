@@ -144,13 +144,20 @@ class JobService:
                 self._mutate_job(job_id, lambda value: _mark_job_failed(value, _redact(exc, self.config)))
         return self.snapshot(job_id) or _snapshot(job)
 
-    def start_range_job(self, batch_id: str, range_ids: list[str], mode: str) -> dict:
-        """Persist a synthetic-only job for verified staged page ranges."""
+    def start_range_job(self, batch_id: str, range_ids: list[str], mode: str,
+                        cloud_consent: bool = False) -> dict:
+        """Persist an explicitly synthetic or production job for verified ranges."""
         mode = str(mode or "").strip().lower()
         if mode not in _VALID_MODES:
             raise ValueError("Unsupported extraction mode.")
-        if self.extractor is None:
-            raise RuntimeError("Range execution requires an explicitly injected synthetic extractor.")
+        if mode in _CLOUD_MODES and not cloud_consent:
+            raise ValueError("Cloud range extraction requires explicit consent.")
+        if _fixture_mode() and self.extractor is None:
+            raise RuntimeError("Fixture mode requires an explicitly injected synthetic extractor.")
+        production = self.extractor is None
+        if production:
+            self.config = self._production_config(mode)
+        extractor = self.extractor or _production_range_marker
         if not isinstance(range_ids, list) or not range_ids or any(not isinstance(item, str) or not item for item in range_ids):
             raise ValueError("Select one or more page ranges.")
         if len(set(range_ids)) != len(range_ids):
@@ -159,7 +166,7 @@ class JobService:
         store = BatchStore(self.output_dir)
         verified_ranges = [store.validate_page_range(batch_id, range_id) for range_id in range_ids]
         verified_ranges.sort(key=lambda item: (item["parent_document_id"], item["first_page"], item["last_page"]))
-        config = _range_config_snapshot(self.config or {}, self.extractor, self._unversioned_range_scope)
+        config = _range_config_snapshot(self.config or {}, extractor, None if production else self._unversioned_range_scope)
         config_json = json.dumps(config, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         config_fingerprint = sha256(config_json.encode("utf-8")).hexdigest()
         versioned = _range_extractor_is_versioned(config)
@@ -191,6 +198,7 @@ class JobService:
                 cache_identity = _range_cache_identity(item, str(batch_id), mode, config_fingerprint)
                 cache_context = _range_cache_context(
                     item, str(batch_id), mode, config_fingerprint, versioned, job_id)
+                cache_context["execution_kind"] = "production" if production else "synthetic"
                 cached = self._find_range_cache(cache_identity, cache_context)
                 ranges.append({
                     "parent_document_id": item["parent_document_id"],
@@ -221,6 +229,9 @@ class JobService:
                 "batch_id": str(batch_id),
                 "range_ids": selected_ids,
                 "mode": mode,
+                "execution_kind": "production" if production else "synthetic",
+                "cloud_consent": bool(cloud_consent and mode in _CLOUD_MODES),
+                "cloud_consent_at": timestamp if cloud_consent and mode in _CLOUD_MODES else None,
                 "config_fingerprint": config_fingerprint,
                 "config": config,
                 "status": "queued",
@@ -240,16 +251,29 @@ class JobService:
             self._write_range_manifest(manifest)
 
         if self.background and job["status"] == "queued":
-            self._launch_background_range_worker(job_id)
+            if production:
+                try:
+                    self._launch_worker(job_id, range_job=True)
+                except Exception as exc:
+                    self._mutate_range_job(job_id, lambda value: _mark_range_job_failed(
+                        value, _redact(exc, self.config)))
+            else:
+                self._launch_background_range_worker(job_id)
         return self.range_snapshot(job_id) or _range_snapshot(job)
 
     def run_range_pending(self, job_id: str) -> dict:
-        """Run waiting range entries through only the injected synthetic extractor."""
-        if self.extractor is None:
-            raise RuntimeError("Live range execution is disabled; an explicitly injected synthetic extractor is required.")
+        """Run waiting range entries through their persisted execution backend."""
         job = self.range_snapshot(job_id)
         if job is None:
             raise ValueError("Range job was not found.")
+        if self.extractor is None and job.get("execution_kind", "synthetic") != "production":
+            raise RuntimeError("Live range execution is disabled; an explicitly injected synthetic extractor is required.")
+        if job.get("execution_kind") == "production" and _fixture_mode():
+            raise RuntimeError("Fixture mode blocks live production range extraction.")
+        if job.get("mode") in _CLOUD_MODES and not _has_range_consent(job):
+            raise ValueError("Persisted cloud consent is missing or invalid; the range job cannot run.")
+        if job.get("execution_kind") == "production":
+            self.config = self._production_config(job["mode"], job.get("config", {}))
         try:
             self._assert_range_runtime_config(job)
         except ValueError as exc:
@@ -283,6 +307,7 @@ class JobService:
                             verified, current["batch_id"], current["mode"],
                             item["config_fingerprint"], _range_extractor_is_versioned(current["config"]),
                             job_id)
+                        cache_context["execution_kind"] = current.get("execution_kind", "synthetic")
                         cached = self._find_range_cache(item["cache_identity"], cache_context)
                         if cached:
                             outcome = cached["status"]
@@ -295,7 +320,18 @@ class JobService:
                                 "mode": current["mode"],
                                 "config_fingerprint": item["config_fingerprint"],
                             }
-                            result = self.extractor(context, current["mode"], dict(self.config or {}))
+                            if current.get("execution_kind") == "production":
+                                from production_range_extractor import extract_range
+                                router = self._range_router(current)
+                                before_request = lambda model, tokens=0: self._reserve_range_provider_request(
+                                    job_id, model, router.ledger if router is not None else None, tokens)
+                                result = extract_range(
+                                    context, current["mode"], self._range_runtime_config(current),
+                                    self.output_dir, router=router,
+                                    before_provider_request=before_request,
+                                )
+                            else:
+                                result = self.extractor(context, current["mode"], dict(self.config or {}))
                             rows = _normalize_range_results(result)
                             if _range_quota_result(rows):
                                 outcome, cache_path, result_count = "quota_paused", "", len(rows)
@@ -342,8 +378,12 @@ class JobService:
                 and all(self._find_job_range_cache(item, job)
                         for item in job.get("ranges", []))):
             return job
-        if self.extractor is None:
+        if self.extractor is None and job.get("execution_kind", "synthetic") != "production":
             raise RuntimeError("Live range execution is disabled; an explicitly injected synthetic extractor is required.")
+        if job.get("mode") in _CLOUD_MODES and not _has_range_consent(job):
+            raise ValueError("Persisted cloud consent is missing or invalid; the range job cannot resume.")
+        if job.get("execution_kind") == "production":
+            self.config = self._production_config(job["mode"], job.get("config", {}))
         self._assert_range_runtime_config(job)
         try:
             with _file_lock(self.root / "locks" / f"range-job-{job_id}.lock", blocking=False):
@@ -353,7 +393,14 @@ class JobService:
             return self.range_snapshot(job_id) or job
         current = self.range_snapshot(job_id) or job
         if self.background and current.get("status") == "queued":
-            self._launch_background_range_worker(job_id)
+            if current.get("execution_kind") == "production":
+                try:
+                    self._launch_worker(job_id, range_job=True)
+                except Exception as exc:
+                    self._mutate_range_job(job_id, lambda value: _mark_range_job_failed(
+                        value, _redact(exc, self.config)))
+            else:
+                self._launch_background_range_worker(job_id)
         return self.range_snapshot(job_id) or current
 
     def range_snapshot(self, job_id: str) -> dict | None:
@@ -397,6 +444,7 @@ class JobService:
             verified, str(batch_id), str(job["mode"]), str(item["config_fingerprint"]),
             versioned, str(job_id),
         )
+        expected["execution_kind"] = job.get("execution_kind", "synthetic")
         if item.get("cache_identity") != expected["cache_identity"]:
             raise ValueError("The completed range cache identity is contradictory.")
         cache = self._find_range_cache(expected["cache_identity"], expected)
@@ -477,11 +525,70 @@ class JobService:
         _finish_range_job(job)
 
     def _assert_range_runtime_config(self, job: dict) -> None:
-        config = _range_config_snapshot(self.config or {}, self.extractor, self._unversioned_range_scope)
+        production = job.get("execution_kind") == "production"
+        extractor = _production_range_marker if production else self.extractor
+        config = _range_config_snapshot(self.config or {}, extractor,
+                                        None if production else self._unversioned_range_scope)
         canonical = json.dumps(config, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         fingerprint = sha256(canonical.encode("utf-8")).hexdigest()
         if fingerprint != job.get("config_fingerprint"):
             raise ValueError("Range job configuration fingerprint does not match the persisted job.")
+
+    def _range_runtime_config(self, job: dict) -> dict:
+        if job.get("execution_kind") == "production" and self.config is None:
+            self.config = self._production_config(job["mode"], job.get("config", {}))
+        return dict(self.config or {})
+
+    def _production_config(self, mode: str, persisted: Mapping[str, Any] | None = None) -> dict:
+        config = self._runtime_config(mode)
+        for key, value in (persisted or {}).items():
+            if not any(part in str(key).casefold()
+                       for part in ("key", "token", "secret", "password", "credential")):
+                config[key] = value
+        import import_recipes
+        config.setdefault("extractor_version", "range-production-v1")
+        config.setdefault("prompt_version", import_recipes.OCR_STRUCTURE_PROMPT_VERSION
+                           if mode == OCR_ASSISTED else import_recipes.PROMPT_VERSION)
+        config.setdefault("ocr_implementation", "local_ocr.extract_local")
+        config.setdefault("ocr_version", import_recipes.OCR_TEXT_VERSION)
+        config.setdefault("recipe_schema_version", "ExtractionBatch-v1")
+        return config
+
+    def _range_router(self, job: dict):
+        if job.get("mode") not in _CLOUD_MODES:
+            return None
+        from model_routing import ModelRouter, UsageLedger, parse_model_config
+        config = self._range_runtime_config(job)
+        return ModelRouter(
+            parse_model_config(config.get("models_json"), str(config.get("model", ""))),
+            UsageLedger(self.output_dir / "gemini_usage.json"),
+            global_rpm=float(config.get("global_rpm", 12)),
+        )
+
+    def _assert_range_cloud_consent(self, job_id: str, model: str) -> None:
+        job = self.range_snapshot(job_id)
+        if job is None or not _has_range_consent(job):
+            raise ValueError("Persisted cloud consent is missing or invalid; provider request blocked.")
+
+    def _reserve_range_provider_request(self, job_id: str, model_id: str, ledger=None,
+                                        request_tokens: int = 0) -> None:
+        self._assert_range_cloud_consent(job_id, model_id)
+        from model_routing import parse_model_config
+        job = self.range_snapshot(job_id)
+        config = self._range_runtime_config(job)
+        models = parse_model_config(config.get("models_json"), str(config.get("model", "")))
+        model = next((item for item in models if item.id == model_id and item.enabled), None)
+        if model is None:
+            raise ValueError("The selected Gemini model is not present in the effective range configuration.")
+        if ledger is None:
+            from model_routing import UsageLedger
+            ledger = UsageLedger(self.output_dir / "gemini_usage.json")
+        ledger.reserve_scheduled(
+            model.id, model.rpd, model_rpm=model.rpm,
+            global_rpm=float(config.get("global_rpm", 12)), tpm=model.tpm,
+            tokens=request_tokens,
+            sleep=time.sleep,
+        )
 
     def _read_range_manifest(self) -> dict:
         if not self.range_manifest_path.exists():
@@ -514,6 +621,7 @@ class JobService:
         versioned = _range_extractor_is_versioned(job.get("config", {}))
         expected = _range_cache_context(verified, job["batch_id"], job["mode"],
                                         item["config_fingerprint"], versioned, job["job_id"])
+        expected["execution_kind"] = job.get("execution_kind", "synthetic")
         if item.get("cache_identity") != expected["cache_identity"]:
             return None
         return self._find_range_cache(expected["cache_identity"], expected)
@@ -536,8 +644,13 @@ class JobService:
                     "first_page", "last_page", "input_sha256", "mode", "config_fingerprint",
                 )
                 provenance_matches = all(record.get(key) == expected.get(key) for key in provenance_fields)
-                if (type(record.get("schema_version")) is int and record["schema_version"] == 1
-                        and record.get("kind") == "synthetic_range_result"
+                production = expected.get("execution_kind") == "production"
+                execution_matches = record.get("execution_kind", "synthetic") == expected.get(
+                    "execution_kind", "synthetic")
+                if (type(record.get("schema_version")) is int
+                        and record["schema_version"] == (2 if production else 1)
+                        and record.get("kind") == ("production_range_result" if production else "synthetic_range_result")
+                        and execution_matches
                         and record.get("cache_identity") == cache_identity
                         and provenance_matches and owned_path
                         and (expected.get("extractor_versioned")
@@ -556,8 +669,9 @@ class JobService:
         cache_dir = self._range_cache_dir(create=True)
         path = cache_dir / f"{item['cache_identity']}--{uuid.uuid4().hex}.json"
         payload = {
-            "schema_version": 1,
-            "kind": "synthetic_range_result",
+            "schema_version": 2 if job.get("execution_kind") == "production" else 1,
+            "kind": "production_range_result" if job.get("execution_kind") == "production" else "synthetic_range_result",
+            "execution_kind": job.get("execution_kind", "synthetic"),
             "cache_identity": item["cache_identity"],
             "batch_id": job["batch_id"],
             "parent_document_id": item["parent_document_id"],
@@ -835,7 +949,7 @@ class JobService:
             "validate_models": bool(config.get("validate_models", False)),
         }
 
-    def _launch_worker(self, job_id: str) -> None:
+    def _launch_worker(self, job_id: str, *, range_job: bool = False) -> None:
         if self.extractor is not None:
             if self.background:
                 self._launch_background_fixture_worker(job_id)
@@ -855,6 +969,8 @@ class JobService:
                 if source_key in self.config:
                     env[env_key] = str(self.config[source_key])
         args = [sys.executable, str(worker), "--output-dir", str(self.output_dir), "--job-id", str(job_id)]
+        if range_job:
+            args.append("--range-job")
         options: dict[str, Any] = {
             "cwd": str(Path(__file__).resolve().parent),
             "env": env,
@@ -1280,6 +1396,23 @@ def _range_json_value(value: Any) -> Any:
     raise TypeError("Synthetic range results must contain JSON-compatible values.")
 
 
+def _production_range_marker(context: dict, mode: str, config: dict) -> list[dict]:
+    """Stable fingerprint marker; production dispatch is implemented by the adapter."""
+    raise RuntimeError("Production range extraction must run through the durable range worker.")
+
+
+def _has_range_consent(job: dict) -> bool:
+    if job.get("mode") not in _CLOUD_MODES:
+        return True
+    if job.get("cloud_consent") is not True:
+        return False
+    try:
+        consent_at = datetime.fromisoformat(str(job.get("cloud_consent_at") or ""))
+    except ValueError:
+        return False
+    return consent_at.tzinfo is not None
+
+
 def _range_quota_result(rows: list[dict]) -> bool:
     return any(_is_quota_result(row) for row in rows)
 
@@ -1296,7 +1429,8 @@ def _range_failure_note(rows: list[dict]) -> str:
 
 def _is_quota_error(message: str) -> bool:
     text = str(message).casefold()
-    return "quota" in text or "resource_exhausted" in text or "429" in text
+    return any(term in text for term in ("quota", "resource_exhausted", "429",
+                                         "daily request limit", "tpm allowance", "rate limit"))
 
 
 def _range_no_recipe(rows: list[dict]) -> bool:

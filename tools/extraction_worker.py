@@ -11,8 +11,14 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-dir", required=True, type=Path)
     parser.add_argument("--job-id", required=True)
+    parser.add_argument("--range-job", action="store_true",
+                        help="Run a durable cookbook page-range job.")
     args = parser.parse_args()
-    JobService(args.output_dir).run_pending(args.job_id)
+    service = JobService(args.output_dir)
+    if args.range_job:
+        service.run_range_pending(args.job_id)
+    else:
+        service.run_pending(args.job_id)
     return 0
 
 
