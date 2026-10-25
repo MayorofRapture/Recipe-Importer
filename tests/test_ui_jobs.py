@@ -18,6 +18,7 @@ import ui_job_service
 from batch_store import BatchStore, _file_lock
 from fixture_extraction import create_fixture_extractor
 from recipe_quality import ExtractionBatch, RecipeCandidate
+from review_store import ReviewStore
 from ui_job_service import JobService
 from ui_data import load_catalog
 
@@ -89,7 +90,7 @@ class JobServiceTests(unittest.TestCase):
         self.assertNotIn(parent["document_id"], {source.get("document_id") for source in job["sources"]})
         self.assertNotIn(page_range["range_id"], {source.get("range_id") for source in job["sources"]})
 
-    def test_range_jobs_cache_synthetic_results_without_registering_candidates(self):
+    def test_range_jobs_cache_synthetic_results_and_register_review_candidates(self):
         batch = self.store.create("Range synthetic boundary")
         parent_path = Path(self.tmp.name) / "range-book.pdf"
         _write_parent_pdf(parent_path)
@@ -118,7 +119,13 @@ class JobServiceTests(unittest.TestCase):
         self.assertTrue(completed["ranges"][0]["cache_path"])
         self.assertEqual(repeated["job_id"], job["job_id"])
         self.assertEqual(len(calls), 1)
-        self.assertFalse((self.output / "review_events.jsonl").exists())
+        registrations = [
+            registration for values in ReviewStore(self.output / "review_events.jsonl").registrations.values()
+            for registration in values if registration.get("event") == "candidate_registration"
+        ]
+        self.assertEqual(len(registrations), 2)
+        self.assertEqual({item["source_hash"] for item in registrations}, {parent["sha256"]})
+        self.assertTrue(all(item.get("range_provenance") for item in registrations))
         self.assertFalse((self.output / "import_state.jsonl").exists())
         self.assertFalse((self.output / "extracted").exists())
         self.assertFalse((self.output / "ui_jobs" / "jobs.json").exists())

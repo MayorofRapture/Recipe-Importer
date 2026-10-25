@@ -234,8 +234,11 @@ class ImportService:
                                extraction_id: str, create_callback,
                                batch_tag: str = "", tag_client: Any = None) -> dict:
         """Claim a single CLI candidate through the same durable duplicate gate."""
-        candidate = RecipeCandidate.model_validate(recipe)
         candidate_id = str(candidate_id)
+        if candidate_id.startswith("range-v1:"):
+            return {"status": "not_sent", "slug": "", "tag_status": "not_attempted",
+                    "reason": "Cookbook range candidates are blocked from import pending compatibility review."}
+        candidate = RecipeCandidate.model_validate(recipe)
         source_path = str(source_path)
         attempt_id = str(uuid.uuid4())
         approval_provenance = {"approval_method": "", "approval_rationale": "",
@@ -909,6 +912,8 @@ class ImportService:
                      protection: dict | None = None) -> tuple[str, dict | None]:
         if view is None:
             return "Candidate is no longer available.", None
+        if view.range_provenance or view.candidate_id.startswith("range-v1:"):
+            return "Cookbook range candidates are blocked from import pending compatibility review.", None
         if view.revision < 1:
             return "UI import requires an explicitly approved review revision.", None
         effective = self._effective(review, view)

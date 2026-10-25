@@ -7,6 +7,7 @@ drafts and import state into a stable UI view model.
 from __future__ import annotations
 
 import json
+import hashlib
 import re
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -22,10 +23,14 @@ from import_protection import ImportProtectionError, protected_candidate_ids
 from quick_edit import ParseWarning, parse_ingredients, parse_instructions
 from recipe_quality import ExtractionBatch, RecipeCandidate, is_complete, needs_review
 from recipe_validation import validate_recipe
-from review_store import ReviewStore, apply_candidate_decision, apply_review_decision, extraction_identity
+from review_store import (
+    ReviewStore, _candidate_payload, _canonical, apply_candidate_decision,
+    apply_review_decision, extraction_identity, range_candidate_id, range_occurrence_id,
+)
 from ui_contracts import normalize_status
 from review_service import project_legacy_review
 from batch_store import BatchStore
+from ui_job_service import _range_cache_identity
 
 
 @dataclass(frozen=True)
@@ -61,6 +66,7 @@ class RecipeView:
     approval_method: str = ""
     approval_rationale: str = ""
     no_instructions_reason: str = ""
+    range_provenance: dict[str, Any] = field(default_factory=dict)
 
     @property
     def quality_findings(self):
@@ -134,6 +140,8 @@ def load_catalog(output_dir: Path, source_root: Path | None = None, *,
     registered_batches: dict[tuple[str, str], list[dict]] = {}
     for event in reviews.events:
         if event.get("event") != "candidate_registration" or not isinstance(event.get("candidate"), dict):
+            continue
+        if event.get("range_provenance"):
             continue
         key = (str(event.get("source_hash", "")), str(event.get("extraction_id", "")))
         # Reconstruct immutable registrations only when there is no cache for
@@ -348,6 +356,113 @@ def load_catalog(output_dir: Path, source_root: Path | None = None, *,
                 approval_method=effective.approval_method if effective else "",
                 approval_rationale=effective.approval_rationale if effective else "",
                 no_instructions_reason=effective.no_instructions_reason if effective else "",
+            ))
+
+    # Range registrations use their own versioned candidate IDs and are never
+    # grouped with legacy cache entries by the parent's true source hash.
+    range_store = BatchStore(output_dir)
+    seen_range_views = set()
+    verified_ranges = {}
+    for identity, registrations in reviews.registrations.items():
+        for registration in registrations:
+            provenance = registration.get("range_provenance")
+            if not isinstance(provenance, dict):
+                continue
+            try:
+                source_hash = str(registration.get("source_hash", ""))
+                extraction_id = str(registration.get("extraction_id", ""))
+                candidate = RecipeCandidate.model_validate(registration["candidate"])
+                fingerprint = hashlib.sha256(
+                    _canonical(_candidate_payload(candidate)).encode("utf-8")
+                ).hexdigest()
+                if (provenance.get("schema_version") != 1
+                        or provenance.get("kind") != "cookbook_range_v1"
+                        or provenance.get("parent_sha256") != source_hash
+                        or provenance.get("parent_document_id") != source_hash
+                        or type(registration.get("range_occurrence")) is not int
+                        or registration.get("range_occurrence", -1) < 0
+                        or not re.fullmatch(r"[0-9a-f]{64}", extraction_id)
+                        or not re.fullmatch(r"[0-9a-f]{64}", str(provenance.get("config_fingerprint", "")))
+                        or not re.fullmatch(r"[0-9a-f]{64}", str(provenance.get("cache_identity", "")))
+                        or not re.fullmatch(r"[0-9a-f]{64}", str(provenance.get("cache_record_sha256", "")))
+                        or not provenance.get("extractor_version")
+                        or range_candidate_id(provenance, extraction_id, fingerprint,
+                                              registration.get("range_occurrence")) != identity
+                        or range_occurrence_id(provenance, extraction_id, fingerprint,
+                                               registration.get("range_occurrence"))
+                        != registration.get("range_occurrence_id")
+                        or registration.get("candidate_id") != identity):
+                    continue
+                range_key = (str(provenance.get("batch_id", "")),
+                             str(provenance.get("range_id", "")))
+                if range_key not in verified_ranges:
+                    verified_ranges[range_key] = _verified_range_context(range_store, provenance)
+                context = verified_ranges[range_key]
+                if context is None:
+                    continue
+                verified = context["verified"]
+                source_path = str(verified["parent_path"])
+                if source_hash != str(verified["parent_sha256"]):
+                    continue
+                key = (identity, source_hash, extraction_id)
+                if key in seen_range_views:
+                    continue
+                seen_range_views.add(key)
+            except (KeyError, TypeError, ValueError, OSError):
+                # Contradictory or unavailable parent/range evidence stays hidden.
+                continue
+
+            draft = drafts.get(identity)
+            if draft is not None and draft.source_hash and draft.source_hash != source_hash:
+                draft = None
+            effective = reviews.project_loaded(identity, source_hash, extraction_id, candidate, draft)
+            reviewed = RecipeCandidate.model_validate(effective.recipe)
+            source_available = source_matches(source_path, source_hash)
+            record = None  # Range candidates cannot inherit whole-book import history.
+            status = normalize_status(
+                "", candidate_complete=is_complete(reviewed, no_instructions_confirmed=bool(
+                    effective.no_instructions_reason)),
+                requires_review=reviewed.requires_review,
+                has_pending_suggestions=any(item.review_status == "pending"
+                                            for item in reviewed.suggestions),
+                has_critical_findings=any(item.severity == "critical"
+                                          for item in reviewed.missing_information),
+                approved=bool(effective.import_ready),
+            )
+            protected = identity in protected_ids or protection_unreadable
+            if protected:
+                status = "Check Mealie"
+            revision = max(
+                (item for item in reviews.revisions.get(identity, [])
+                 if item.get("source_hash") == source_hash
+                 and item.get("extraction_id") == extraction_id),
+                key=lambda item: int(item.get("revision", 0)), default={},
+            )
+            views.append(RecipeView(
+                candidate_id=identity, source_hash=source_hash, source_path=source_path,
+                candidate=reviewed, status=status, protected=protected,
+                import_record=dict(record or {}), draft=draft,
+                warnings=tuple(_warnings(reviewed, draft)),
+                import_ready=status == "Ready to import" and not protected,
+                extraction_id=extraction_id, revision=effective.revision,
+                content_digest=effective.content_sha256,
+                target_bindings=tuple(registration.get("target_bindings", [])),
+                identity_status=reviews.identity_link_status(identity, source_hash, extraction_id),
+                source_available=source_available, source_verified=verify_sources and source_available,
+                legacy_draft_conflict=effective.legacy_draft_conflict,
+                revision_target_bindings=tuple(revision.get("target_bindings", [])),
+                revision_raw_bulk_text=dict(revision.get("raw_bulk_text", {})),
+                revision_mode=str(revision.get("mode", "structured")),
+                source_display_name=str(provenance.get("parent_filename", "")),
+                batch_name=str(provenance.get("batch_name", "Existing cookbook")),
+                batch_tag=str(provenance.get("batch_tag", "")),
+                latest_suggestion_request=reviews.latest_suggestion_request_loaded(
+                    identity, source_hash, extraction_id),
+                source_candidate=RecipeCandidate.model_validate(registration["candidate"]),
+                approval_method=effective.approval_method,
+                approval_rationale=effective.approval_rationale,
+                no_instructions_reason=effective.no_instructions_reason,
+                range_provenance=dict(provenance),
             ))
 
     # Explicitly declared new retry candidates stay in their attempt cache. They
@@ -977,6 +1092,50 @@ def verify_selected_source(view: RecipeView) -> RecipeView:
     except OSError:
         matches = False
     return replace(view, source_available=matches, source_verified=matches)
+
+
+def range_relative_to_original_page(view: RecipeView, relative_page: int) -> int:
+    """Map a one-based range page to the verified original cookbook page."""
+    provenance = view.range_provenance
+    first_page = provenance.get("first_page")
+    page_count = provenance.get("page_count")
+    if (type(relative_page) is not int or type(first_page) is not int
+            or type(page_count) is not int or not provenance
+            or relative_page < 1 or relative_page > page_count):
+        raise ValueError("Range-relative page is outside the registered cookbook range.")
+    return first_page + relative_page - 1
+
+
+def _verified_range_context(store: BatchStore, provenance: dict) -> dict | None:
+    """Verify a range once per catalog load, even when it has many candidates."""
+    try:
+        batch_id = str(provenance.get("batch_id", ""))
+        range_id = str(provenance.get("range_id", ""))
+        batch = store.get(batch_id)
+        parent = next((item for item in (batch or {}).get("parent_documents", [])
+                       if item.get("document_id") == provenance.get("parent_document_id")), None)
+        if (batch is None or parent is None
+                or parent.get("original_filename") != provenance.get("parent_filename")):
+            return None
+        verified = store.validate_page_range(batch_id, range_id)
+        if any(provenance.get(key) != verified.get(source_key) for key, source_key in (
+                ("parent_document_id", "parent_document_id"),
+                ("parent_sha256", "parent_sha256"), ("range_id", "range_id"),
+                ("first_page", "first_page"), ("last_page", "last_page"),
+                ("page_count", "page_count"), ("input_sha256", "input_sha256"),
+                ("input_path", "input_path"))):
+            return None
+        mode = provenance.get("mode")
+        if (provenance.get("source_path") != verified.get("parent_path")
+                or provenance.get("extraction_method") != mode
+                or mode not in {"local_ocr", "gemini", "ocr_assisted"}
+                or _range_cache_identity(
+                    verified, batch_id, str(mode), str(provenance.get("config_fingerprint", "")),
+                ) != provenance.get("cache_identity")):
+            return None
+        return {"batch": batch, "parent": parent, "verified": verified}
+    except (KeyError, TypeError, ValueError, OSError, RuntimeError):
+        return None
 
 
 def _cached_digest(path: Path, digests: dict[str, str | None]) -> str | None:

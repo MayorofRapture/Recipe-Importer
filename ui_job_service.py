@@ -319,7 +319,10 @@ class JobService:
                     if latest and latest.get("quota_paused"):
                         break
                 self._mutate_range_job(job_id, _finish_range_job)
-        return self.range_snapshot(job_id) or {}
+        finished = self.range_snapshot(job_id) or {}
+        if finished.get("status") in {"completed", "completed_with_errors"}:
+            self.register_completed_ranges(job_id)
+        return finished
 
     def pause_range_job(self, job_id: str) -> dict:
         def pause(job: dict) -> None:
@@ -357,6 +360,97 @@ class JobService:
         with _file_lock(self.range_manifest_lock):
             job = self._read_range_manifest()["jobs"].get(str(job_id))
             return _range_snapshot(job) if job is not None else None
+
+    def register_completed_ranges(self, job_id: str) -> list[dict]:
+        """Register every successful range in a completed job; safe to repeat after restart."""
+        job = self.range_snapshot(str(job_id))
+        if job is None or job.get("status") not in {"completed", "completed_with_errors"}:
+            raise ValueError("Only finished range jobs can be registered for review.")
+        registrations = []
+        for item in job.get("ranges", []):
+            if item.get("status") != "completed":
+                continue
+            registrations.extend(self.register_completed_range(
+                str(job["batch_id"]), str(item["parent_document_id"]),
+                str(item["range_id"]), job_id=str(job_id),
+            ))
+        return registrations
+
+    def register_completed_range(self, batch_id: str, parent_document_id: str,
+                                 range_id: str, *, job_id: str) -> list[dict]:
+        """Register only a completed synthetic result bound to its verified original range."""
+        job = self.range_snapshot(str(job_id))
+        if (job is None or job.get("batch_id") != str(batch_id)
+                or job.get("status") not in {"completed", "completed_with_errors"}):
+            raise ValueError("Only a completed range job can be registered for review.")
+        item = next((value for value in job.get("ranges", [])
+                     if value.get("range_id") == str(range_id)), None)
+        if item is None or item.get("status") != "completed":
+            if item is not None and item.get("status") == "no_recipe":
+                return []
+            raise ValueError("The selected range has no completed recipe result.")
+        store = BatchStore(self.output_dir)
+        verified = store.validate_page_range(str(batch_id), str(range_id))
+        _assert_range_matches_job(item, verified)
+        versioned = _range_extractor_is_versioned(job.get("config", {}))
+        expected = _range_cache_context(
+            verified, str(batch_id), str(job["mode"]), str(item["config_fingerprint"]),
+            versioned, str(job_id),
+        )
+        if item.get("cache_identity") != expected["cache_identity"]:
+            raise ValueError("The completed range cache identity is contradictory.")
+        cache = self._find_range_cache(expected["cache_identity"], expected)
+        if cache is None or cache.get("status") != "completed":
+            raise ValueError("The completed range extraction cache is missing or invalid.")
+        cache_path = Path(cache["cache_path"])
+        record = json.loads(cache_path.read_text(encoding="utf-8"))
+        cache_job_id = str(record.get("job_id", ""))
+        cache_job = self.range_snapshot(cache_job_id) if cache_job_id else None
+        cache_job_item = next((value for value in (cache_job or {}).get("ranges", [])
+                               if value.get("range_id") == str(range_id)), None)
+        if (cache_job is None or cache_job.get("status") not in {"completed", "completed_with_errors"}
+                or cache_job_item is None or cache_job_item.get("status") != "completed"
+                or cache_job_item.get("cache_identity") != expected["cache_identity"]):
+            raise ValueError("The extraction cache is not bound to a completed range job.")
+        batch = store.get(str(batch_id))
+        parent = next((value for value in batch.get("parent_documents", [])
+                       if value.get("document_id") == str(parent_document_id)), None) if batch else None
+        if (parent is None or parent.get("sha256") != verified.get("parent_sha256")
+                or parent.get("document_id") != verified.get("parent_document_id")):
+            raise ValueError("The selected parent cookbook does not match the verified range.")
+
+        from recipe_quality import ExtractionBatch
+        from review_store import ReviewStore
+
+        candidate_rows = []
+        for result in record["results"]:
+            row = result.get("recipe", result.get("candidate", result)) if isinstance(result, dict) else None
+            if not isinstance(row, dict) or str(row.get("status", "")).upper() in _FAILED_RESULT_STATES | _NO_RECIPE_STATES:
+                raise ValueError("The completed range contains an invalid or unsuccessful recipe result.")
+            candidate_rows.append(row)
+        extraction = ExtractionBatch.model_validate({"recipes": candidate_rows})
+        if not extraction.recipes:
+            return []
+        provenance = {
+            "schema_version": 1, "kind": "cookbook_range_v1",
+            "batch_id": str(batch_id), "parent_document_id": verified["parent_document_id"],
+            "parent_sha256": verified["parent_sha256"],
+            "parent_filename": str(parent.get("original_filename", "")),
+            "batch_name": str(batch.get("name", "")),
+            "batch_tag": str(batch.get("tag", "")),
+            "range_id": verified["range_id"], "first_page": verified["first_page"],
+            "last_page": verified["last_page"], "page_count": verified["page_count"],
+            "input_path": verified["input_path"], "input_sha256": verified["input_sha256"],
+            "mode": job["mode"], "extraction_method": job["mode"],
+            "config_fingerprint": item["config_fingerprint"],
+            "cache_identity": item["cache_identity"], "cache_path": cache["cache_path"],
+            "cache_record_sha256": str(record.get("record_sha256", "")),
+            "extractor_version": str(job.get("config", {}).get("extractor_version") or "unversioned"),
+            "job_id": cache_job_id, "source_path": verified["parent_path"],
+        }
+        return ReviewStore(self.output_dir / "review_events.jsonl").register_range_candidates(
+            verified["parent_path"], verified["parent_sha256"], provenance, extraction.recipes,
+        )
 
     def list_range_jobs(self) -> list[dict]:
         with _file_lock(self.range_manifest_lock):

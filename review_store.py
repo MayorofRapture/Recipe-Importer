@@ -142,6 +142,59 @@ def _candidate_payload(candidate: RecipeCandidate) -> dict:
     return value
 
 
+def _range_target_bindings(candidate: RecipeCandidate) -> list[dict]:
+    bindings = []
+    field_targets = {}
+    for field in ("ingredients", "instructions"):
+        for position, value in enumerate(getattr(candidate, field)):
+            bindings.append({"target_id": str(uuid.uuid4()), "target_kind": "row",
+                             "field": field, "original_value": value,
+                             "original_position": position})
+
+    def target_for_path(field_path: str) -> tuple[str, str]:
+        match = re.fullmatch(r"(ingredients|instructions)\[(\d+)\]", field_path)
+        if match:
+            row = next((item for item in bindings
+                        if item.get("target_kind") == "row"
+                        and item.get("field") == match.group(1)
+                        and item.get("original_position") == int(match.group(2))), None)
+            return (str(row["target_id"]), "row") if row else ("", "")
+        if field_path not in {"name", "ingredients", "instructions", "yield_text", "description"}:
+            return "", ""
+        target = field_targets.get(field_path)
+        if target is None:
+            target = {"target_id": str(uuid.uuid4()), "target_kind": "field",
+                      "field": field_path, "original_value": getattr(candidate, field_path)}
+            bindings.append(target)
+            field_targets[field_path] = target
+        return str(target["target_id"]), "field"
+
+    for suggestion in candidate.suggestions:
+        source_target, source_target_kind = target_for_path(suggestion.field_path)
+        bindings.append({"issue_id": suggestion.suggestion_id,
+                         "target_id": str(uuid.uuid4()), "target_kind": "proposal",
+                         "field_path_at_extraction": suggestion.field_path,
+                         "source_target_id": source_target,
+                         "source_target_kind": source_target_kind,
+                         "field": (suggestion.field_path.split("[", 1)[0]
+                                   if source_target_kind == "row" else suggestion.field_path),
+                         "original_value": suggestion.proposed_value,
+                         "original_issue": suggestion.model_dump(mode="json")})
+    for index, finding in enumerate(candidate.missing_information):
+        source_target, source_target_kind = target_for_path(finding.field_path)
+        bindings.append({"issue_id": f"finding:{index}:{finding.field_path}",
+                         "target_id": str(uuid.uuid4()), "target_kind": "finding",
+                         "field_path_at_extraction": finding.field_path,
+                         "severity": finding.severity,
+                         "source_target_id": source_target,
+                         "source_target_kind": source_target_kind,
+                         "field": (finding.field_path.split("[", 1)[0]
+                                   if source_target_kind == "row" else finding.field_path),
+                         "original_value": finding.detail,
+                         "original_issue": finding.model_dump(mode="json")})
+    return bindings
+
+
 def _recipe_digest(recipe: dict) -> str:
     fields = {key: recipe.get(key) for key in (
         "name", "ingredients", "instructions", "yield_text", "description",
@@ -200,6 +253,41 @@ def extraction_identity(source_hash: str, extraction: dict) -> str:
         if isinstance(candidate, dict) and not candidate.get("notes"):
             candidate.pop("notes", None)
     return hashlib.sha256((source_hash + _canonical(normalized)).encode("utf-8")).hexdigest()
+
+
+_RANGE_PROVENANCE_FIELDS = (
+    "schema_version", "kind", "batch_id", "parent_document_id", "parent_sha256",
+    "range_id", "first_page", "last_page", "page_count", "input_sha256",
+    "cache_identity", "mode", "config_fingerprint",
+)
+
+
+def range_extraction_identity(provenance: dict, candidates: list[RecipeCandidate]) -> str:
+    """Identify one range extraction without relying on result-array order."""
+    identity = {key: provenance.get(key) for key in _RANGE_PROVENANCE_FIELDS}
+    rows = sorted((_candidate_payload(candidate) for candidate in candidates), key=_canonical)
+    return hashlib.sha256(
+        b"recipe-importer:range-extraction:v1\0" + _canonical({"identity": identity, "recipes": rows}).encode()
+    ).hexdigest()
+
+
+def range_occurrence_id(provenance: dict, extraction_id: str, fingerprint: str,
+                        identical_occurrence: int) -> str:
+    """Return a stable ID for one same-content occurrence within one range extraction."""
+    identity = {key: provenance.get(key) for key in (
+        "schema_version", "kind", "batch_id", "parent_document_id", "parent_sha256",
+        "range_id", "first_page", "last_page", "page_count", "input_sha256",
+    )}
+    identity.update({"extraction_id": extraction_id, "fingerprint": fingerprint,
+                     "identical_occurrence": identical_occurrence})
+    return hashlib.sha256(
+        b"recipe-importer:range-candidate:v1\0" + _canonical(identity).encode()
+    ).hexdigest()
+
+
+def range_candidate_id(provenance: dict, extraction_id: str, fingerprint: str,
+                       identical_occurrence: int) -> str:
+    return f"range-v1:{range_occurrence_id(provenance, extraction_id, fingerprint, identical_occurrence)}"
 
 
 def _legacy_identity(source_hash: str, title: str) -> str:
@@ -489,6 +577,94 @@ class ReviewStore:
                     raise ReviewConflict("operation_id was already used for different review data")
                 return prior
         return None
+
+    def register_range_candidates(self, source: str, source_hash: str,
+                                  provenance: dict,
+                                  candidates: list[RecipeCandidate]) -> list[dict]:
+        """Append candidates whose identity is isolated to a verified cookbook range."""
+        if (not isinstance(provenance, dict)
+                or any(key not in provenance for key in _RANGE_PROVENANCE_FIELDS)
+                or provenance.get("schema_version") != 1
+                or provenance.get("kind") != "cookbook_range_v1"
+                or provenance.get("parent_sha256") != source_hash
+                or provenance.get("parent_document_id") != source_hash
+                or not re.fullmatch(r"[0-9a-f]{64}", str(source_hash))
+                or not re.fullmatch(r"[0-9a-f]{64}", str(provenance.get("range_id", "")))
+                or not re.fullmatch(r"[0-9a-f]{64}", str(provenance.get("input_sha256", "")))
+                or not re.fullmatch(r"[0-9a-f]{64}", str(provenance.get("cache_identity", "")))
+                or not re.fullmatch(r"[0-9a-f]{64}", str(provenance.get("config_fingerprint", "")))
+                or not re.fullmatch(r"[0-9a-f]{64}", str(provenance.get("cache_record_sha256", "")))
+                or type(provenance.get("first_page")) is not int
+                or type(provenance.get("last_page")) is not int
+                or type(provenance.get("page_count")) is not int
+                or provenance["first_page"] < 1
+                or provenance["last_page"] < provenance["first_page"]
+                or provenance["page_count"] != provenance["last_page"] - provenance["first_page"] + 1
+                or not provenance.get("batch_id") or not provenance.get("mode")
+                or not provenance.get("parent_filename") or not provenance.get("extractor_version")
+                or not provenance.get("cache_path") or not provenance.get("source_path") or not source):
+            raise ValueError("Cookbook range provenance is invalid or incomplete.")
+        candidates = [RecipeCandidate.model_validate(candidate) for candidate in candidates]
+        extraction_id = range_extraction_identity(provenance, candidates)
+        fingerprints = [hashlib.sha256(_canonical(_candidate_payload(item)).encode()).hexdigest()
+                        for item in candidates]
+        occurrence_counts: Counter[str] = Counter()
+        identities = []
+        for fingerprint in fingerprints:
+            occurrence = occurrence_counts[fingerprint]
+            occurrence_counts[fingerprint] += 1
+            identities.append((fingerprint, occurrence,
+                               range_candidate_id(provenance, extraction_id, fingerprint, occurrence)))
+
+        with _state_lock(self.path):
+            self._reload()
+            output = []
+            pending = []
+            for candidate, (fingerprint, occurrence, candidate_id) in zip(candidates, identities):
+                existing = [event for event in self.registrations.get(candidate_id, [])
+                            if event.get("event") == "candidate_registration"]
+                if existing:
+                    previous_provenance = existing[0].get("range_provenance", {}) if len(existing) == 1 else {}
+                    same_provenance = all(
+                        previous_provenance.get(key) == provenance.get(key)
+                        for key in (*_RANGE_PROVENANCE_FIELDS, "parent_filename", "input_path",
+                                    "source_path", "extraction_method", "extractor_version")
+                    )
+                    if (len(existing) != 1
+                            or existing[0].get("source_hash") != source_hash
+                            or existing[0].get("extraction_id") != extraction_id
+                            or existing[0].get("fingerprint") != fingerprint
+                            or not same_provenance
+                            or existing[0].get("source") != str(source)
+                            or existing[0].get("candidate") != _candidate_payload(candidate)
+                            or existing[0].get("range_occurrence") != occurrence):
+                        raise ReviewConflict("Range candidate identity conflicts with existing review history.")
+                    output.append(existing[0])
+                    continue
+                bindings = _range_target_bindings(candidate)
+                event = self._base_event(
+                    "candidate_registration", candidate_id, source_hash, extraction_id,
+                    f"register-range-v1:{candidate_id}",
+                )
+                event.update({
+                    "source": str(source), "fingerprint": fingerprint,
+                    "identity_status": "registered", "identity_version": 2,
+                    "logical_identity_digest": logical_recipe_identity(_candidate_payload(candidate)),
+                    "identity_group_id": candidate_id, "legacy_id": "",
+                    "title_legacy_id": "", "legacy_aliases": [],
+                    "candidate": _candidate_payload(candidate),
+                    "target_bindings": bindings, "range_provenance": dict(provenance),
+                    "range_occurrence": occurrence,
+                    "range_occurrence_id": candidate_id.partition(":")[2],
+                })
+                pending.append(event)
+                output.append(event)
+            self._append_many(pending, locked=True)
+            self._reload()
+            return [next((event for event in self.registrations.get(item["candidate_id"], [])
+                          if event.get("source_hash") == source_hash
+                          and event.get("extraction_id") == extraction_id), item)
+                    for item in output]
 
     def register_candidate_batches(
         self, batches: list[tuple[str, str, str, list[RecipeCandidate]]],
