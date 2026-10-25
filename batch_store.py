@@ -451,6 +451,13 @@ class BatchStore:
         temporary: Path | None = None
 
         try:
+            resolved_range_dir = range_dir.resolve()
+            try:
+                resolved_range_dir.relative_to(self.root.resolve())
+            except ValueError:
+                return _rejected("page range", "The range storage path is outside the batch store.")
+            if resolved_range_dir != Path(os.path.abspath(range_dir)):
+                return _rejected("page range", "The range storage path is redirected or unsafe.")
             with _file_lock(lock_path):
                 with _file_lock(self.lock_path):
                     manifest = self._read_manifest()
@@ -476,18 +483,6 @@ class BatchStore:
                     return _rejected("page range", "The staged parent PDF hash does not match its identity.")
                 existing_range = next((item for item in parent.get("ranges", [])
                                        if item.get("range_id") == range_id), None)
-                if existing_range is not None:
-                    existing_path = Path(str(existing_range.get("input_path", "")))
-                    if (existing_path == input_path and not input_path.is_symlink()
-                            and input_path.is_file()
-                            and _digest_file(input_path) == existing_range.get("input_sha256")):
-                        try:
-                            with fitz.open(input_path) as existing_doc:
-                                valid_existing = len(existing_doc) == page_count and not existing_doc.needs_pass
-                        except Exception:
-                            valid_existing = False
-                        if valid_existing:
-                            return {**existing_range, "status": "duplicate"}
                 receipt_record = None
                 if receipt_path.exists():
                     if receipt_path.is_symlink():
@@ -496,23 +491,37 @@ class BatchStore:
                         receipt_record = json.loads(receipt_path.read_text(encoding="utf-8"))["record"]
                     except (OSError, json.JSONDecodeError, KeyError, TypeError):
                         return _rejected("page range", "The range recovery receipt is damaged.")
-                    if (receipt_record.get("range_id") != range_id
-                            or receipt_record.get("record_version") != 1
-                            or receipt_record.get("schema_version") != 1
-                            or receipt_record.get("kind") != "page_range"
-                            or receipt_record.get("parent_sha256") != parent_digest
-                            or receipt_record.get("document_id") != parent_digest
-                            or receipt_record.get("batch_id") != batch_key
-                            or receipt_record.get("first_page") != first_page
-                            or receipt_record.get("last_page") != last_page
-                            or receipt_record.get("page_count") != page_count
-                            or receipt_record.get("status") != "waiting"
-                            or receipt_record.get("input_path") != str(input_path)
-                            or not isinstance(receipt_record.get("size_bytes"), int)
-                            or receipt_record.get("size_bytes", 0) <= 0
-                            or not re.fullmatch(r"[0-9a-f]{64}", str(receipt_record.get("input_sha256", "")))):
+                    if (not _page_range_record_matches(
+                                receipt_record, range_id, parent_digest, batch_key,
+                                first_page, last_page, page_count, input_path)
+                            or receipt_record.get("status") != "waiting"):
                         return _rejected("page range", "The range recovery receipt does not match this request.")
+                if existing_range is not None and not _page_range_record_matches(
+                        existing_range, range_id, parent_digest, batch_key,
+                        first_page, last_page, page_count, input_path):
+                    return _rejected("page range", "The existing range metadata does not match this request.")
+                if existing_range is not None and receipt_record is not None:
+                    immutable_fields = (
+                        "record_version", "schema_version", "kind", "range_id", "document_id",
+                        "parent_sha256", "batch_id", "first_page", "last_page", "page_count",
+                        "input_path", "input_sha256", "size_bytes",
+                    )
+                    if any(existing_range.get(field) != receipt_record.get(field)
+                           for field in immutable_fields):
+                        return _rejected("page range", "Range metadata conflicts with its recovery receipt.")
+                if existing_range is not None and input_path.is_file() and not input_path.is_symlink():
+                    if (input_path.stat().st_size == existing_range["size_bytes"]
+                            and _digest_file(input_path) == existing_range["input_sha256"]):
+                        try:
+                            with fitz.open(input_path) as existing_doc:
+                                valid_existing = len(existing_doc) == page_count and not existing_doc.needs_pass
+                        except Exception:
+                            valid_existing = False
+                        if valid_existing:
+                            return {**existing_range, "status": "duplicate"}
+                if receipt_record is not None:
                     if (not input_path.is_symlink() and input_path.is_file()
+                            and input_path.stat().st_size == receipt_record["size_bytes"]
                             and _digest_file(input_path) == receipt_record["input_sha256"]):
                         try:
                             with fitz.open(input_path) as recovered_doc:
@@ -521,7 +530,7 @@ class BatchStore:
                             valid_recovered = False
                         if valid_recovered:
                             if existing_range is not None:
-                                return {**existing_range, "status": "repaired"}
+                                return {**existing_range, "status": "duplicate"}
                             with _file_lock(self.lock_path):
                                 current_manifest = self._read_manifest()
                                 current_batch = current_manifest["batches"].get(batch_key)
@@ -543,7 +552,11 @@ class BatchStore:
                                             f"Range metadata recovery failed: {type(exc).__name__}.",
                                         )
                                     return {**receipt_record, "status": "recovered"}
-                                if current_existing.get("input_sha256") != receipt_record.get("input_sha256"):
+                                if (not _page_range_record_matches(
+                                            current_existing, range_id, parent_digest, batch_key,
+                                            first_page, last_page, page_count, input_path)
+                                        or any(current_existing.get(field) != receipt_record.get(field)
+                                               for field in immutable_fields)):
                                     return _rejected("page range", "Range metadata conflicts with its recovery receipt.")
                                 return {**current_existing, "status": "duplicate"}
                 try:
@@ -600,8 +613,14 @@ class BatchStore:
                         ranges = parent.setdefault("ranges", [])
                         existing = next((item for item in ranges
                                          if item.get("range_id") == range_id), None)
+                        if existing is not None and not _page_range_record_matches(
+                                existing, range_id, parent_digest, batch_key,
+                                first_page, last_page, page_count, input_path):
+                            return _rejected("page range", "The existing range metadata does not match this request.")
                         expected_digest = (existing or receipt_record or {}).get("input_sha256")
-                        if expected_digest is not None and expected_digest != generated_digest:
+                        expected_size = (existing or receipt_record or {}).get("size_bytes")
+                        if (expected_digest is not None and expected_digest != generated_digest
+                                or expected_size is not None and expected_size != size_bytes):
                             return _rejected(
                                 "page range", "Regenerated bytes differ from the recorded range input; it was preserved."
                             )
@@ -916,6 +935,36 @@ def _page_range_id(parent_sha256: str, first_page: int, last_page: int) -> str:
         str(last_page).encode("ascii"),
     ))
     return sha256(identity).hexdigest()
+
+
+def _page_range_record_matches(record: object, range_id: str, parent_sha256: str,
+                               batch_id: str, first_page: int, last_page: int,
+                               page_count: int, input_path: Path) -> bool:
+    if not isinstance(record, dict):
+        return False
+    if any(type(record.get(key)) is not int
+           for key in ("record_version", "schema_version", "first_page", "last_page", "page_count")):
+        return False
+    expected = {
+        "record_version": 1,
+        "schema_version": 1,
+        "kind": "page_range",
+        "range_id": range_id,
+        "document_id": parent_sha256,
+        "parent_sha256": parent_sha256,
+        "batch_id": batch_id,
+        "first_page": first_page,
+        "last_page": last_page,
+        "page_count": page_count,
+        "input_path": str(input_path),
+    }
+    if any(record.get(key) != value for key, value in expected.items()):
+        return False
+    size_bytes = record.get("size_bytes")
+    input_sha256 = record.get("input_sha256")
+    return (type(size_bytes) is int and size_bytes > 0
+            and isinstance(input_sha256, str)
+            and re.fullmatch(r"[0-9a-f]{64}", input_sha256) is not None)
 
 
 def _digest_file(path: Path) -> str:

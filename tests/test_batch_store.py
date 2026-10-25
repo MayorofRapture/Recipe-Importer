@@ -3,6 +3,8 @@ from __future__ import annotations
 import io
 import hashlib
 import json
+import os
+import subprocess
 import tempfile
 import threading
 import unittest
@@ -201,6 +203,151 @@ class BatchStoreTests(unittest.TestCase):
             self.assertEqual(failed["status"], "rejected")
             self.assertEqual(recovered["status"], "recovered")
             self.assertEqual(len(store.get(batch["batch_id"])["parent_documents"][0]["ranges"]), 1)
+
+    def test_page_range_rejects_manifest_receipt_hash_conflict(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = BatchStore(root / "output", parent_disk_reserve_bytes=0)
+            batch = store.create("Range identity conflict")
+            source = root / "book.pdf"
+            _write_pdf(source, 2)
+            parent = store.stage_parent_pdf(batch["batch_id"], source)
+            created = store.create_page_range(batch["batch_id"], parent["document_id"], 1, 2)
+            manifest = store._read_manifest()
+            recorded_range = manifest["batches"][batch["batch_id"]]["parent_documents"][0]["ranges"][0]
+            recorded_range["input_sha256"] = "0" * 64
+            store._write_manifest(manifest)
+
+            result = store.create_page_range(batch["batch_id"], parent["document_id"], 1, 2)
+
+            self.assertEqual(result["status"], "rejected")
+            self.assertEqual(Path(created["input_path"]).read_bytes()[:4], b"%PDF")
+            self.assertEqual(store.get(batch["batch_id"])["parent_documents"][0]["ranges"][0]["input_sha256"], "0" * 64)
+
+    def test_page_range_rejects_receipt_size_conflict_without_changing_materialized_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = BatchStore(root / "output", parent_disk_reserve_bytes=0)
+            batch = store.create("Range receipt conflict")
+            source = root / "book.pdf"
+            _write_pdf(source, 1)
+            parent = store.stage_parent_pdf(batch["batch_id"], source)
+            created = store.create_page_range(batch["batch_id"], parent["document_id"], 1, 1)
+            range_path = Path(created["input_path"])
+            original_bytes = range_path.read_bytes()
+            receipt_path = range_path.with_suffix(".json")
+            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+            receipt["record"]["size_bytes"] += 1
+            receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+
+            result = store.create_page_range(batch["batch_id"], parent["document_id"], 1, 1)
+
+            self.assertEqual(result["status"], "rejected")
+            self.assertEqual(range_path.read_bytes(), original_bytes)
+            self.assertEqual(len(store.get(batch["batch_id"])["parent_documents"][0]["ranges"]), 1)
+
+    def test_page_range_duplicate_preserves_mutable_manifest_status(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = BatchStore(root / "output", parent_disk_reserve_bytes=0)
+            batch = store.create("Range workflow status")
+            source = root / "book.pdf"
+            _write_pdf(source, 1)
+            parent = store.stage_parent_pdf(batch["batch_id"], source)
+            store.create_page_range(batch["batch_id"], parent["document_id"], 1, 1)
+            manifest = store._read_manifest()
+            recorded_range = manifest["batches"][batch["batch_id"]]["parent_documents"][0]["ranges"][0]
+            recorded_range["status"] = "completed"
+            store._write_manifest(manifest)
+
+            result = store.create_page_range(batch["batch_id"], parent["document_id"], 1, 1)
+
+            self.assertEqual(result["status"], "duplicate")
+            self.assertEqual(store.get(batch["batch_id"])["parent_documents"][0]["ranges"][0]["status"], "completed")
+
+    def test_page_range_repairs_only_exact_recorded_bytes_without_adding_a_record(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = BatchStore(root / "output", parent_disk_reserve_bytes=0)
+            batch = store.create("Exact range repair")
+            source = root / "book.pdf"
+            _write_pdf(source, 1)
+            parent = store.stage_parent_pdf(batch["batch_id"], source)
+            created = store.create_page_range(batch["batch_id"], parent["document_id"], 1, 1)
+            range_path = Path(created["input_path"])
+            original_bytes = range_path.read_bytes()
+            range_path.write_bytes(b"damaged")
+
+            def restore_exact_bytes(_document, temporary_path, _first, _last, _max_bytes):
+                temporary_path.write_bytes(original_bytes)
+
+            with patch.object(store, "_write_page_range_pdf", side_effect=restore_exact_bytes):
+                repaired = store.create_page_range(batch["batch_id"], parent["document_id"], 1, 1)
+
+            self.assertEqual(repaired["status"], "repaired")
+            self.assertEqual(range_path.read_bytes(), original_bytes)
+            self.assertEqual(len(store.get(batch["batch_id"])["parent_documents"][0]["ranges"]), 1)
+
+    def test_page_range_rejects_contradictory_manifest_identity_before_duplicate(self):
+        contradictions = {
+            "record_version": 2,
+            "schema_version": 2,
+            "kind": "other",
+            "document_id": "f" * 64,
+            "parent_sha256": "f" * 64,
+            "batch_id": "other-batch",
+            "first_page": 2,
+            "last_page": 3,
+            "page_count": 3,
+            "input_path": "other.pdf",
+            "size_bytes": 1,
+        }
+        for field, value in contradictions.items():
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                store = BatchStore(root / "output", parent_disk_reserve_bytes=0)
+                batch = store.create("Range identity validation")
+                source = root / "book.pdf"
+                _write_pdf(source, 3)
+                parent = store.stage_parent_pdf(batch["batch_id"], source)
+                store.create_page_range(batch["batch_id"], parent["document_id"], 1, 2)
+                manifest = store._read_manifest()
+                recorded_range = manifest["batches"][batch["batch_id"]]["parent_documents"][0]["ranges"][0]
+                recorded_range[field] = value
+                store._write_manifest(manifest)
+
+                result = store.create_page_range(batch["batch_id"], parent["document_id"], 1, 2)
+
+                self.assertEqual(result["status"], "rejected")
+
+    def test_page_range_rejects_ranges_directory_junction_escape(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = BatchStore(root / "output", parent_disk_reserve_bytes=0)
+            batch = store.create("Range path ownership")
+            source = root / "book.pdf"
+            _write_pdf(source, 1)
+            parent = store.stage_parent_pdf(batch["batch_id"], source)
+            range_dir = Path(parent["staged_path"]).parent / "ranges"
+            external = root / "outside"
+            external.mkdir()
+            environment = os.environ.copy()
+            environment["RI_RANGE_DIR"] = str(range_dir)
+            environment["RI_EXTERNAL_DIR"] = str(external)
+            try:
+                subprocess.run(
+                    ["powershell.exe", "-NoProfile", "-Command",
+                     "New-Item -ItemType Junction -Path $env:RI_RANGE_DIR -Target $env:RI_EXTERNAL_DIR | Out-Null"],
+                    check=True, capture_output=True, text=True, env=environment,
+                )
+            except (OSError, subprocess.CalledProcessError) as exc:
+                self.skipTest(f"directory junction creation is unavailable: {type(exc).__name__}")
+
+            result = store.create_page_range(batch["batch_id"], parent["document_id"], 1, 1)
+
+            self.assertEqual(result["status"], "rejected")
+            self.assertEqual(list(external.iterdir()), [])
+            range_dir.unlink()
 
     def test_page_range_generation_interruption_leaves_no_record_or_temporary_input(self):
         with tempfile.TemporaryDirectory() as tmp:
