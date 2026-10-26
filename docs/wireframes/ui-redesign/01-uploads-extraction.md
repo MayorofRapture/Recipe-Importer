@@ -1,105 +1,45 @@
-# Uploads, extraction and recovery
+# 01 — Upload and extraction
 
-Synthetic example batch: **Weeknight cookbook**, optional Mealie tag **Weeknight scans**. Local batch grouping is not Mealie cookbook membership. All designs are proposed.
+**Status: proposal.** Keep the current batch, staging, job, consent, and range services. Reorder presentation only after approval.
 
-## U1 — First-time intake / global navigation
-
-```text
-Recipe Importer        Uploads [active]       Review       Import & history       Help
------------------------------------------------------------------------------------
-Add recipes
-Turn scans into recipes you can check before sending to Mealie.
-
-Batch name [Weeknight cookbook              ]   Mealie tag (optional) [Weeknight scans]
-                                               Used for filtering in Mealie.
-┌─────────────────────────────────────────────────────────────────────────────────┐
-│ Drop scans or a cookbook PDF here                         [Choose files]         │
-│ JPG, JPEG, PNG, WEBP, PDF · file/page limits shown from actual configuration      │
-└─────────────────────────────────────────────────────────────────────────────────┘
-Files                         Pages          Result                    Action
-[preview] fried-rice.jpg         1            Added                     Remove from batch
-[preview] cookbook.pdf          12            Added                     Preview pages
-[preview] rice-copy.jpg          1            Previously seen           Open existing work
-          notes.txt              —            Unsupported type          Choose another file
-
-Processing [Local OCR] [Gemini extraction] [OCR + assisted structuring]
-Gemini extraction sends these images/PDFs to Google. Review happens locally.
-[Start extraction: 2 new files]      Advanced options ▾
-```
-
-Choose files/drop stages only accepted files after successful durable write. Duplicates do not inflate new-file count. Remove from batch removes membership, not original source/cache/history; no permanent-delete control. Before R4, existing pages remain honest placeholders, not this form pretending to work.
-
-Advanced options show configured routing/limits and capability validation. Local OCR copy explicitly says no cloud; assisted structuring says numbered OCR text may be sent. Missing Tesseract offers configure/help or eligible other mode. Save batch name/tag on commit; changing tag never alters imported history. Interrupted/partial staging retains accepted sources and points to failed files.
-
-## U2 — Active extraction
+## Returning-user first view
 
 ```text
-Recipe Importer        Uploads [active]       Review       Import & history
-Batch [Weeknight cookbook ▾]                                  [Add files]
------------------------------------------------------------------------------------
-Processing scans                              [Pause after current file]
-18 of 24 files processed      [======================--------]
-31 recipes available · 6 need attention        [Review available recipes]
+Upload
+Current batch: Sunday recipes · 27 files · 4 ready · 2 need attention
+[Add scans] [Resume extraction] [Open Review]
 
-Source                Processing result                        Next action
-cookbook.pdf          8 recipes found · 2 need review            Review recipes
-fried-rice.jpg        Ready to review                           Review
-bars.jpg              Text saved; needs structuring             Open source
-apples.jpg            Processing                                Details
-page-19.jpg           Waiting                                   —
------------------------------------------------------------------------------------
-Details ▾  Attempts, OCR method, model route, local counters, event log
+Files in this batch
+✓ page-01.jpg · 1 page · Ready to review
+… chapter-4.pdf · 18 pages · Reading selected ranges
+! page-19.png · Could not read file · Choose another file
+
+Extraction and cookbook ranges ▾
 ```
 
-Progress percentage uses known file count, not guessed recipe denominator. Completed sources can have mixed recipe states; clicking Review retains job in backend. Polling never starts jobs. Pause prevents scheduling after in-flight file(s) finish; worker count means more than one file may already be running, so show that fact rather than promising instant pause. Existing candidates/edits remain usable if network stops.
-
-## U3 — Paused / failure / completed states
+## First-use view
 
 ```text
-Processing paused — request allowance reached
-18 of 24 files processed. Your recipes and corrections are saved.
-[Review 31 available recipes]   [Resume when quota is available]   Details ▾
-Reset time not available. Other applications may share this provider allowance.
+Upload recipes
+Create a named batch to keep scans and progress together.
+[Batch name________________] [Optional Mealie tag____________]
+[Create batch]
+
+Add PDF, JPG, PNG, or WEBP scans
+[Choose files]  Files are saved independently; a rejected file does not discard others.
 ```
 
-Resume revalidates provider eligibility and unresolved scope; it does not blindly rotate models. Disabled resume explains prerequisite. A transient source error has **Try failed files again**, source path/title and safe next step; not-created candidates remain in source activity rather than disappearing from inventory.
+After creating/selecting a batch, show the source list and per-file accepted/rejected outcomes first. Keep each saved source and its preview available. Put extraction mode and cloud consent immediately before Start extraction. Show pause/resume and per-source/per-recipe status in the job area.
 
-```text
-Source needs attention — this scan could not be read
-No recipe was produced from page-19.jpg. Earlier recipes are unchanged.
-[Preview source]   [Try local OCR]   [Try extraction again]   Details ▾
-```
+Cookbook range selection stays a separate disclosure: original PDF, inclusive page bounds, overlap confirmation, selected range IDs, extraction method/consent, progress, and resume status. Keep the original immutable. A completed range can enter Review; the UI must continue to say that range import is disabled.
 
-Only offer supported recovery modes; cloud action repeats disclosure and preserves attempt lineage. “No recipe found” is reserved for a successful extraction that genuinely produced none.
+## Responsive and error states
 
-```text
-All 24 files processed
-38 recipes found · 32 to review · 6 need attention
-[Continue review]    See source results
-```
+- At narrow widths, batch selection, file outcomes, extraction controls, and progress stack in that order; keep file status and the safe next action visible without clipping.
+- Error copy identifies the specific file/action and what remains saved. A partial upload keeps valid siblings selectable.
+- A quota pause says work is paused and which unfinished ranges remain; it must not say the batch is complete.
+- Avoid raw source paths and full hashes in the normal page. Keep those under optional diagnostics.
 
-Completion means processing completed, not recipes approved/imported. Empty batch says Add files; filter-empty says Clear filters. A storage error preserves current accepted files and gives Retry save, not a fresh batch that duplicates staging.
+## User value and risk
 
-## U4 — Intentional re-extraction / identity compare (R5)
-
-```text
-Try a new extraction — cookbook.pdf
-Targets: Cranberry & Caramel Date Bars
-Protected siblings: Fried Rice (Imported), Lemon Cake (Ready to import)
-The whole PDF may be processed; protected recipe outcomes will be preserved.
-Earlier extraction, draft and decisions remain available.
-[Start new attempt] [Cancel]
-
-New results need matching
-Existing candidate                  New candidate                    Choice
-Cranberry & Caramel Date Bars        Date Bars                         [Same recipe ▾]
-Imported Fried Rice                 Fried Rice                        Protected / unchanged
-Unmatched                           Caramel Topping                    [Defer ▾]
-[Save mapping] [Cancel]
-```
-
-No array-position matching. Same title is not conclusive across ambiguous candidates. Mapping does not import/approve. Changed source bytes need a lineage relationship established explicitly; no automatic deduplication by recipe title. Save failure retains the comparison choices. Cancel leaves existing draft authoritative for continued review.
-
-## Keyboard / responsive requirements
-
-File picker is equivalent to drag/drop. Status updates announce whole contextual phrases without stealing focus. Batch/tag labels remain visible; file results use text. At narrow widths each file is a labeled stacked row and controls wrap; a single-column page scroll replaces a dense desktop table. No horizontal scroll for filenames/results; full name is discoverable to keyboard users. Check screenshot and DOM/keyboard evidence at R4/R5, not just AppTest uploader existence.
+Putting recent work first reduces time spent reopening a batch among hundreds of recipes. Separating ordinary sources from cookbook ranges prevents users from confusing their different processing controls. Regression risk is medium if controls are hidden: retain consent, duplicate/source integrity, pause/resume, partial-success and range-import gates in both layout and tests.

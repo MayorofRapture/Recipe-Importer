@@ -1,120 +1,119 @@
-# Recipe-Importer UI/UX audit
+# Recipe-Importer current UI/UX assessment
 
-Date: 2026-10-14. Baseline: `5df8558560ca7fd0bb9b2b24daf7573f4ad92e63`, branch `feature/m1-1-review-ui-redesign`.
+Date: 2026-10-25. Checkout: `feature/complete-recipe-workspace`, baseline `7249d193e04232c6eab9ca9dc4662e649c5aa908` plus the UX-0 accessibility and harness correction commit. This is a verification baseline, not release sign-off.
 
-This is an independent design assessment, not a UI release approval. Recommendations are proposals. No application changes, production artifact reads, or Gemini/Mealie calls were needed. `.env` was not opened. Historical batch counts are not current observations.
+## Verdict
 
-## Evidence and method
+**The three-workspace product is coherent in offline synthetic flows, while Review still spends too much viewport height above the editor and is too dense at 768px.** Keep the existing Upload -> Review -> Import & history workflow and its business rules. The Review layout redesign remains the next milestone; UX-0 corrected harness assumptions and restored focus after save/candidate navigation.
 
-| Evidence | Scope and confidence |
-| --- | --- |
-| `streamlit_app.py`, all four `app_pages/` modules; `ui_data.py`, `ui_contracts.py`, `ui_review_state.py`, `draft_store.py`, `quick_edit.py` | Current composition and local state behavior; high confidence in code findings, no rendered-layout claims. |
-| `import_recipes.py`, `recipe_quality.py`, `review_store.py`, `mealie_client.py`, `model_routing.py`, local OCR/structuring entry points | Ownership, payload, persistence, retry and review boundaries; code inspection, not live service verification. |
-| `README.md`, `.env.example`, `requirements.txt`, root `AGENTS.md` | Documented operations and constraints. Current runtime reports Streamlit 1.66.0; minimum requirement remains broader. |
-| `docs/UI_UX_Specification.md`, `docs/UI_Implementation_Roadmap.md`, `docs/wireframes/recipe-importer-primary-workflows.md`, M1.1 plan and verification | Prior intent and historical evidence; not proof of current usability. |
-| `tests/`, `tests/ui_fixture_factory.py`, fixture README | Existing coverage and sanitized scenarios. The fixture PDF is a text placeholder, not representative scan evidence. |
-| Fresh `python -m unittest discover -v` | **Verified: 91 tests passed**, zero failures, offline. Existing assertions miss important orchestration cases below. |
-| Temporary AppTest/read-model probes | Three reproducible failures described below; no production output touched. These are exploratory checks, not newly installed regression tests. |
-| Local Playwright capability check | **Blocked:** `npx.cmd --offline --package @playwright/cli playwright-cli --help` returned `ENOTCACHED`; Python Playwright also absent. No browser screenshots or focus/reflow measurements obtained. No dependencies installed. |
+The Upload title-field locator resolves the visible `Recipe title` input. At 320px, the collapsed navigation exposes an accessible `Expand sidebar` button and Review is reachable by keyboard. Browser inspection found an application focus defect: after Save draft and candidate navigation, focus returned to the document body. UX-0 restores focus to the recipe title field. Full screen-reader conformance, 200% text resizing, live Gemini, and installed Mealie behavior remain unverified. Phase 3B.6 remains **Conditional Pass**.
 
-Installed skill guidance reviewed: Superpowers/brainstorming/planning/verification, Ponytail, recipe-review-ux and its checklist, product-design-and-ux including AI uncertainty/handoff, project Streamlit guidance, UI/UX Pro Max, accessibility-audit, Playwright, design/design-system, brand and companion skill entry points. Slide/banner and React/Tailwind advice is unsuitable for this desktop editing task. UI/UX Pro Max's local search recommended a marketplace hero pattern; that generic result was rejected because document correction needs workspace, not discovery marketing. Native Streamlit API signatures were inspected locally before recommending menus, wrapping containers and navigation.
+## Evidence and limits
 
-## What works
-
-- The backend already separates source extraction, diagnostics, proposals, human decisions and Mealie outcomes. Keep that foundation.
-- Three native top destinations are shallow and understandable. Replacing navigation wholesale would add effort without fixing the actual review problems.
-- Quick Edit preserves ingredient lines and instruction blocks; structured editing supports precise individual corrections in principle. Both are valuable.
-- `DraftStore` appends durable records and performs flush/fsync; saves are separate from review events and source caches. `save_draft` reads back the record before reporting success.
-- Confirmed imported and uncertain recipes are protected in the UI. CLI processing skips imported/uncertain identities and repairs eligible tags separately.
-- Approve, save and import are distinct concepts. Pending suggestions and critical findings have an explicit visible approval gate.
-- End-of-queue does not wrap to the beginning. Error paths attempt to keep the current editing buffer available.
-- The test suite and local service boundaries make a gradual redesign feasible without live API writes.
-
-## The five most important problems
-
-### A01 — Approval does not identify the content that was approved
-
-**Priority P0; verified projection defect, code-verified CLI divergence.** `ui_data.load_catalog` determines approval from the existence of the latest whole-candidate decision. It then overlays a draft without checking whether the decision belongs to that draft. In a temporary fixture, approve Fried Rice, save different ingredients afterward, reload: status is still **Ready to import**.
-
-Separately, `_approve` writes a UI draft and records only whole-candidate `approved`. The CLI applies review events but never reads `ui_drafts.jsonl`. Thus the edited UI draft and recipe later constructed by the CLI can differ. This is a handoff integrity problem even though the UI currently cannot import.
-
-**Root cause:** approval is modeled as a boolean permission, rather than consent to a particular recipe revision. **Change:** pin approval to an exact immutable content snapshot/revision and extraction lineage; share its projection with CLI import. Any later content edit invalidates eligibility. Preserve the current ledgers with additive compatibility events, not a rewrite. R1 must prove edited UI content reaches the existing payload boundary and later edits do not inherit consent.
-
-### A02 — Durable drafts and proposal decisions compete for authority
-
-**Priority P0; verified with a temporary fixture.** Save Cranberry Date Bars while its proposal is pending; accept the quantity through `ReviewStore`; reload `load_catalog`: ingredients remain `dates, cranberries` and the proposal is pending again. `load_catalog` applies review decisions, then replaces the whole result with a saved candidate. `buffer_for` also retains an existing session buffer after newer decisions. Accepting a proposal can therefore appear ineffective or drift from what will eventually import.
-
-**Root cause:** a saved draft embeds review metadata and is allowed to replace newer decisions. **Change:** draft edits and decision authority need explicit precedence and revision checks. Replay decisions against their original extraction targets and merge only nonconflicting draft edits. If both changed the same field, show a conflict; do not select a winner silently. A critical diagnosis also needs an explicit resolution event; approving a proposal currently does not remove the UI's critical finding while the CLI filters approved fields separately.
-
-### A03 — Structured editing is unreliable and expensive
-
-**Priority P0 for correctness, P1 for efficiency.** Temporary AppTest: click the first **Move ingredient down** for Fried Rice. Expected `1 egg, 2 cups rice`; actual widget values and buffer remain `2 cups rice, 1 egg`. Keys use list indexes, and retained widget state writes old values into the reordered buffer on the next run. Delete/add and bulk-mode transitions carry related risks; those paths require regression tests rather than being assumed broken.
-
-Every structured row also has a number, editable field and three wide action buttons in five columns. This multiplies controls and tab stops for a recipe with 20 ingredients. Long steps receive an 80px text area. Title, yield and description have no editable controls; timing/temperature exist only inside strings, not supported metadata fields.
-
-**Root cause:** row position is doing the work of row identity, and row management is always visible. **Change:** stable UI row identifiers, a single explicit row menu, readable step editors, bulk-edit section mode, and supported metadata editing. Time/temperature remain source text unless an explicit backend schema extension is approved.
-
-### A04 — The source and editor lose out to navigation chrome
-
-**Priority P1; code-verified structure, usability hypothesis.** Before either pane the page renders a title/caption, bordered queue heading, four filter groups, navigation row, totals, recipe selector, divider, second title/status, action heading and five actions. Previous/next and recipe title are repeated. The Batch options are source hashes, so “batch” actually means a single source, not a human-named collection. `height=650` source/editor containers sit below this stack; no evidence shows they fit a 900px window.
-
-All findings appear after the two panes. Non-indexed suggestions are omitted in structured mode; its renderer only displays recognized ingredient/instruction row indexes. Multiple suggestions for the same row collapse into one dictionary entry. Source page input permits 1–100 regardless of actual page count and offers neither zoom nor evidence targeting.
-
-**Root cause:** independent forms were accumulated above a workspace instead of allocating the viewport around comparison. **Change:** one compact context line, one recipe header/action strip, two generous panes, queue drawer, actual page bounds, source zoom, field-local issues and a complete Issues view. The proposed wireframes replace the structure, not just widths.
-
-### A05 — This is not yet an end-to-end product, and the catalog hides some work
-
-**Priority P1; code verified.** Upload only links to Review. Import & history groups names with no actions, source identity, tag outcome or reconciliation. `load_catalog` builds rows from valid extraction caches; sources with no valid candidate and history records without a current cache are absent. A quota-exhausted file can therefore have no representation in Review. `TAG_FAILED` is normalized to Imported and its separate outcome is not surfaced by the history page.
-
-**Root cause:** the interface treats successful extraction as the inventory instead of tracking sources, recipes and outcomes separately. **Change:** source-level batch activity and recipe-level review queues; independent history sourced from the ledger; import preflight and separate create/tag/reconcile actions. Do not imply that the existing CLI orchestration is already a usable UI job service.
-
-## Additional findings
-
-| ID / priority | Current evidence and consequence | Recommendation / proof needed |
+| Evidence | What it establishes | Limit |
 | --- | --- | --- |
-| A06 / P1 | `Skip`, queue buttons, filters and recipe selection do not invoke durable save or a dirty guard. Session buffers help some navigation, but refresh/restart loses unsaved text. A saved cue appears only after clicking Save. | Save on committed field changes plus guarded transitions. State exactly when text is durable; never promise every keystroke autosave with native widgets. Test refresh, failed-save and cross-page navigation. |
-| A07 / P1 | `_approval_block_reason` checks critical findings/pending proposals but not the minimum recipe fields. Candidate approval readback checks only decision existence. | Shared backend validation and exact-revision readback; empty title/ingredients/instructions cannot pass. Failed/partial writes keep the same candidate selected. |
-| A08 / P1 | Catalog identity is source digest plus normalized original title. Duplicate titles within one source can collide; renamed extraction candidates can appear new. UI direct identity lookup can return a record before CLI ambiguity checking. | Keep existing IDs for established records, freeze identity during title edits, and route split/rename/duplicate ambiguity to explicit reconciliation. No title-similarity auto-match. |
-| A09 / P1 | A source preview image has alt text, but it says only “Recipe source page …”. It cannot make the scan readable to a screen reader. | Add separately labeled original OCR text when available, keyboard zoom/page controls and meaningful source context. OCR remains imperfect evidence. Requires rendered DOM/keyboard audit. |
-| A10 / P1 | Malformed ledger lines can raise from store constructors. `_load_caches` silently skips invalid caches; users may see an incomplete inventory with no explanation. | Show “Some local records could not be read”, preserve files, identify artifact category and safe recovery. Corrupted latest cache fallback must disclose use of an older attempt. Never hide uncertain import history. |
-| A11 / P2 | Every rerun parses caches and several ledgers, repeatedly scanning review decisions and state; source PDF rasterization repeats. | Cache previews by source hash/page/render scale; cache read-only projections by artifact revisions and invalidate after writes. Benchmark 1,000 recipes; avoid a rewrite or database until measurements justify one. |
-| A12 / P2 | Alerts/warnings repeat; `field_path` and full source hashes appear in ordinary controls. | Human labels, local issue summaries and optional technical Details. Keep provenance discoverable. |
+| `streamlit_app.py`, `app_pages/upload.py`, `app_pages/review.py`, `app_pages/import_history.py`, and current service/view-model boundaries | Current composition, visible controls, workflow ownership, and safety gates | Source inspection cannot establish rendered quality or accessibility-tree behavior |
+| Synthetic Upload -> Review -> Import journey in cached Chromium, device scale factor 1 | Review renders at 1920x1080, 1440x900, 768x900, and 320x900; accessible names, narrow navigation, focus after save, and document overflow inspected | The capture hides only fixture attestation and local output-path captions. Source/editor usability at 320px remains poor; screen-reader behavior was not tested |
+| `docs/wireframes/ui-redesign/evidence/browser-upload-partial-success-1440x900.png` and `browser-import-history-1440x900.png` | Upload partial acceptance and history after a synthetic fake-service journey | Earlier capture; synthetic data/services only, not live integration evidence |
+| `docs/remediation/2026-10-24-remediation-roadmap.md`, Phase 3B.6 | Compatibility results and recorded gates | Results apply to their documented SHA; UX-0 does not upgrade live-service or Mealie compatibility status |
+| GitHub PR #3 head after the roadmap-only documentation push | PR remained open and unmerged at baseline SHA `7249d193e04232c6eab9ca9dc4662e649c5aa908` | Current CI is reported separately for the exact pushed UX-0 SHA |
 
-## Architectural constraints and design consequences
+All recipes and uploaded files in screenshots are synthetic. No production `output/`, scan, `.env`, Gemini, or Mealie data was used. Capture hides the fixture attestation and local output-path captions. Normal app chrome still displays the selected local-library path; this remains a separate clutter/privacy finding for a later presentation fix.
 
-1. Streamlit reruns Python and input widgets commit on change/blur, not necessarily every keypress. Build an explicit committed-buffer save policy and flush focused inputs before navigation; verify in a browser. Widget state is not durable storage.
-2. Native columns/containers can supply two panes, forms and menus. A fixed action bar, precise focus restoration and pan/zoom may need a small scoped component or CSS. Those are gated feasibility experiments; no frontend framework migration is justified yet.
-3. Stores currently use locks per instance, not one process-wide/cross-process transaction. Multiple tabs and CLI/UI concurrent writers are not proven safe. R1 defines revision conflicts; job milestones require an explicit single-writer boundary.
-4. `process_file` mixes extraction, review and creation. It cannot simply be invoked from Import for selected approved recipes: the UI needs a narrow existing-business-logic service adapter with no surprise extraction or sibling import.
-5. The current model has `name`, ingredients, instructions, yield and description; no typed prep/cook time, oven temperature or page-to-field coordinate schema. Do not invent editable fields or highlights with no backing evidence.
-6. Different files containing the same recipe are not covered by exact-byte duplicate prevention. Show “Previously seen source” only when the digest matches; a similar title can prompt manual review but cannot claim a duplicate has been proven.
-7. Mealie behavior is code/documented expectation, not verified installed-release compatibility. No direct cookbook membership endpoint, server idempotency guarantee or dependable reconciliation lookup is assumed.
+## Workspace assessment
 
-## Accessibility evidence boundary
+### Upload and cookbook range selection
 
-No rendered markup or screenshot was available, so this is a Python source review, not a completed WCAG audit. Label text, image-alt argument and button labels exist; actual names/roles, contrast, focus order, traps, target dimensions, live announcements, zoom and reflow are **Unverified**. The “responsive” test checks literal container height/alt strings, not viewport behavior.
+The page supports named batches, optional batch tags, multiple local scan formats, per-file staging outcomes, extraction mode and consent, resumable job state, and cookbook PDF ranges. The first-time path starts with a batch form; the accepted types and independent file validation are visible. Partial success keeps valid files when another file is rejected. The staged files and job/range progress are understandable at desktop width.
 
-R2–R6 must retain a scoped accessibility-audit report against actual UI input. Test WCAG 2.2 SC 1.1.1, 1.3.1, 1.4.3, 1.4.4, 1.4.10, 1.4.11, 2.1.1, 2.1.2, 2.4.4, 2.4.6, 2.4.7, 2.4.11, 2.5.8, 3.2.2, 3.3.1, 3.3.2 and 4.1.2; authentication 3.3.8 is outside the initial local app. Add status announcement checks under 4.1.3. Screenshots alone cannot establish keyboard or programmatic relationships. No source-inspection inference is filed as a measured contrast or target-size failure.
+The page is long and combines batch setup, all staged files, file preview, extraction controls, job progress, and cookbook-range tooling in one vertical flow. A user returning to an existing batch has both “Create a batch” and “Select an existing batch” before the current work. Keep this compact for repeat use: visually prioritize the active batch, current source outcomes, and one next action; keep range setup in a clearly separate section. Do not imply that approved cookbook range candidates can be imported: that gate remains intentionally disabled.
 
-## Recommendation and validation order
+**First-time result:** understandable, though the upload-to-review continuity is mostly conveyed by status/copy and app navigation. **Repeat-use result:** batch switching and progress are available, but the user must scan a long page to find the relevant job or range.
 
-Address A01–A03 and approval completeness before changing appearance. Then inspect the two-pane review workspace with realistic synthetic scans, long instructions and 15 OCR artifacts. Stabilize this workflow before adding import, then upload/extraction. This sequence yields useful checkpoints for existing caches and avoids hiding integrity defects behind attractive screens.
+### Recipe Review and source comparison
 
-Success targets in the product document are hypotheses for future usability checks, not measured improvements. No participants were observed; no browser session was completed. Existing tests passing is valuable safety evidence, not evidence that review is fast or pleasant.
+Review has real queue controls, skip/back, a skipped list, source page and view controls, selectable source text, recipe title/details, ingredient and instruction tabs, row actions, bulk edit, issue/proposal review, durable Save draft, and separate Approve & next. This is a meaningful review workspace rather than the older placeholder described in the October 14 audit. Keep the source authority, saved draft/review authority, and approval gates.
 
-## Related deliverables
+Rendered observations:
 
-- [Product experience](UI_Product_Experience.md)
-- [Luna implementation roadmap](UI_Redesign_Roadmap.md)
-- [Wireframe index](wireframes/ui-redesign/README.md)
+| Viewport | Observed result | UX consequence |
+| --- | --- | --- |
+| 1920x1080 | Source and recipe panes remain readable. Save draft and Approve & next fit in the initial viewport. | Wide desktop is the strongest comparison layout. |
+| 1440x900 | Source and recipe panes begin near y=348. Save draft is at y=839; Approve & next begins around y=933 and is below the fold. | Approval needs a short scroll; the queue/navigation stack still uses substantial height. |
+| 768x900 | Panes remain side by side at about 280-350 CSS px. Save/Approve are below the initial viewport; source and controls are cramped. No document horizontal overflow. | The layout technically fits but reduces reading and editing comfort. |
+| 320x900 | The navigation is collapsed behind an accessible `Expand sidebar` button. Review is reachable by keyboard after expanding it. Source and recipe are not both comfortably usable in the initial viewport; the editor is a long scroll from source content. No document horizontal overflow. | Navigation works, but source comparison remains inefficient. Defer the layout correction to the next milestone. |
 
-The new documents propose replacing prior UX/layout decisions after approval. Prior specs, plans and historical verification remain intact as evidence; their commit instructions do not override the current no-commit constraint.
+Review is optimized around a queue but not yet around sustained comparison. The controls above the panes compete with the recipe work. Issue and proposal context is lower in the page than the field it affects, so users can miss relevant evidence during a correction. Row-level Actions are repeated for every ingredient and step. The source can be read via source text, but the page selector/source view and editor are separate controls with no field-to-source anchor. Do not add spatial highlights unless OCR coordinates are available and validated.
 
-## Design-package completion checks
+**Save / Approve / Import:** these actions are separate and correctly labeled. Save draft is durable draft storage; Approve & next records review authority; Import belongs to the third workspace. Preserve that separation and make saved/approved status persistent in the compact recipe header.
 
-- **Verified:** 8 new documentation/wireframe files; 30 local links/HTML anchors resolve; UTF-8 content reads cleanly; static board has no remote assets or scripts.
-- **Verified:** independent builder review returned no blocking questions after adding evidence-backed OCR-artifact removal and missing-source approval rules. These are proposed design decisions, not implemented behavior.
-- **Verified:** targeted `python -m compileall -q streamlit_app.py app_pages ui_data.py ui_contracts.py ui_review_state.py draft_store.py review_store.py recipe_quality.py import_recipes.py tests` and `python import_recipes.py --help` both exited 0.
-- **Verified:** `git diff --check`, plus `git -c core.autocrlf=false diff --no-index --check -- NUL <file>` for each new untracked document. Ordinary Git diff does not inspect untracked content; the extra check covers it without staging.
-- **Verified:** tracked application files have no diff; no commit/push/merge performed. Git status reports pre-existing permission warnings for three temporary directories; those directories were neither accessed nor changed.
-- **Blocked / Unverified:** Playwright capability check described above; no real rendered screenshots, accessibility conformance, usability measurements or live-service integration claimed. AppTest probes do not substitute for those checks.
+### Import and history
+
+Import & history now has an approved-recipe selection, tag choice, preview/import preflight, and independent search/paginated history with outcomes and provenance. It explains that approval in Review is required before import. This repairs the old audit's claim that this destination was only a placeholder. Preserve the separate creation/tag/reconciliation outcomes and protected uncertain results.
+
+The page combines a consequential import preflight with long-lived history. Make the visual boundary between these tasks clearer and keep history discoverable without suggesting that an old entry is eligible for a new POST. Range candidates remain excluded. No Mealie request was made in this assessment, so payload compatibility and live outcome handling are not visually or functionally verified here.
+
+## Findings by category
+
+### Confirmed application behavior correction
+
+**Focus restoration after Save draft and candidate navigation.** Before UX-0, Chromium showed `document.body` as active after save and queue selection. The UI now restores focus to the recipe title field after these transitions. Real-browser assertions cover both paths; review/import authority is unchanged.
+
+### Confirmed UX/accessibility defects
+
+1. **P1 ? The app prints the full local library path in page chrome.** `streamlit_app.py` emits it as ordinary caption text rather than an optional diagnostic. Replace it with short library status and keep diagnostics opt-in.
+2. **P1 ? Review does not protect the comparison canvas at 768px or 320px.** Side-by-side panes shrink at 768px. At 320px the collapsed menu is operable, but source and recipe are not both comfortably usable in the initial viewport. Switch to a labeled Source/Recipe view below a measured width; keep two panes on wide screens.
+3. **P1 ? Approve & next falls below the fold at 1440?900.** Save draft is at y=839 and Approve & next begins around y=933. A compact action strip and shorter top stack would reduce the scroll needed to approve.
+4. **P2 ? Repeated row menus increase tab stops and visual noise.** Retain keyboard reachability while reducing the repeated controls.
+5. **P2 ? Issue/proposal context can be far from its editable field.** Keep a concise issue summary near the affected field and expandable evidence; never visually merge an unverified proposal into recipe text.
+
+The priority labels describe user friction, not formal WCAG conformance. Screenshots do not prove accessible relationships, contrast in every state, keyboard operation, live announcements, or screen-reader behavior.
+
+### Browser harness findings
+
+- The current Upload journey finds `Recipe title` through its accessible label, edits it, and verifies the saved value after reload. The former timeout is stale; no application title-field defect was found.
+- The old 320px driver attempted a hidden navigation anchor at x=-272. Chromium exposes a named `Expand sidebar` button. The harness now opens the navigation, targets only controls intersecting the viewport, and reaches Review by keyboard. The app navigation was operable; the negative-coordinate click was a harness defect.
+- Save/Approve accessible names are verified in the Chromium accessibility tree. The focus ring is present on keyboard-focused Save draft. Focus is restored after a durable save and candidate change.
+
+### Accessibility verification ledger
+
+**Verified in the tested states:** no document horizontal overflow at 320px, 768px, 1440px, and 1920px; the accessibility tree exposes `Recipe title`, `Save draft`, and `Approve & next` with textbox/button roles; keyboard navigation opens the 320px menu and reaches Review; Tab reaches Save draft in eight steps from the Recipe title field; computed focus ring is visible; focus returns to the selected recipe title after save and queue navigation.
+
+**Unverified:** full keyboard-only completion across every control; keyboard activation of Save/Approve (the local CDP driver traverses to these controls, but its Enter dispatch did not activate Save reliably); complete name/role/value inspection; error announcements; image alternative quality across source types; contrast across all states; 200% text resize; and screen-reader behavior.
+
+Do not call the UI WCAG-conformant from this baseline. Before a release claim, complete the project accessibility review against current DOM, 200% text, error and focus states, and a full keyboard-only journey. Screen-reader validation was not performed.
+
+## Five highest-impact improvements
+
+| Rank | Change | User benefit | Current behavior affected | Complexity | Regression risk |
+| --- | --- | --- | --- | --- | --- |
+| 1 | Give Review a viewport-first desktop layout and source/editor switch at narrow widths | Faster correction with less scrolling; readable source at 768px | Pane stack begins below navigation controls; side-by-side remains at 768px | Medium | Medium: pane state, focus, tabs, and dirty edits across mode changes |
+| 2 | Keep Save, Approve & next, and saved/approved state in a compact reachable header/action strip | Fewer trips to the bottom of long recipes; clearer interruption recovery | Actions render in the editor flow and can be below the 900px fold | Medium | High: preserve exact-revision approval and save semantics |
+| 3 | Put issue/proposal context next to the affected field | Less context switching and lower chance of applying the wrong proposal | Issues/proposals are separated from some editable rows | Medium | High: suggestion must stay visibly unverified until explicit human action |
+| 4 | Remove path/hash from the default page chrome | Less clutter and less local filesystem detail exposed | Header caption repeats full resolved library location | Small | Low: keep a discoverable diagnostics path for troubleshooting |
+| 5 | Separate active import preflight from searchable historical outcomes | Easier to find new approved work without confusing it with protected past attempts | One long page contains both preflight and history | Small to medium | High: history must never imply authorization to retry a protected attempt |
+
+## Sanitized screenshot set
+
+Open the [annotated current Review captures](wireframes/ui-redesign/current-state-review-annotations.html). These PNGs use isolated synthetic data at device scale factor 1. The browser capture temporarily hides the synthetic fixture attestation and local output-path captions; no screenshot contains local filesystem metadata.
+
+- [Review - 1920x1080](wireframes/ui-redesign/evidence/ux0-review-1920x1080.png)
+- [Review - 1440x900](wireframes/ui-redesign/evidence/ux0-review-1440x900.png)
+- [Review - 768x900](wireframes/ui-redesign/evidence/ux0-review-768x900.png)
+- [Review - 320x900](wireframes/ui-redesign/evidence/ux0-review-320x900.png)
+- [Upload - 1440x900 partial acceptance](wireframes/ui-redesign/evidence/browser-upload-partial-success-1440x900.png)
+- [Import & history - 1440x900 synthetic history](wireframes/ui-redesign/evidence/browser-import-history-1440x900.png)
+
+The screenshots show the current rendered app. The separate wireframe pages remain proposals and are not implementation artifacts.
+
+## Release readiness gaps — separate from visual design
+
+- **Live Gemini:** unverified. Provider credentials/model availability, latency, quotas, and real upload behavior were not exercised.
+- **Installed Mealie compatibility:** unverified. No live create, tag, reconciliation, or installed-version contract check was performed.
+- **Cookbook range import:** intentionally disabled. Do not enable it in the redesign; it requires separately authorized controlled rollout and compatibility evidence.
+- **Browser/accessibility:** UX-0 baseline captured. The Upload locator and 320px Review navigation work in synthetic Chromium; full keyboard completion, 200% text, broad contrast/error-state coverage, and screen-reader behavior remain unverified.
+- **Offline functional gate:** Phase 3B.6 Conditional Pass at `c22757d`; see [remediation roadmap](remediation/2026-10-24-remediation-roadmap.md). This design assessment does not upgrade that status.
+
+## Scope boundary
+
+UX-0 changed only the Review focus handoff and browser verification harness. It did not change review/import authority, candidate identities, extraction behavior, Mealie compatibility, histories, scans, or production output. `.vscode/` and `graphify-out/` remain untouched. No live service was contacted. The Review layout redesign has not started.
