@@ -47,6 +47,8 @@ Review is optimized around a queue but not yet around sustained comparison. The 
 
 **Save / Approve / Import:** these actions are separate and correctly labeled. Save draft is durable draft storage; Approve & next records review authority; Import belongs to the third workspace. Preserve that separation and make saved/approved status persistent in the compact recipe header.
 
+**Unsaved work:** the synthetic browser journey saved a draft, reloaded the page, and verified the edited title was restored. AppTest coverage verifies that a dirty buffer remains selected when a navigation save conflicts and that approval is blocked while the buffer is unsaved. UX-0 did not simulate a browser-level storage conflict or interrupted process.
+
 ### Import and history
 
 Import & history now has an approved-recipe selection, tag choice, preview/import preflight, and independent search/paginated history with outcomes and provenance. It explains that approval in Review is required before import. This repairs the old audit's claim that this destination was only a placeholder. Preserve the separate creation/tag/reconciliation outcomes and protected uncertain results.
