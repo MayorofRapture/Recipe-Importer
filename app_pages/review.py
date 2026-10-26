@@ -356,6 +356,12 @@ def _navigation_context() -> dict:
         "review_queue", "review_search", "review_source", "review_status", "review_page")}
 
 
+def _request_recipe_title_focus() -> None:
+    st.session_state.review_focus_request = int(
+        st.session_state.get("review_focus_request", 0)
+    ) + 1
+
+
 def _advance_queue(direction: int) -> None:
     if "review_selection" in st.session_state:
         st.session_state.review_pending_advance = direction
@@ -516,6 +522,7 @@ def _save(view, buffer, advance: bool) -> None:
         "message": message,
     }
     st.session_state.review_active_selection = view.candidate_id
+    _request_recipe_title_focus()
     if record.revision == view.revision and advance:
         _advance_queue(1)
     st.rerun()
@@ -557,6 +564,7 @@ def _approve(view, buffer, *, approval_method: str = "source_verified",
         else:
             st.error(f"Approval was not saved. Your current text remains on screen: {exc}")
         return
+    _request_recipe_title_focus()
     _advance_queue(1)
 
 
@@ -867,6 +875,7 @@ def main() -> None:
             _render_queue(views, queue_page)
             st.info("The selected recipe is outside this queue. Adjust the filters to return to it.")
             return
+    previous_active_selection = st.session_state.get("review_active_selection")
     st.session_state.review_queue_ids = ids
     st.session_state.review_all_queue_ids = queue_page["all_ids"]
     view = verify_selected_source(next(v for v in candidates if v.candidate_id == selected_id))
@@ -877,6 +886,8 @@ def main() -> None:
     buffer = buffer_for(view)
     sync_buffer(view, buffer)
     st.session_state.review_active_selection = selected_id
+    if previous_active_selection and previous_active_selection != selected_id:
+        _request_recipe_title_focus()
     if not quality_audit_mode:
         save_resume_pointer(view, buffer)
         _queue_state().record_visit(selected_id, view.candidate.name, _navigation_context())
@@ -1558,6 +1569,17 @@ def _render_editor_fragment(view, buffer) -> None:
         else:
             st.caption(state["message"])
     _render_editor(view, buffer)
+    focus_request = st.session_state.pop("review_focus_request", None)
+    if focus_request is not None:
+        st.html(
+            f"<!-- review focus request {int(focus_request)} -->"
+            "<script>(() => { let attempts=0; const restore=() => { "
+            "const target=document.querySelector('input[aria-label=\"Recipe title\"]'); "
+            "if (target && document.activeElement !== target) target.focus({ preventScroll: true }); "
+            "if (++attempts < 4 && document.activeElement !== target) requestAnimationFrame(restore); "
+            "}; requestAnimationFrame(() => requestAnimationFrame(restore)); })();</script>",
+            unsafe_allow_javascript=True,
+        )
     if diagnostics is not None:
         with st.expander("Performance counters", expanded=True):
             st.caption(runtime_marker(st.context.url))

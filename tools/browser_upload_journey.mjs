@@ -6,6 +6,7 @@ import { mkdtemp, readFile, rm, mkdir, writeFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { assertBrowserFixtureAttestation, rejectArbitraryUrl,
   prepareEvidenceDirectory, startIsolatedBrowserFixture } from './browser_fixture_runner.mjs';
+import { rectIntersectsViewport } from './browser_dom_helpers.mjs';
 
 function arg(name, fallback = undefined) {
   const prefix = `--${name}=`;
@@ -56,8 +57,11 @@ async function waitFor(cdp, expression, description, timeout = 30000) {
 async function clickText(cdp, text, selector = 'button,a,[role="button"]') {
   const box = await evaluate(cdp, `(() => {
     const match=[...document.querySelectorAll(${JSON.stringify(selector)})].find(e=>{
-      const r=e.getBoundingClientRect(), value=(e.innerText||e.getAttribute('aria-label')||'').replace(/\\s+/g,' ').trim();
-      return r.width>0 && r.height>0 && value.includes(${JSON.stringify(text)});
+      const value=(e.getAttribute('aria-label')||e.innerText||'').replace(/\\s+/g,' ').trim();
+      if (!value.includes(${JSON.stringify(text)}) || !e.getClientRects().length) return false;
+      e.scrollIntoView({block:'center',inline:'nearest'});
+      const r=e.getBoundingClientRect();
+      return r.width>0 && r.height>0 && (${rectIntersectsViewport.toString()})(r,innerWidth,innerHeight);
     });
     match?.scrollIntoView({block:'center', inline:'nearest'});
     if(!match)return null; const r=match.getBoundingClientRect(); return {x:r.x+r.width/2,y:r.y+r.height/2,text:match.innerText.trim(),disabled:match.disabled,scrollY};
@@ -70,6 +74,21 @@ async function clickText(cdp, text, selector = 'button,a,[role="button"]') {
   await sleep(300);
   console.error(`Browser URL after click: ${await evaluate(cdp, 'location.href')}`);
   return box.text;
+}
+async function tabToControl(cdp, accessibleName, limit = 60) {
+  const trail = [];
+  for (let index = 0; index < limit; index += 1) {
+    await key(cdp, 'Tab', 'Tab', 9);
+    const focus = await evaluate(cdp, `(() => {
+      const e=document.activeElement;
+      return {tag:e?.tagName||'',role:e?.getAttribute('role')||'',label:e?.getAttribute('aria-label')||'',
+        text:(e?.innerText||'').replace(/\\s+/g,' ').trim(),visible:!!e?.getClientRects().length};
+    })()`);
+    trail.push(focus);
+    if (focus.visible && (focus.label === accessibleName || focus.text === accessibleName
+        || (focus.tag === 'A' && focus.text.includes(accessibleName)))) return trail;
+  }
+  throw new Error(`Keyboard Tab did not reach ${JSON.stringify(accessibleName)}; focus trail=${JSON.stringify(trail)}.`);
 }
 async function fillByLabel(cdp, label, value) {
   const box = await evaluate(cdp, `(() => {
@@ -93,15 +112,29 @@ async function chooseFiles(cdp, paths) {
   await cdp.send('DOM.setFileInputFiles', { nodeId: node.nodeId, files: paths });
 }
 async function screenshot(cdp, name) {
+  const replacedName = name.replace(/\d+x\d+/, `${viewport[0]}x${viewport[1]}`);
+  await evaluate(cdp, `(() => {
+    window.__ux0SanitizedCaptions=[];
+    for(const e of document.querySelectorAll('[data-testid="stCaptionContainer"]')){
+      if(/^(Isolated browser fixture:|Local application library:)/.test(e.innerText.trim())){
+        window.__ux0SanitizedCaptions.push([e,e.style.visibility]);e.style.visibility='hidden';
+      }
+    }
+    return window.__ux0SanitizedCaptions.length;
+  })()`);
   const image = await cdp.send('Page.captureScreenshot', { format: 'png', captureBeyondViewport: false });
-  const path = join(evidence, name);
+  await evaluate(cdp, `(() => {for(const [e,value] of window.__ux0SanitizedCaptions)e.style.visibility=value;delete window.__ux0SanitizedCaptions})()`);
+  const path = join(evidence, replacedName);
   await mkdir(evidence, { recursive: true });
   await writeFile(path, Buffer.from(image.data, 'base64'));
   return path;
 }
 async function key(cdp, value, code, vk, modifiers = 0) {
-  await cdp.send('Input.dispatchKeyEvent', { type: 'keyDown', key: value, code, windowsVirtualKeyCode: vk, modifiers });
-  await cdp.send('Input.dispatchKeyEvent', { type: 'keyUp', key: value, code, windowsVirtualKeyCode: vk, modifiers });
+  const event = { key: value, code, windowsVirtualKeyCode: vk, nativeVirtualKeyCode: vk, modifiers };
+  if (value === 'Enter') event.text = '\r';
+  if (value === ' ') event.text = ' ';
+  await cdp.send('Input.dispatchKeyEvent', { ...event, type: 'keyDown' });
+  await cdp.send('Input.dispatchKeyEvent', { ...event, type: 'keyUp' });
 }
 
 const profile = await mkdtemp(join(fixture.root, 'browser-profile-'));
@@ -157,19 +190,68 @@ try {
   await waitFor(cdp, `/Extraction is complete/.test(document.body.innerText)`, 'synthetic background extraction');
   artifacts.push(await screenshot(cdp, 'upload-complete-1440x900.png'));
 
-  await clickText(cdp, 'Review', 'a,button,[role="tab"],[role="button"]');
+  if (viewport[0] <= 480) {
+    await tabToControl(cdp, 'Expand sidebar');
+    await key(cdp, ' ', 'Space', 32);
+    await waitFor(cdp, `!![...document.querySelectorAll('a')].find(e=>e.innerText.includes('Review')&&e.getBoundingClientRect().right>0)`,
+      'narrow navigation links become visible');
+    await tabToControl(cdp, 'Review');
+    await key(cdp, 'Enter', 'Enter', 13);
+  } else {
+    await clickText(cdp, 'Review', 'a,button,[role="tab"],[role="button"]');
+  }
   await waitFor(cdp, `([...document.querySelectorAll('input')].some(e=>e.value.includes('Synthetic demo from synthetic-recipe')) || document.body.innerText.includes('Synthetic demo from synthetic-recipe')) && /Save draft/.test(document.body.innerText)`, 'review candidate');
+  if (viewport[0] <= 480) {
+    await tabToControl(cdp, 'Collapse sidebar');
+    await key(cdp, ' ', 'Space', 32);
+    await waitFor(cdp, `!document.querySelector('button[aria-label="Collapse sidebar"]')`, 'narrow navigation closed after selection');
+  }
+  const reviewAX = await cdp.send('Accessibility.getFullAXTree');
+  const reviewNames = (reviewAX.nodes||[]).filter(node=>['textbox','button'].includes(node.role?.value))
+    .map(node=>({role:node.role.value,name:node.name?.value||''}));
+  for (const name of ['Recipe title','Save draft','Approve & next']) {
+    if (!reviewNames.some(node=>node.name===name)) throw new Error(`Review accessibility tree is missing ${JSON.stringify(name)}.`);
+  }
+  console.error(`Review accessible control names verified at ${viewport.join('x')}: ${JSON.stringify(reviewNames.filter(node=>['Recipe title','Save draft','Approve & next'].includes(node.name)))}`);
+  const reviewBaseline = await evaluate(cdp, `(() => {
+    const box=e=>{if(!e)return null;const r=e.getBoundingClientRect();return {x:Math.round(r.x),y:Math.round(r.y),right:Math.round(r.right),bottom:Math.round(r.bottom),width:Math.round(r.width),height:Math.round(r.height)}};
+    const inViewport=r=>!!r&&r.x>=0&&r.y>=0&&r.right<=innerWidth&&r.bottom<=innerHeight;
+    const title=document.querySelector('input[aria-label="Recipe title"]');
+    const save=[...document.querySelectorAll('button')].find(e=>e.innerText.trim()==='Save draft');
+    const approve=[...document.querySelectorAll('button')].find(e=>e.innerText.trim()==='Approve & next');
+    const sourceHeading=[...document.querySelectorAll('h1,h2,h3,h4,div')].find(e=>e.innerText.trim()==='Source scan · synthetic-recipe.png');
+    const navButton=document.querySelector('button[aria-label="Expand sidebar"],button[aria-label="Collapse sidebar"]');
+    return {viewport:{width:innerWidth,height:innerHeight,documentWidth:document.documentElement.scrollWidth,scrollX,scrollY},
+      navigation:{buttonName:navButton?.getAttribute('aria-label')||'',button:box(navButton),
+        reviewLink:[...document.querySelectorAll('a')].find(e=>e.innerText.includes('Review'))?box([...document.querySelectorAll('a')].find(e=>e.innerText.includes('Review'))):null},
+      recipeTitle:box(title),saveDraft:{box:box(save),visibleWithoutScrolling:inViewport(box(save))},
+      approve:{box:box(approve),visibleWithoutScrolling:inViewport(box(approve))},sourceHeading:box(sourceHeading)};
+  })()`);
   artifacts.push(await screenshot(cdp, 'review-candidate-1440x900.png'));
   await fillByLabel(cdp, 'Recipe title', 'Synthetic demo from synthetic-recipe reviewed');
+  const saveFocusTrail = await tabToControl(cdp, 'Save draft');
+  const focusedSave = await evaluate(cdp, `(() => {const e=document.activeElement,s=getComputedStyle(e);return {
+    tag:e?.tagName,text:(e?.innerText||'').trim(),visible:!!e?.getClientRects().length,
+    outlineStyle:s.outlineStyle,outlineWidth:s.outlineWidth,outlineColor:s.outlineColor,boxShadow:s.boxShadow
+  }})()`);
   await clickText(cdp, 'Save draft');
   await waitFor(cdp, `/Draft saved \\(revision 1\\)/.test(document.body.innerText)`, 'durable draft revision');
+  await waitFor(cdp, `document.activeElement?.getAttribute('aria-label')==='Recipe title'`, 'focus restored to recipe title after Save draft');
+  const focusAfterSave = await evaluate(cdp, `(() => {const e=document.activeElement;return {tag:e?.tagName||'',label:e?.getAttribute('aria-label')||'',text:(e?.innerText||'').trim(),visible:!!e?.getClientRects().length}})()`);
+  if (focusAfterSave.label !== 'Recipe title') {
+    throw new Error(`Save draft did not restore focus to Recipe title; focused element=${JSON.stringify(focusAfterSave)}.`);
+  }
   await fillByLabel(cdp, 'Recipe title', 'Synthetic demo from synthetic-recipe final edit');
   await key(cdp, 'Enter', 'Enter', 13);
   await waitFor(cdp, `!/Draft saved \\(revision 1\\)/.test(document.body.innerText)`, 'unsaved edit clears saved confirmation');
   await clickText(cdp, 'Save draft');
   await waitFor(cdp, `/Draft saved \\(revision 2\\)/.test(document.body.innerText)`, 'second durable draft revision');
+  await waitFor(cdp, `document.activeElement?.getAttribute('aria-label')==='Recipe title'`, 'focus restored after second Save draft');
   await clickText(cdp, 'Save draft');
   await waitFor(cdp, `/Draft already saved \\(revision 2\\)/.test(document.body.innerText)`, 'no-op save confirmation');
+  await waitFor(cdp, `(() => {const e=document.activeElement;return e?.getAttribute('aria-label')==='Recipe title'||
+    (e?.tagName==='BUTTON'&&e.innerText.trim()==='Save draft')})()`, 'focus remains on Save draft or returns to Recipe title after no-op save');
+  const focusAfterNoOpSave = await evaluate(cdp, `(() => {const e=document.activeElement;return {tag:e?.tagName||'',label:e?.getAttribute('aria-label')||'',text:(e?.innerText||'').trim()}})()`);
   const priorDocumentStart = await evaluate(cdp, 'performance.timeOrigin');
   await cdp.send('Page.reload');
   await waitFor(cdp, `performance.timeOrigin>${priorDocumentStart}`, 'browser reload completion');
@@ -178,7 +260,18 @@ try {
   await clickText(cdp, 'Approve & next');
   await waitFor(cdp, `/You.ve reached the end|queue is clear|No recipes match these filters|Open Import & history/.test(document.body.innerText)`, 'explicit approval');
 
-  await clickText(cdp, 'Import & history', 'a,button,[role="tab"],[role="button"]');
+  if (viewport[0] <= 480) {
+    await clickText(cdp, 'Expand sidebar', 'button');
+    await waitFor(cdp, `!![...document.querySelectorAll('a')].find(e=>e.innerText.includes('Import & history')&&e.getBoundingClientRect().right>0)`,
+      'narrow Import and history link becomes visible');
+    await clickText(cdp, 'Import & history', 'a,button,[role="tab"],[role="button"]');
+  } else {
+    await clickText(cdp, 'Import & history', 'a,button,[role="tab"],[role="button"]');
+  }
+  if (viewport[0] <= 480) {
+    await waitFor(cdp, `location.pathname.includes('import-history')`, 'navigation to Import and history');
+    await clickText(cdp, 'Collapse sidebar', 'button');
+  }
   await waitFor(cdp, `/Ready to import/.test(document.body.innerText) && /Select all eligible recipes/.test(document.body.innerText)`, 'approved recipe import controls');
   await clickText(cdp, 'Select all eligible recipes');
   await waitFor(cdp, `/Synthetic demo from synthetic-recipe/.test(document.body.innerText)`, 'approved recipe selected for import');
@@ -192,7 +285,10 @@ try {
   artifacts.push(await screenshot(cdp, 'import-history-1440x900.png'));
 
   const accessible = await evaluate(cdp, `(() => ({
-    title:document.title, url:location.href, viewport:{width:innerWidth,height:innerHeight,documentWidth:document.documentElement.scrollWidth,
+        title:document.title, url:location.href, reviewBaseline:${JSON.stringify(reviewBaseline)},
+        keyboardSaveFocus:{tabSteps:${saveFocusTrail.length},control:${JSON.stringify(focusedSave)}},
+        focusAfterSave:${JSON.stringify(focusAfterSave)}, focusAfterNoOpSave:${JSON.stringify(focusAfterNoOpSave)},
+        viewport:{width:innerWidth,height:innerHeight,documentWidth:document.documentElement.scrollWidth,
       horizontalOverflow:document.documentElement.scrollWidth>innerWidth},
     headings:[...document.querySelectorAll('h1,h2,h3,h4')].map(e=>({level:e.tagName,text:e.innerText.trim()})),
     controls:[...document.querySelectorAll('button,input,textarea,[role="combobox"],a')].map(e=>{

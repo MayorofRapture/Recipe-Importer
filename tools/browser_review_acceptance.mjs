@@ -62,6 +62,13 @@ async function browserDiagnostics(cdp) {
       }));
     return {
       selectedTitle: title,
+      focus: (() => { const element = document.activeElement; return {
+        tag: element?.tagName || null,
+        label: element?.getAttribute('aria-label') || null,
+        value: element?.value || null,
+        text: (element?.innerText || '').trim().slice(0, 80),
+        visible: !!element?.getClientRects().length,
+      }; })(),
       actionContext: ${JSON.stringify(activeContext)},
       activeTabs: [...document.querySelectorAll('[role="tab"][aria-selected="true"]')]
         .filter(visible).map((element) => element.innerText.trim()),
@@ -426,6 +433,10 @@ try {
   await waitFor(cdp, `!!document.querySelector('input[aria-label="Jump to recipe"]')`, 'recipe queue controls');
   await clickComboOption(cdp, 'Jump to recipe', candidate);
   const cranberryId = await waitForCandidateSelected(cdp, fixture, candidate);
+  await waitFor(cdp, `document.activeElement?.getAttribute('aria-label')==='Recipe title'`, 'focus restored after candidate navigation');
+  const candidateFocus = await evaluate(cdp, `(() => {const e=document.activeElement;return {tag:e?.tagName||'',label:e?.getAttribute('aria-label')||'',value:e?.value||''}})()`);
+  if (candidateFocus.label !== 'Recipe title') throw new Error(`Candidate navigation did not restore focus to Recipe title: ${JSON.stringify(candidateFocus)}.`);
+  evidence.focusAfterCandidateNavigation = candidateFocus;
   await ensureExpanderOpen(cdp, 'Issues and source notes');
   await clickVisibleText(cdp, 'Ingredients', '[role="tab"]');
   await assertActiveCandidate(cdp, fixture, candidate, { tab: 'Ingredients', revision: 0 });
@@ -504,6 +515,8 @@ try {
   evidence.screenshots.push(await screenshot(cdp, 'browser-review-ready-to-approve-1440x900.png'));
   await clickVisibleText(cdp, 'Approve & next');
   await waitFor(cdp, `document.body.innerText.includes('Imported')||document.querySelector('input[aria-label="Recipe title"]')?.value!==${JSON.stringify('Fried Rice')}`, 'approval navigation');
+  await waitFor(cdp, `(() => {const title=[...document.querySelectorAll('input[aria-label="Recipe title"]')].find(e=>e.getClientRects().length);return !!title?.value&&document.activeElement===title})()`, 'focus follows the selected recipe after Approve & next candidate navigation');
+  evidence.focusAfterApprovalNavigation = await evaluate(cdp, `(() => {const e=document.activeElement;return {tag:e?.tagName||'',label:e?.getAttribute('aria-label')||'',value:e?.value||''}})()`);
   const reviewEvents = (await readFile(join(fixture.output, 'review_events.jsonl'), 'utf8'))
     .split(/\r?\n/).filter(Boolean).map((line) => JSON.parse(line));
   const approval = reviewEvents.findLast((event) => event.event === 'review_approval' && event.candidate_id === friedRiceId);

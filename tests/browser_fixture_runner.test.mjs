@@ -14,6 +14,7 @@ import {
   rejectArbitraryUrl,
   startIsolatedBrowserFixture,
 } from '../tools/browser_fixture_runner.mjs';
+import { rectIntersectsViewport } from '../tools/browser_dom_helpers.mjs';
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const projectTemp = path.join(projectRoot, '.test-tmp');
@@ -77,6 +78,12 @@ test('write-capable harnesses reject caller URLs before launch', () => {
   assert.throws(() => rejectArbitraryUrl(['--url=http://127.0.0.1:8501']), /not accepted/);
   assert.throws(() => rejectArbitraryUrl(['--url']), /not accepted/);
   assert.doesNotThrow(() => rejectArbitraryUrl(['--evidence-dir=synthetic']));
+});
+
+test('browser click targets must intersect the viewport', () => {
+  assert.equal(rectIntersectsViewport({ left: 0, top: 0, right: 20, bottom: 20 }, 320, 900), true);
+  assert.equal(rectIntersectsViewport({ left: -280, top: 78, right: -264, bottom: 106 }, 320, 900), false);
+  assert.equal(rectIntersectsViewport({ left: 320, top: 0, right: 340, bottom: 20 }, 320, 900), false);
 });
 
 test('browser evidence stays in project temp storage and rejects production paths', async (t) => {
