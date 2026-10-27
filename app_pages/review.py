@@ -798,7 +798,23 @@ def main() -> None:
         "{padding-top: .25rem !important; padding-bottom: .5rem !important;} "
         "[data-testid='stMainBlockContainer'] > div[data-testid='stVerticalBlock'] "
         "{gap: .5rem !important;} [data-testid='stMainBlockContainer'] h1 "
-        "{font-size: 1.25rem !important; line-height: 1.3 !important; margin: 0 !important;}</style>",
+        "{font-size: 1.25rem !important; line-height: 1.3 !important; margin: 0 !important;} "
+        ".st-key-review-pane-switcher {display:none;} "
+        "@media (max-width: 900px) {"
+        ".st-key-review-pane-switcher {display:block;} "
+        ".st-key-review_workspace [data-testid='stHorizontalBlock']:has(.st-key-review_source_pane) "
+        "{display:flex; flex-direction:column; gap:.5rem;} "
+        "[data-testid='stAppViewContainer']:has(.st-key-review-pane-switcher [role='radio'][aria-checked='true']:first-of-type) "
+        ".st-key-review_workspace [data-testid='stColumn']:has(.st-key-review_recipe_pane), "
+        "[data-testid='stAppViewContainer']:has(.st-key-review-pane-switcher [role='radio'][aria-checked='true']:nth-of-type(2)) "
+        ".st-key-review_workspace [data-testid='stColumn']:has(.st-key-review_source_pane) "
+        "{display:none !important;} "
+        "[data-testid='stAppViewContainer']:has(.st-key-review-pane-switcher [role='radio'][aria-checked='true']:first-of-type) "
+        ".st-key-review_workspace [data-testid='stColumn']:has(.st-key-review_source_pane), "
+        "[data-testid='stAppViewContainer']:has(.st-key-review-pane-switcher [role='radio'][aria-checked='true']:nth-of-type(2)) "
+        ".st-key-review_workspace [data-testid='stColumn']:has(.st-key-review_recipe_pane) "
+        "{flex:1 1 100% !important; width:100% !important; min-width:0 !important;} "
+        "}</style>",
         unsafe_allow_html=True,
     )
 
@@ -821,6 +837,9 @@ def main() -> None:
     _apply_pending_queue_change(views)
     _apply_pending_blocker_jump(views)
     st.session_state.setdefault("review_selection", views[0].candidate_id)
+    st.session_state.setdefault("review_workspace_view", "Source")
+    if st.session_state.review_workspace_view not in {"Source", "Recipe"}:
+        st.session_state.review_workspace_view = "Source"
     if st.session_state.get("review_transition_error"):
         st.error(st.session_state.pop("review_transition_error"))
     if st.session_state.get("review_filter_restore_notice"):
@@ -893,7 +912,10 @@ def main() -> None:
         _queue_state().record_visit(selected_id, view.candidate.name, _navigation_context())
     all_ids = queue_page["all_ids"]
     position = all_ids.index(selected_id) + 1
-    st.title("Review")
+    st.markdown(f"### {view.candidate.name or 'Untitled recipe'}")
+    saved_label = (f"Unsaved changes · saved revision {view.revision}"
+                   if buffer_is_dirty(view, buffer) else f"Saved revision {view.revision}")
+    st.caption(saved_label)
     st.caption(f"{view.status} · {position} of {len(all_ids)}")
     if view.range_provenance:
         provenance = view.range_provenance
@@ -909,17 +931,15 @@ def main() -> None:
         st.warning("Read-only until this recipe’s Mealie outcome is reconciled.")
         if st.session_state.get("review_protected_target") == view.candidate_id:
             st.info("This prior or uncertain Mealie outcome protects the recipe from approval and another create request. Use Import history to reconcile it.")
-    workspace_view = _render_actions(view, buffer)
-    if workspace_view == "Source":
-        _render_source(view, buffer)
-    elif workspace_view == "Recipe":
-        _render_editor_fragment(view, buffer)
-    else:
+    _render_actions(view, buffer)
+    with st.container(key="review_workspace"):
         source, editor = st.columns([0.9, 1.1], gap="medium")
         with source:
-            _render_source(view, buffer)
+            with st.container(key="review_source_pane"):
+                _render_source(view, buffer)
         with editor:
-            _render_editor_fragment(view, buffer)
+            with st.container(key="review_recipe_pane"):
+                _render_editor_fragment(view, buffer)
     _render_ingredient_repair(view, buffer)
     _render_findings(view, buffer)
     _render_identity_resolution(view, views)
@@ -1626,8 +1646,6 @@ def _render_editor(view, buffer) -> None:
             _render_structured_section(view, buffer, "ingredients")
         if tabs[1].open:
             _render_structured_section(view, buffer, "instructions")
-        if st.button("Save draft", key=f"save:{view.candidate_id}", width="stretch"):
-            _save(view, buffer, advance=False)
         if buffer_is_dirty(view, buffer):
             st.caption("Unsaved changes · use Save draft to keep these edits.")
         render_suggestion_summary(st, view.candidate.suggestions)
@@ -1640,9 +1658,6 @@ def _render_editor(view, buffer) -> None:
                 st, blockers,
                 on_jump=lambda anchor, code: _jump_to_blocker(anchor, view.candidate_id, code),
             )
-        if st.button("Approve & next", key=f"approve:{view.candidate_id}", disabled=bool(blockers),
-                     type="primary", width="stretch"):
-            _approve(view, buffer)
 
 
 def _remember_recipe_section(candidate_id: str) -> None:
@@ -1697,14 +1712,31 @@ def _queue_choice_changed() -> None:
         st.session_state.review_selection = requested
 
 
-def _render_actions(view, buffer) -> str:
-    with st.popover("Options"):
-        workspace_view = st.radio("Workspace view", ["Side by side", "Source", "Recipe"],
-                                  key="review_workspace_view")
+def _render_actions(view, buffer) -> None:
+    with st.container(key="review-pane-switcher"):
+        st.segmented_control(
+            "Review pane", ["Source", "Recipe"], key="review_workspace_view",
+        )
+    with st.container(horizontal=True, vertical_alignment="center"):
+        if not view.protected and st.button(
+                "Save draft", key=f"save:{view.candidate_id}", width="stretch"):
+            _save(view, buffer, advance=False)
+        candidate, _warnings = candidate_from_buffer(view, buffer)
+        blockers = _approval_blockers(view, candidate)
+        if not view.protected and st.button(
+                "Approve & next", key=f"approve:{view.candidate_id}",
+                disabled=bool(blockers), type="primary", width="stretch"):
+            _approve(view, buffer)
+    if blockers:
+        st.warning(f"Approval blocked: {blockers[0].label}", icon=":material/lock:")
+    if not view.source_verified or not view.source_available:
+        st.warning(
+            "Original source unavailable. Review the current recipe carefully before using manual approval.",
+            icon=":material/find_in_page:",
+        )
     state = st.session_state.get("review_save_state")
     if isinstance(state, str) and state:
         st.caption(state)
-    return workspace_view
 
 
 def _render_navigation(view) -> None:

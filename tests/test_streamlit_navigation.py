@@ -29,7 +29,7 @@ class StreamlitNavigationTests(unittest.TestCase):
                 app = AppTest.from_file(str(APP_PATH)).run(timeout=10)
 
         self.assertFalse(app.exception)
-        self.assertTrue(any(item.value == "Review" for item in app.title))
+        self.assertTrue(any("Fried Rice" in item.value for item in app.markdown))
         self.assertTrue(any("Ready to review · 1 of" in item.value for item in app.caption))
         self.assertTrue(any(button.label == "Back" for button in app.button))
         self.assertTrue(any(button.label.startswith("Skipped recipes (") for button in app.button))
@@ -41,7 +41,7 @@ class StreamlitNavigationTests(unittest.TestCase):
         self.assertTrue({"Show", "Source file", "Status", "Jump to recipe"}.issubset(
             {item.label for item in app.selectbox}))
         self.assertTrue({"Page", "Source view"}.issubset({item.label for item in app.selectbox}))
-        self.assertIn("Workspace view", [item.label for item in app.radio])
+        self.assertIn("Review pane", [item.label for item in app.get("segmented_control")])
 
 
 if __name__ == "__main__":

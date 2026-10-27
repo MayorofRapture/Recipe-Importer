@@ -28,14 +28,16 @@ try:
 except (FixtureModeError, LibraryPathConflict) as exc:
     st.error(str(exc), icon=":material/lock:")
     st.stop()
-st.caption(f"Local application library: {application_library}")
+st.caption("Using the selected local library.")
 alternate_library = alternate_cwd_library(application_library)
-if alternate_library:
-    st.warning(
-        f"Another populated library exists at {alternate_library}. This app is using "
-        f"{application_library}; set RECIPE_IMPORTER_OUTPUT_DIR to select the other library. "
-        "Libraries are never merged or moved automatically."
-    )
+with st.expander("Library troubleshooting"):
+    st.caption(f"Selected library: {application_library}")
+    if alternate_library:
+        st.warning(
+            f"Another populated library exists at {alternate_library}. This app is using "
+            f"{application_library}; set RECIPE_IMPORTER_OUTPUT_DIR to select the other library. "
+            "Libraries are never merged or moved automatically."
+        )
 
 if "initial_destination" not in st.session_state:
     library = application_library

@@ -102,6 +102,62 @@ class StreamlitReviewTests(unittest.TestCase):
         self.assertFalse(app.exception)
         self.assertTrue(any("Save draft" in button.label for button in app.button))
 
+    def test_narrow_workspace_switch_preserves_recipe_and_source_state(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = write_ui_fixture(Path(tmp))
+            with patch.dict(os.environ, {
+                "RECIPE_IMPORTER_OUTPUT_DIR": str(fixture["output"]),
+                "RECIPE_IMPORTER_SOURCE_DIR": str(Path(tmp, "sources")),
+            }, clear=False):
+                app = AppTest.from_file(str(APP_PATH)).run(timeout=10)
+                app = next(item for item in app.selectbox if item.label == "Jump to recipe").set_value(
+                    "Fried Rice").run(timeout=10)
+                ingredient = next(item for item in app.text_input if item.label == "Ingredient 1")
+                app = ingredient.set_value("3 cups freshly edited rice").run(timeout=10)
+                app = next(item for item in app.selectbox if item.label == "Page").set_value(2).run(timeout=10)
+                app = next(item for item in app.selectbox if item.label == "Source view").set_value("Inspect").run(timeout=10)
+
+                app = app.get("segmented_control")[0].set_value("Recipe").run(timeout=10)
+                self.assertEqual(app.session_state["review_workspace_view"], "Recipe")
+                self.assertEqual(app.session_state["review_buffers"][app.session_state["review_selection"]]
+                                 ["structured_ingredients"][0], "3 cups freshly edited rice")
+                self.assertTrue(any(item.label == "Ingredient 1" and item.value == "3 cups freshly edited rice"
+                                    for item in app.text_input))
+
+                app = app.get("segmented_control")[0].set_value("Source").run(timeout=10)
+                self.assertEqual(app.session_state["review_workspace_view"], "Source")
+                candidate_id = app.session_state["review_selection"]
+
+        self.assertFalse(app.exception)
+        self.assertEqual(app.session_state[f"page:{candidate_id}"], 2)
+        self.assertEqual(app.session_state[f"zoom:{candidate_id}"], "Inspect")
+        self.assertEqual(app.session_state[f"recipe_sections:{candidate_id}"], "Ingredients")
+
+    def test_header_approve_saves_the_latest_editor_value_as_approved_revision(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = write_ui_fixture(Path(tmp))
+            with patch.dict(os.environ, {
+                "RECIPE_IMPORTER_OUTPUT_DIR": str(fixture["output"]),
+                "RECIPE_IMPORTER_SOURCE_DIR": str(Path(tmp, "sources")),
+            }, clear=False):
+                app = AppTest.from_file(str(APP_PATH)).run(timeout=10)
+                app = next(item for item in app.selectbox if item.label == "Jump to recipe").set_value(
+                    "Fried Rice").run(timeout=10)
+                app = next(item for item in app.text_input if item.label == "Ingredient 1").set_value(
+                    "4 cups latest rice edit").run(timeout=10)
+                app = next(item for item in app.button if item.label == "Approve & next").click().run(timeout=10)
+
+            events_path = Path(fixture["output"]) / "review_events.jsonl"
+            events = [json.loads(line) for line in events_path.read_text(encoding="utf-8").splitlines()]
+            revision = next(event for event in events if event.get("event") == "review_revision"
+                            and event.get("recipe", {}).get("name") == "Fried Rice")
+            approval = next(event for event in events if event.get("event") == "review_approval"
+                            and event.get("candidate_id") == revision["candidate_id"])
+
+        self.assertFalse(app.exception)
+        self.assertEqual(revision["recipe"]["ingredients"][0], "4 cups latest rice edit")
+        self.assertEqual(approval["revision"], revision["revision"])
+
     def test_save_draft_writes_authoritative_revision_event(self):
         with tempfile.TemporaryDirectory() as tmp:
             fixture = write_ui_fixture(Path(tmp))

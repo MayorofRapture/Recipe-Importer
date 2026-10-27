@@ -17,6 +17,7 @@ const candidate = arg('candidate', 'Cranberry & Caramel Date Bars');
 const evidenceArg = arg('evidence-dir');
 const editValue = arg('edited-value', '10 bars');
 const instructionValue = arg('instructions', 'Combine the ingredients.\n\nBake until set.');
+const viewportWidth = Number(arg('inspect-width', '1440'));
 const executable = resolve(arg('executable', join(process.env.LOCALAPPDATA || '', 'ms-playwright',
   'chromium_headless_shell-1200', 'chrome-headless-shell-win64', 'chrome-headless-shell.exe')));
 if (!evidenceArg) {
@@ -73,6 +74,9 @@ async function browserDiagnostics(cdp) {
       activeTabs: [...document.querySelectorAll('[role="tab"][aria-selected="true"]')]
         .filter(visible).map((element) => element.innerText.trim()),
       queueAndFilters: controls,
+      paneChoices: [...document.querySelectorAll('[role="radio"]')].filter(visible)
+        .map((element) => ({ text: element.innerText.trim(), checked: element.getAttribute('aria-checked'),
+          selected: element.getAttribute('aria-pressed'), tabIndex: element.tabIndex })),
       visibleActions: [...document.querySelectorAll('button')].filter(visible)
         .map((element) => ({ label: element.getAttribute('aria-label') || element.innerText.trim(),
           disabled: element.disabled })).filter((item) => item.label).slice(-18),
@@ -213,6 +217,18 @@ async function clickVisibleText(cdp, text, selector = 'button,a,[role="button"]'
   await evaluate(cdp, 'new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))');
   console.error(`Clicked ${JSON.stringify({ text: point.text, x: Math.round(point.x), y: Math.round(point.y) })}`);
 }
+async function clickPane(cdp, text) {
+  const activated = await evaluate(cdp, `(() => {
+    const e=[...document.querySelectorAll('.st-key-review-pane-switcher [role="radio"]')]
+      .find(option=>option.innerText.trim()===${JSON.stringify(text)});
+    if(!e)return false; e.scrollIntoView({block:'center',inline:'nearest'}); e.focus(); e.click(); return true;
+  })()`);
+  if (!activated) throw new Error(`Could not find the ${text} pane option.`);
+  await evaluate(cdp, 'new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))');
+  await waitFor(cdp, `!![...document.querySelectorAll('.st-key-review-pane-switcher [role="radio"]')].find(e=>e.innerText.trim()===${JSON.stringify(text)}&&e.getAttribute('aria-checked')==='true')`, `${text} pane selection`);
+  const focusedWithinSwitcher = await evaluate(cdp, `document.querySelector('.st-key-review-pane-switcher')?.contains(document.activeElement)===true`);
+  if (!focusedWithinSwitcher) throw new Error(`Focus did not remain with the Review pane switcher after choosing ${text}.`);
+}
 async function pressKey(cdp, key, code, windowsVirtualKeyCode) {
   await cdp.send('Input.dispatchKeyEvent', { type: 'keyDown', key, code, windowsVirtualKeyCode });
   await cdp.send('Input.dispatchKeyEvent', { type: 'keyUp', key, code, windowsVirtualKeyCode });
@@ -286,6 +302,22 @@ async function clickComboOption(cdp, label, optionText) {
   await waitFor(cdp, `!![...document.querySelectorAll('[role="option"]')].find(e=>e.innerText.includes(${JSON.stringify(optionText)}))`, `${label} option ${optionText}`);
   await clickVisibleText(cdp, optionText, '[role="option"]');
 }
+async function selectNextComboOption(cdp, label, expectedValue) {
+  await evaluate(cdp, `(() => { const element=document.querySelector('input[aria-label='+${JSON.stringify(JSON.stringify(label))}+']'); element?.focus(); return !!element; })()`);
+  await pressKey(cdp, 'ArrowDown', 'ArrowDown', 40);
+  await pressKey(cdp, 'Enter', 'Enter', 13);
+  await waitFor(cdp, `document.querySelector('input[aria-label='+${JSON.stringify(JSON.stringify(label))}+']')?.value===${JSON.stringify(expectedValue)}`, `${label} set to ${expectedValue}`);
+}
+async function selectPreviousComboOption(cdp, label, expectedValue) {
+  await evaluate(cdp, `(() => { const element=document.querySelector('input[aria-label='+${JSON.stringify(JSON.stringify(label))}+']'); element?.focus(); return !!element; })()`);
+  await pressKey(cdp, 'ArrowUp', 'ArrowUp', 38);
+  await pressKey(cdp, 'Enter', 'Enter', 13);
+  await waitFor(cdp, `document.querySelector('input[aria-label='+${JSON.stringify(JSON.stringify(label))}+']')?.value===${JSON.stringify(expectedValue)}`, `${label} set to ${expectedValue}`);
+  if (label === 'Page') {
+    const pageNumber = Number(expectedValue.split(' ')[0]);
+    await waitFor(cdp, `!!document.querySelector('img[alt="Recipe source page ${pageNumber}"]')`, `${label} preview rendered on page ${pageNumber}`);
+  }
+}
 async function fillLabel(cdp, label, value) {
   const point = await evaluate(cdp, `(() => {
     const e=[...document.querySelectorAll('input,textarea')].find(x=>x.getAttribute('aria-label')===${JSON.stringify(label)}||[...(x.labels||[])].some(l=>l.innerText.trim()===${JSON.stringify(label)}));
@@ -306,8 +338,92 @@ async function screenshot(cdp, name) {
   return path;
 }
 
+async function verifyResponsiveLayout(cdp, evidence) {
+  const layouts = [];
+  for (const { width, height } of [
+    { width: 1920, height: 1080 }, { width: 1440, height: 900 },
+    { width: 768, height: 900 }, { width: 320, height: 900 },
+  ]) {
+    await cdp.send('Emulation.setDeviceMetricsOverride', { width, height, deviceScaleFactor: 1, mobile: false });
+    await evaluate(cdp, 'window.scrollTo(0,0)');
+    await waitFor(cdp, `innerWidth===${width}&&document.documentElement.scrollWidth<=innerWidth`, `${width}px layout without horizontal overflow`);
+    const layout = await evaluate(cdp, `JSON.stringify((() => {
+      const pane=(name)=>{const e=document.querySelector('.st-key-review_'+name+'_pane'),r=e?.getBoundingClientRect();return {visible:!!e?.getClientRects().length,width:r?.width||0,left:r?.left||0,right:r?.right||0}};
+      const action=(label)=>{const e=[...document.querySelectorAll('button')].find(x=>x.innerText.trim()===label);const r=e?.getBoundingClientRect();return {visible:!!e?.getClientRects().length,top:r?.top??null,bottom:r?.bottom??null,disabled:e?.disabled??null}};
+      const switcher=document.querySelector('.st-key-review-pane-switcher');
+      return {width:innerWidth,scrollWidth:document.documentElement.scrollWidth,scrollY,source:pane('source'),recipe:pane('recipe'),switcherVisible:!!switcher?.getClientRects().length,save:action('Save draft'),approve:action('Approve & next')};
+    })())`);
+    const state = JSON.parse(layout);
+    if (width > 900) {
+      if (!state.source.visible || !state.recipe.visible || state.switcherVisible) throw new Error(`Wide comparison layout failed at ${width}px: ${layout}`);
+      if (state.source.width < 480 || state.recipe.width < 600) throw new Error(`Wide pane widths are too small at ${width}px: ${layout}`);
+    } else if (!state.source.visible || state.recipe.visible || !state.switcherVisible) {
+      throw new Error(`Narrow Source layout failed at ${width}px: ${layout}`);
+    }
+    if (!state.save.visible || !state.approve.visible || state.save.bottom > height || state.approve.bottom > height) {
+      throw new Error(`Save/Approve are outside the initial ${width}x${height} viewport: ${layout}`);
+    }
+    layouts.push(state);
+    evidence.screenshots.push(await screenshot(cdp, `d1-review-source-${width}x${height}.png`));
+    if (width <= 900) {
+      if (width === 768) {
+        await selectNextComboOption(cdp, 'Page', '2 of 2');
+        await selectNextComboOption(cdp, 'Source view', 'Inspect');
+      }
+      await clickPane(cdp, 'Recipe');
+      await waitFor(cdp, `!![...document.querySelectorAll('input[aria-label="Recipe title"]')].find(e=>e.getClientRects().length)`, `${width}px Recipe pane`);
+      await clickVisibleText(cdp, 'Ingredients', '[role="tab"]');
+      await waitFor(cdp, `!![...document.querySelectorAll('input[aria-label="Ingredient 1"]')].find(e=>e.getClientRects().length)`, `${width}px ingredient editor`);
+      await fillLabel(cdp, 'Ingredient 1', `responsive draft ${width}`);
+      await waitFor(cdp, `([...document.querySelectorAll('input[aria-label="Ingredient 1"]')].find(e=>e.getClientRects().length))?.value===${JSON.stringify(`responsive draft ${width}`)}`, `${width}px ingredient text entered`);
+      await pressKey(cdp, 'Tab', 'Tab', 9);
+      await waitFor(cdp, `document.body.innerText.includes('Unsaved changes')`, `${width}px editor draft state`);
+      await clickPane(cdp, 'Source');
+      await waitFor(cdp, `!document.querySelector('.st-key-review_recipe_pane')?.getClientRects().length`, `${width}px Source pane restored`);
+      await clickPane(cdp, 'Recipe');
+      await waitFor(cdp, `(() => {const input=[...document.querySelectorAll('input[aria-label="Ingredient 1"]')].find(e=>e.getClientRects().length);return input?.value===${JSON.stringify(`responsive draft ${width}`)}})()`, `${width}px unsaved edit restored`);
+      const retainedEdit = await evaluate(cdp, `document.querySelector('input[aria-label="Ingredient 1"]')?.value`);
+      const instructionsSelected = await evaluate(cdp, `[...document.querySelectorAll('[role="tab"][aria-selected="true"]')].some(e=>e.innerText.trim()==='Instructions')`);
+      if (!instructionsSelected) await clickVisibleText(cdp, 'Instructions', '[role="tab"]');
+      await clickPane(cdp, 'Source');
+      await waitFor(cdp, `!![...document.querySelectorAll('input[aria-label="Page"]')].find(e=>e.getClientRects().length)`, `${width}px Source pane after tab round trip`);
+      const retainedSource = await evaluate(cdp, `JSON.stringify({page:[...document.querySelectorAll('input[aria-label="Page"]')].find(e=>e.getClientRects().length)?.value,zoom:[...document.querySelectorAll('input[aria-label="Source view"]')].find(e=>e.getClientRects().length)?.value})`);
+      await clickPane(cdp, 'Recipe');
+      await waitFor(cdp, `!![...document.querySelectorAll('input[aria-label="Recipe title"]')].find(e=>e.getClientRects().length)`, `${width}px Recipe pane after tab round trip`);
+      await waitFor(cdp, `!![...document.querySelectorAll('[role="tab"][aria-selected="true"]')].find(e=>e.innerText.trim()==='Instructions')`, `${width}px recipe section restored`);
+      const retainedState = { ...JSON.parse(retainedSource), tab: await evaluate(cdp, `[...document.querySelectorAll('[role="tab"][aria-selected="true"]')].map(e=>e.innerText.trim())`) };
+      retainedState.edit = retainedEdit;
+      if (retainedState.page !== '2 of 2' || retainedState.zoom !== 'Inspect' || retainedState.edit !== `responsive draft ${width}` || !retainedState.tab.includes('Instructions')) {
+        throw new Error(`Narrow pane switch lost state at ${width}px: ${JSON.stringify(retainedState)}`);
+      }
+      evidence.screenshots.push(await screenshot(cdp, `d1-review-recipe-${width}x${height}.png`));
+      await clickPane(cdp, 'Source');
+      await waitFor(cdp, `!![...document.querySelectorAll('input[aria-label="Page"]')].find(e=>e.getClientRects().length)`, `${width}px Source pane before next viewport`);
+      layouts.at(-1).retainedPaneState = retainedState;
+    }
+  }
+  evidence.responsiveLayouts = layouts;
+  await cdp.send('Emulation.setDeviceMetricsOverride', { width: 1440, height: 900, deviceScaleFactor: 1, mobile: false });
+  await selectPreviousComboOption(cdp, 'Page', '1 of 2');
+  await selectPreviousComboOption(cdp, 'Source view', 'Fit');
+  await evaluate(cdp, 'window.scrollTo(0,0)');
+  await evaluate(cdp, `document.documentElement.style.fontSize='200%'`);
+  await waitFor(cdp, `document.documentElement.scrollWidth<=innerWidth`, '200 percent root text resize without horizontal overflow');
+  const resized = await evaluate(cdp, `JSON.stringify({width:innerWidth,scrollWidth:document.documentElement.scrollWidth,rootFont:getComputedStyle(document.documentElement).fontSize,save:[...document.querySelectorAll('button')].find(e=>e.innerText.trim()==='Save draft')?.getBoundingClientRect().toJSON(),approve:[...document.querySelectorAll('button')].find(e=>e.innerText.trim()==='Approve & next')?.getBoundingClientRect().toJSON()})`);
+  evidence.textResize200Percent = JSON.parse(resized);
+  evidence.screenshots.push(await screenshot(cdp, 'd1-review-text-200-percent.png'));
+  await evaluate(cdp, `document.documentElement.style.fontSize=''`);
+}
+
 const profile = await mkdtemp(join(fixture.root, 'browser-profile-'));
 let browser;
+async function stopBrowser() {
+  if (browser && browser.exitCode === null) {
+    browser.kill();
+    await Promise.race([new Promise((resolveClose) => browser.once('close', resolveClose)), sleep(5000)]);
+  }
+  await rm(profile, { recursive: true, force: true }).catch(() => {});
+}
 try {
   browser = spawn(executable, [
     '--headless=new', '--disable-gpu', '--disable-dev-shm-usage', '--disable-background-networking',
@@ -332,15 +448,49 @@ try {
   await new Promise((resolveOpen, reject) => { ws.addEventListener('open', resolveOpen, { once: true }); ws.addEventListener('error', reject, { once: true }); });
   const cdp = new CDP(ws);
   await cdp.send('Page.enable'); await cdp.send('Runtime.enable');
-  await cdp.send('Emulation.setDeviceMetricsOverride', { width: 1440, height: 900, deviceScaleFactor: 1, mobile: false });
+  await cdp.send('Emulation.setDeviceMetricsOverride', { width: viewportWidth, height: 900, deviceScaleFactor: 1, mobile: false });
   const navigationStarted = Date.now();
   await cdp.send('Page.navigate', { url });
-  await waitFor(cdp, `document.readyState==='complete'&&!!document.querySelector('[data-testid="stApp"]')&&[...document.querySelectorAll('input[aria-label="Recipe title"]')].some(e=>e.getClientRects().length)`, 'initial Review editor', 45000);
+  const initialPaneReady = viewportWidth <= 900
+    ? `!!document.querySelector('.st-key-review_source_pane')?.getClientRects().length`
+    : `[...document.querySelectorAll('input[aria-label="Recipe title"]')].some(e=>e.getClientRects().length)`;
+  await waitFor(cdp, `document.readyState==='complete'&&!!document.querySelector('[data-testid="stApp"]')&&(${initialPaneReady})`, 'initial Review pane', 45000);
   await waitFor(cdp, `(()=>{const i=[...document.images].find(x=>x.alt.startsWith('Recipe source page'));return !!i&&i.complete&&i.naturalWidth>100&&![...document.querySelectorAll('[data-testid*="skeleton" i],[class*="skeleton" i')].length})()`, 'settled source scan and editor', 60000);
   await assertBrowserFixtureAttestation(cdp, fixture);
+  await evaluate(cdp, `(() => { const caption=[...document.querySelectorAll('[data-testid="stCaptionContainer"]')].find(e=>e.innerText.startsWith('Isolated browser fixture:')); if(caption)caption.style.display='none'; })()`);
+  if (viewportWidth <= 900) {
+    const initialPanes = await evaluate(cdp, `JSON.stringify(['source','recipe'].map(name=>{const e=document.querySelector('.st-key-review_'+name+'_pane');return {name,visible:!!e?.getClientRects().length,width:e?.getBoundingClientRect().width||0}}))`);
+    if (arg('inspect') === 'true') console.log(`Initial narrow panes: ${initialPanes}`);
+    await clickPane(cdp, 'Recipe');
+    await waitFor(cdp, `!![...document.querySelectorAll('input[aria-label="Recipe title"]')].find(e=>e.getClientRects().length)`, 'narrow Recipe pane');
+  }
   const friedRiceId = await assertActiveCandidate(cdp, fixture, 'Fried Rice', { revision: 0 });
   const timings = { firstReviewSettledMs: Date.now() - navigationStarted };
   const evidence = { screenshots: [await screenshot(cdp, 'browser-review-after-precise-1440x900.png')], timings };
+  if (arg('inspect') === 'true') {
+    if (viewportWidth <= 900) {
+      await fillLabel(cdp, 'Ingredient 1', 'probe edit');
+      await pressKey(cdp, 'Tab', 'Tab', 9);
+      await waitFor(cdp, `document.body.innerText.includes('Unsaved changes')`, 'fragment edit buffer refresh');
+      await sleep(500);
+      await clickPane(cdp, 'Source');
+      await sleep(1000);
+    }
+    console.log(JSON.stringify(await evaluate(cdp, `JSON.stringify({scrollY,body:document.body.innerText.slice(0,2400),paneChoices:[...document.querySelectorAll('[role="radio"]')].map(e=>({text:e.innerText.trim(),checked:e.getAttribute('aria-checked'),pressed:e.getAttribute('aria-pressed'),tabIndex:e.tabIndex,className:e.className})),wrapperClasses:[...document.querySelectorAll('[class*="review_workspace"]')].map(e=>e.className),overflow:{width:innerWidth,scrollWidth:document.documentElement.scrollWidth},panes:['source','recipe'].map(name=>{const e=document.querySelector('.st-key-review_'+name+'_pane');const r=e?.getBoundingClientRect();return {name,visible:!!e?.getClientRects().length,width:r?.width,left:r?.left,right:r?.right,display:e?getComputedStyle(e).display:null,parentDisplay:e?getComputedStyle(e.parentElement).display:null}}),actions:[...document.querySelectorAll('button')].filter(e=>['Save draft','Approve & next'].includes(e.innerText.trim())).map(e=>({label:e.innerText.trim(),visible:!!e.getClientRects().length,top:e.getBoundingClientRect().top,bottom:e.getBoundingClientRect().bottom})),controls:[...document.querySelectorAll('input,textarea,button,[role="tab"]')].map(e=>({tag:e.tagName,role:e.getAttribute('role'),aria:e.getAttribute('aria-label'),text:e.innerText?.trim().slice(0,80),value:e.value?.slice(0,100),disabled:e.disabled})).filter(x=>x.aria||x.text)})`), null, 2));
+    await screenshot(cdp, `browser-review-inspect-${viewportWidth}.png`);
+    ws.close(); await stopBrowser();
+    await fixture.close();
+    process.exit(0);
+  }
+  if (arg('skip-responsive') !== 'true') {
+    await verifyResponsiveLayout(cdp, evidence);
+    if (arg('responsive-only') === 'true') {
+      console.log(JSON.stringify(evidence, null, 2));
+      ws.close(); await stopBrowser();
+      await fixture.close();
+      process.exit(0);
+    }
+  }
   const firstSourceText = await evaluate(cdp, `(() => {
     const sections=[...document.querySelectorAll('[data-testid="stText"]')]
       .filter(element=>element.getClientRects().length).map(element=>element.innerText.trim());
@@ -349,7 +499,10 @@ try {
   const firstSource = JSON.parse(firstSourceText || '{}');
   if (!firstSource.body || !firstSource.sections.some(text=>text.includes('Fried Rice')&&text.includes('Cook rice.'))
       || firstSource.sections.some(text=>text.includes('The Best Caramel Apples'))) {
-    throw new Error(`Source text did not show only the selected source page: ${JSON.stringify(firstSource)}.`);
+    throw new Error(`Source text did not show only the selected source page: ${JSON.stringify({firstSource,
+      browser:await browserDiagnostics(cdp),visibleSourceControls:await evaluate(cdp, `JSON.stringify([...document.querySelectorAll('input[aria-label="Page"],input[aria-label="Source view"]')].map(e=>({label:e.getAttribute('aria-label'),value:e.value,visible:!!e.getClientRects().length})))`),
+      selectedPane:await evaluate(cdp, `JSON.stringify([...document.querySelectorAll('.st-key-review-pane-switcher [role="radio"]')].map(e=>({text:e.innerText.trim(),checked:e.getAttribute('aria-checked')})))`),
+      body:await evaluate(cdp, `document.body.innerText.slice(-1200)`)})}.`);
   }
   evidence.sourceTextStyleAudit = await evaluate(cdp, `(() => {
     const color=(value)=>{const m=value.match(/rgba?\\((\\d+),\\s*(\\d+),\\s*(\\d+)/);return m?m.slice(1,4).map(Number):null};
@@ -397,13 +550,6 @@ try {
   await pressKey(cdp, 'Enter', 'Enter', 13);
   await waitFor(cdp, `(() => [...document.querySelectorAll('[data-testid="stText"]')]
     .filter(e=>e.getClientRects().length).some(e=>e.innerText.includes('Cook rice.')))()`, 'return to source page one');
-  if (arg('inspect') === 'true') {
-    console.log(JSON.stringify(await evaluate(cdp, `JSON.stringify({body:document.body.innerText.slice(0,2400),controls:[...document.querySelectorAll('input,textarea,button,[role="tab"]')].map(e=>({tag:e.tagName,role:e.getAttribute('role'),aria:e.getAttribute('aria-label'),text:e.innerText?.trim().slice(0,80),value:e.value?.slice(0,100),disabled:e.disabled})).filter(x=>x.aria||x.text)})`), null, 2));
-    ws.close(); browser.kill(); await sleep(150); await rm(profile, { recursive: true, force: true }).catch(() => {});
-    await fixture.close();
-    process.exit(0);
-  }
-
   await clickVisibleText(cdp, 'Instructions', '[role="tab"]');
   await waitFor(cdp, `!!document.querySelector('textarea[aria-label="Step 1"]')`, 'Instructions section');
   await clickVisibleText(cdp, 'Ingredients', '[role="tab"]');
@@ -506,6 +652,9 @@ try {
   if (approvedInstructions.length !== 2) throw new Error('The browser fixture expects exactly two instruction steps.');
   await fillLabel(cdp, 'Step 1', approvedInstructions[0]);
   await fillLabel(cdp, 'Step 2', approvedInstructions[1]);
+  await waitFor(cdp, `document.querySelector('textarea[aria-label="Step 1"]')?.value===${JSON.stringify(approvedInstructions[0])}&&document.querySelector('textarea[aria-label="Step 2"]')?.value===${JSON.stringify(approvedInstructions[1])}`, 'latest instruction edits visible before Save');
+  await pressKey(cdp, 'Tab', 'Tab', 9);
+  await waitFor(cdp, `document.body.innerText.includes('Unsaved changes')`, 'instruction edits synchronized before Save');
   await clickVisibleText(cdp, 'Save draft');
   await waitForReviewRevision(fixture, friedRiceId, 1);
   await assertActiveCandidate(cdp, fixture, 'Fried Rice', { tab: 'Instructions', revision: 1 });
@@ -544,6 +693,6 @@ try {
   console.log(JSON.stringify(evidence, null, 2));
   ws.close();
 } finally {
-  browser?.kill(); await sleep(150); await rm(profile, { recursive: true, force: true }).catch(() => {});
+  await stopBrowser();
   await fixture.close();
 }
