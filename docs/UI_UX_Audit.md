@@ -1,5 +1,7 @@
 # Recipe-Importer current UI/UX assessment
 
+> **D1 update (2026-10-26):** The Review viewport and focus layout has been implemented for independent review. The UX-0 measurements and findings below are retained as the before-state; see [D1 implementation evidence](wireframes/ui-redesign/D1-review-workspace-implementation.md) for after-state screenshots, measured positions, and verification limits.
+
 Date: 2026-10-25. Checkout: `feature/complete-recipe-workspace`, baseline `7249d193e04232c6eab9ca9dc4662e649c5aa908` plus the UX-0 accessibility and harness correction commit. This is a verification baseline, not release sign-off.
 
 ## Verdict
