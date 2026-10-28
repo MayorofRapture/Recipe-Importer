@@ -761,7 +761,24 @@ def _selection_changed() -> None:
     requested = st.session_state.get("review_selection")
     if prior and prior != requested:
         st.session_state.review_pending_selection = requested
-        st.session_state.review_selection = prior
+
+
+def _sync_structured_widget(candidate_id: str, values_key: str, ids_key: str,
+                            row_id: str, widget_key: str) -> None:
+    """Put the edited structured row in the shared buffer before fragment rendering."""
+    buffer = st.session_state.get("review_buffers", {}).get(candidate_id)
+    if not isinstance(buffer, dict):
+        return
+    try:
+        index = buffer.get(ids_key, []).index(row_id)
+        buffer[values_key][index] = str(st.session_state.get(widget_key, ""))
+    except (ValueError, IndexError, KeyError, TypeError):
+        return
+    field = "ingredients" if values_key == "structured_ingredients" else "instructions"
+    separator = "\n" if field == "ingredients" else "\n\n"
+    buffer[f"raw_{field}"] = separator.join(
+        str(item) for item in buffer[values_key] if str(item).strip()
+    )
 
 
 def _filter_changed(key: str) -> None:
@@ -912,34 +929,7 @@ def main() -> None:
         _queue_state().record_visit(selected_id, view.candidate.name, _navigation_context())
     all_ids = queue_page["all_ids"]
     position = all_ids.index(selected_id) + 1
-    st.markdown(f"### {view.candidate.name or 'Untitled recipe'}")
-    saved_label = (f"Unsaved changes · saved revision {view.revision}"
-                   if buffer_is_dirty(view, buffer) else f"Saved revision {view.revision}")
-    st.caption(saved_label)
-    st.caption(f"{view.status} · {position} of {len(all_ids)}")
-    if view.range_provenance:
-        provenance = view.range_provenance
-        st.info(
-            f"Cookbook: {view.source_display_name} · original pages "
-            f"{provenance.get('first_page')}-{provenance.get('last_page')}. "
-            "You can review and approve this recipe, but cookbook range recipes cannot be imported into Mealie in this phase."
-        )
-    _render_navigation(view)
-    _render_suggestion_job_status(view)
-    _render_queue(views, queue_page)
-    if view.protected:
-        st.warning("Read-only until this recipe’s Mealie outcome is reconciled.")
-        if st.session_state.get("review_protected_target") == view.candidate_id:
-            st.info("This prior or uncertain Mealie outcome protects the recipe from approval and another create request. Use Import history to reconcile it.")
-    _render_actions(view, buffer)
-    with st.container(key="review_workspace"):
-        source, editor = st.columns([0.9, 1.1], gap="medium")
-        with source:
-            with st.container(key="review_source_pane"):
-                _render_source(view, buffer)
-        with editor:
-            with st.container(key="review_recipe_pane"):
-                _render_editor_fragment(view, buffer)
+    _render_review_workspace_fragment(view, buffer, position, len(all_ids), views, queue_page)
     _render_ingredient_repair(view, buffer)
     _render_findings(view, buffer)
     _render_identity_resolution(view, views)
@@ -1571,14 +1561,44 @@ def _render_source_text(view, page_number: int, output_dir: Path,
 
 
 @st.fragment
-def _render_editor_fragment(view, buffer) -> None:
+def _render_review_workspace_fragment(view, buffer, position, total, views, queue_page) -> None:
     diagnostics = (st.session_state.setdefault("_ui_diagnostics", new_counters())
                    if os.environ.get("RECIPE_IMPORTER_UI_DIAGNOSTICS") == "1" else None)
     bind_session(diagnostics)
     count("fragment_executions")
-    # Tab and row widgets rerun this fragment only, so capture both sections
-    # before Streamlit cleans up the inactive tab's widget state.
+    if any(st.session_state.get(key) is not None for key in (
+        "review_pending_selection", "review_pending_filter", "review_pending_advance",
+        "review_pending_return")) or st.session_state.get("review_show_skipped"):
+        st.rerun(scope="app")
     sync_buffer(view, buffer)
+    st.markdown(f"### {view.candidate.name or 'Untitled recipe'}")
+    saved_label = (f"Unsaved changes \u00b7 saved revision {view.revision}"
+                   if buffer_is_dirty(view, buffer) else f"Saved revision {view.revision}")
+    st.caption(saved_label)
+    st.caption(f"{view.status} \u00b7 {position} of {total}")
+    if view.range_provenance:
+        provenance = view.range_provenance
+        st.info(
+            f"Cookbook: {view.source_display_name} \u00b7 original pages "
+            f"{provenance.get('first_page')}-{provenance.get('last_page')}. "
+            "You can review and approve this recipe, but cookbook range recipes cannot be imported into Mealie in this phase."
+        )
+    _render_navigation(view)
+    _render_suggestion_job_status(view)
+    _render_queue(views, queue_page)
+    if view.protected:
+        st.warning("Read-only until this recipe's Mealie outcome is reconciled.")
+        if st.session_state.get("review_protected_target") == view.candidate_id:
+            st.info("This prior or uncertain Mealie outcome protects the recipe from approval and another create request. Use Import history to reconcile it.")
+    _render_actions(view, buffer)
+    with st.container(key="review_workspace"):
+        source, editor = st.columns([0.9, 1.1], gap="medium")
+        with source:
+            with st.container(key="review_source_pane"):
+                _render_source(view, buffer)
+        with editor:
+            with st.container(key="review_recipe_pane"):
+                _render_editor(view, buffer)
     state = st.session_state.get("review_save_state")
     if isinstance(state, dict) and state.get("kind") == "draft_saved":
         if (state.get("candidate_id") != view.candidate_id
@@ -1588,7 +1608,6 @@ def _render_editor_fragment(view, buffer) -> None:
             st.session_state.pop("review_save_state", None)
         else:
             st.caption(state["message"])
-    _render_editor(view, buffer)
     focus_request = st.session_state.pop("review_focus_request", None)
     if focus_request is not None:
         st.html(
@@ -1770,11 +1789,17 @@ def _render_structured_section(view, buffer, field: str) -> None:
             if field == "ingredients":
                 buffer[value_key][index] = st.text_input(
                     f"Ingredient {index + 1}", value=value,
-                    key=structured_widget_key(view, widget_prefix, row_id))
+                    key=structured_widget_key(view, widget_prefix, row_id),
+                    on_change=_sync_structured_widget,
+                    args=(view.candidate_id, value_key, ids_key, row_id,
+                          structured_widget_key(view, widget_prefix, row_id)))
             else:
                 buffer[value_key][index] = st.text_area(
                     f"Step {index + 1}", value=value,
-                    key=structured_widget_key(view, widget_prefix, row_id), height=88)
+                    key=structured_widget_key(view, widget_prefix, row_id), height=88,
+                    on_change=_sync_structured_widget,
+                    args=(view.candidate_id, value_key, ids_key, row_id,
+                          structured_widget_key(view, widget_prefix, row_id)))
         with cols[2]:
             action = st.menu_button("Actions", ["Insert below", "Move up", "Move down", "Merge with next", "Remove"],
                                     key=f"actions_{kind}:{view.candidate_id}:{row_id}",

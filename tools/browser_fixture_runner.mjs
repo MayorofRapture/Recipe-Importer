@@ -193,7 +193,7 @@ export async function startIsolatedBrowserFixture({ scenario = 'review', require
     RECIPE_IMPORTER_FIXTURE_MODE: '1', RECIPE_IMPORTER_BROWSER_FIXTURE: '1',
     RECIPE_IMPORTER_PRODUCTION_OUTPUT_DIR: join(projectRoot, 'output'),
     RECIPE_IMPORTER_FIXTURE_RUN_ID: runId, RECIPE_IMPORTER_FIXTURE_NONCE: nonce };
-  if (scenario === 'performance') env.RECIPE_IMPORTER_UI_DIAGNOSTICS = '1';
+  if (scenario === 'performance' || scenario === 'review-state') env.RECIPE_IMPORTER_UI_DIAGNOSTICS = '1';
   for (const name of credentials) delete env[name];
 
   let server;

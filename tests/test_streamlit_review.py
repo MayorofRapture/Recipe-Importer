@@ -14,6 +14,45 @@ APP_PATH = Path(__file__).resolve().parents[1] / "streamlit_app.py"
 
 
 class StreamlitReviewTests(unittest.TestCase):
+    def test_header_and_approval_follow_latest_buffer_and_approve_one_revision(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = write_ui_fixture(Path(tmp), incomplete_fried_rice=True)
+            with patch.dict(os.environ, {
+                "RECIPE_IMPORTER_OUTPUT_DIR": str(fixture["output"]),
+                "RECIPE_IMPORTER_SOURCE_DIR": str(Path(tmp, "sources")),
+            }, clear=False):
+                app = AppTest.from_file(str(APP_PATH)).run(timeout=10)
+                self.assertFalse(app.exception)
+                candidate_id = app.session_state["review_selection"]
+                approve = next(item for item in app.button if item.label == "Approve & next")
+                self.assertTrue(approve.disabled)
+
+                app.session_state[f"recipe_sections:{candidate_id}"] = "Instructions"
+                app.run(timeout=10)
+                next(item for item in app.button if item.label == "Add step").click().run(timeout=10)
+                next(item for item in app.text_area if item.label == "Step 1").set_value("Cook rice.").run(timeout=10)
+
+                self.assertTrue(any(item.value.startswith("Unsaved changes · saved revision 0")
+                                    for item in app.caption))
+                self.assertFalse(next(item for item in app.button if item.label == "Approve & next").disabled)
+                next(item for item in app.text_area if item.label == "Step 1").set_value("").run(timeout=10)
+                self.assertTrue(next(item for item in app.button if item.label == "Approve & next").disabled)
+                next(item for item in app.text_area if item.label == "Step 1").set_value("Cook rice.").run(timeout=10)
+                next(item for item in app.button if item.label == "Approve & next").click().run(timeout=10)
+
+            events = [json.loads(line) for line in
+                      (Path(fixture["output"]) / "review_events.jsonl").read_text(encoding="utf-8").splitlines()]
+            revisions = [item for item in events if item.get("event") == "review_revision"
+                         and item.get("candidate_id") == candidate_id]
+            approvals = [item for item in events if item.get("event") == "review_approval"
+                         and item.get("candidate_id") == candidate_id]
+
+        self.assertEqual(len(revisions), 1)
+        self.assertEqual(revisions[0]["revision"], 1)
+        self.assertEqual(revisions[0]["recipe"]["instructions"], ["Cook rice."])
+        self.assertEqual(len(approvals), 1)
+        self.assertEqual(approvals[0]["revision"], 1)
+
     def test_review_shows_hash_bound_cached_text_with_unavailable_source_notice(self):
         with tempfile.TemporaryDirectory() as tmp:
             fixture = write_ui_fixture(Path(tmp))

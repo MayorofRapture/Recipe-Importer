@@ -13,7 +13,7 @@ from review_store import ReviewStore, extraction_identity
 
 def write_ui_fixture(
     root: Path, *, duplicate_titles: bool = False,
-    duplicate_requires_review: bool = True,
+    duplicate_requires_review: bool = True, incomplete_fried_rice: bool = False,
 ) -> dict[str, Path | str]:
     output = root / "output"
     extracted = output / "extracted"
@@ -26,7 +26,7 @@ def write_ui_fixture(
 
     fried = RecipeCandidate(
         name="Fried Rice", ingredients=["2 cups rice", "1 egg"],
-        instructions=["Cook rice.", "Fold in egg."],
+        instructions=[] if incomplete_fried_rice else ["Cook rice.", "Fold in egg."],
     )
     caramel = RecipeCandidate(
         name="The Best Caramel Apples",

@@ -14,6 +14,7 @@ function arg(name, fallback = undefined) {
 
 rejectArbitraryUrl();
 const candidate = arg('candidate', 'Cranberry & Caramel Date Bars');
+const stateRegression = arg('state-regression') === 'true';
 const evidenceArg = arg('evidence-dir');
 const editValue = arg('edited-value', '10 bars');
 const instructionValue = arg('instructions', 'Combine the ingredients.\n\nBake until set.');
@@ -24,7 +25,10 @@ if (!evidenceArg) {
   throw new Error('Provide --evidence-dir for synthetic browser evidence.');
 }
 const evidenceDir = await prepareEvidenceDirectory(evidenceArg);
-const fixture = await startIsolatedBrowserFixture({ scenario: 'review', requiredCandidates: [candidate] });
+const fixture = await startIsolatedBrowserFixture({
+  scenario: stateRegression ? 'review-state' : 'review',
+  requiredCandidates: stateRegression ? ['Fried Rice', 'Synthetic Manual Directions'] : [candidate],
+});
 const url = fixture.url;
 
 class CDP {
@@ -328,7 +332,12 @@ async function fillLabel(cdp, label, value) {
   await cdp.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x: point.x, y: point.y, button: 'left', clickCount: 1 });
   await cdp.send('Input.dispatchKeyEvent', { type: 'keyDown', key: 'a', code: 'KeyA', modifiers: 2, windowsVirtualKeyCode: 65 });
   await cdp.send('Input.dispatchKeyEvent', { type: 'keyUp', key: 'a', code: 'KeyA', modifiers: 2, windowsVirtualKeyCode: 65 });
-  await cdp.send('Input.insertText', { text: value });
+  if (value === '') {
+    await cdp.send('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Backspace', code: 'Backspace', windowsVirtualKeyCode: 8 });
+    await cdp.send('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Backspace', code: 'Backspace', windowsVirtualKeyCode: 8 });
+  } else {
+    await cdp.send('Input.insertText', { text: value });
+  }
 }
 async function screenshot(cdp, name) {
   await mkdir(evidenceDir, { recursive: true });
@@ -464,9 +473,81 @@ try {
     await clickPane(cdp, 'Recipe');
     await waitFor(cdp, `!![...document.querySelectorAll('input[aria-label="Recipe title"]')].find(e=>e.getClientRects().length)`, 'narrow Recipe pane');
   }
-  const friedRiceId = await assertActiveCandidate(cdp, fixture, 'Fried Rice', { revision: 0 });
+  const friedRiceId = stateRegression ? null
+    : await assertActiveCandidate(cdp, fixture, 'Fried Rice', { revision: 0 });
   const timings = { firstReviewSettledMs: Date.now() - navigationStarted };
   const evidence = { screenshots: [await screenshot(cdp, 'browser-review-after-precise-1440x900.png')], timings };
+  if (stateRegression) {
+    const counters = async () => JSON.parse(await evaluate(cdp, `(() => {
+      const e=[...document.querySelectorAll('[data-testid="stJson"]')].find(x=>x.innerText.includes('full_page_executions'));
+      const values={};for(const line of (e?.innerText||'').split('\\n')){const m=line.match(/^\\s*"([^"]+)":\\s*(\\d+)/);if(m)values[m[1]]=Number(m[2]);}
+      return JSON.stringify(values);
+    })()`));
+    const state = async () => JSON.parse(await evaluate(cdp, `JSON.stringify((() => {
+      const header=[...document.querySelectorAll('[data-testid="stCaptionContainer"]')]
+        .map(e=>e.innerText.trim()).find(t=>/^(Unsaved changes · saved revision|Saved revision) \\d+/.test(t))||'';
+      const button=[...document.querySelectorAll('button')].find(e=>e.innerText.trim()==='Approve & next'&&e.getClientRects().length);
+      return {header,approveDisabled:button?.disabled??null,
+        editorDirty:[...document.querySelectorAll('[data-testid="stCaptionContainer"]')].some(e=>e.innerText.includes('Unsaved changes · use Save draft')),
+        title:document.querySelector('input[aria-label="Recipe title"]')?.value||''};
+    })())`));
+    const states = {};
+    await clickVisibleText(cdp, 'Performance counters', '[data-testid="stExpander"]');
+    await waitFor(cdp, `!![...document.querySelectorAll('[data-testid="stJson"]')].find(e=>e.innerText.includes('full_page_executions'))`, 'Review execution counters');
+    const baseline = await counters();
+    const initialState = await state();
+    states.initialCompleteRecipeWasSavedAndEligible = initialState.header.startsWith('Saved revision')
+      && initialState.approveDisabled === false;
+    const waitForFragmentRerun = async (prior, label) => waitFor(cdp, `(()=>{const e=[...document.querySelectorAll('[data-testid="stJson"]')].find(x=>x.innerText.includes('fragment_executions'));return Number((e?.innerText.match(/"fragment_executions":\\s*(\\d+)/)||[])[1]||0)>${prior}})()`, label);
+
+    const initialTitle = await evaluate(cdp, `document.querySelector('input[aria-label="Recipe title"]')?.value||''`);
+    if (!initialTitle) throw new Error('The state regression needs an isolated synthetic recipe.');
+    const editedTitle = `${initialTitle} draft`;
+    await fillLabel(cdp, 'Recipe title', editedTitle);
+    await pressKey(cdp, 'Tab', 'Tab', 9);
+    await waitFor(cdp, `document.querySelector('input[aria-label="Recipe title"]')?.value===${JSON.stringify(editedTitle)}`, 'committed title edit');
+    await waitFor(cdp, `(()=>{const e=[...document.querySelectorAll('[data-testid="stJson"]')].find(x=>x.innerText.includes('fragment_executions'));return Number((e?.innerText.match(/"fragment_executions":\\s*(\\d+)/)||[])[1]||0)>${baseline.fragment_executions||0}})()`, 'fragment-only title rerun');
+    states.recipeAfterEdit = { ...await state(), counters: await counters() };
+    states.headerRefreshedAfterEdit = states.recipeAfterEdit.header.startsWith('Unsaved changes');
+    states.titleEditWasFragmentOnly = states.recipeAfterEdit.counters.full_page_executions === baseline.full_page_executions;
+    states.screenshots = [await screenshot(cdp, 'd1-correction-stale-header-reproduction.png')];
+    await clickVisibleText(cdp, 'Instructions', '[role="tab"]');
+    await waitFor(cdp, `!!document.querySelector('textarea[aria-label="Step 1"]')&&!!document.querySelector('textarea[aria-label="Step 2"]')`, 'complete recipe instructions');
+    let afterEdit = await counters();
+    await fillLabel(cdp, 'Step 1', '');
+    await pressKey(cdp, 'Tab', 'Tab', 9);
+    await waitForFragmentRerun(afterEdit.fragment_executions, 'first instruction fragment rerun');
+    afterEdit = await counters();
+    await fillLabel(cdp, 'Step 2', '');
+    await pressKey(cdp, 'Tab', 'Tab', 9);
+    await waitForFragmentRerun(afterEdit.fragment_executions, 'second instruction fragment rerun');
+    await waitFor(cdp, `document.querySelector('textarea[aria-label="Step 1"]')?.value===''&&document.querySelector('textarea[aria-label="Step 2"]')?.value===''`, 'complete recipe made incomplete');
+    states.missingInstructionsCompleted = { ...await state(), counters: await counters() };
+    states.approvalDisabledAfterMakingIncomplete = states.missingInstructionsCompleted.approveDisabled === true;
+    states.headerUpdatedAfterMakingIncomplete = states.missingInstructionsCompleted.header.startsWith('Unsaved changes');
+    states.incompleteEditStayedFragmentOnly = states.missingInstructionsCompleted.counters.full_page_executions === baseline.full_page_executions;
+    states.noDraftWriteDuringEditorInteraction = states.missingInstructionsCompleted.counters.durable_writes === baseline.durable_writes;
+    states.screenshots = [await screenshot(cdp, 'd1-correction-approval-disabled.png')];
+    afterEdit = await counters();
+    await fillLabel(cdp, 'Step 1', 'Warm synthetic rice.');
+    await pressKey(cdp, 'Tab', 'Tab', 9);
+    await waitForFragmentRerun(afterEdit.fragment_executions, 'completed instruction fragment rerun');
+    await waitFor(cdp, `document.querySelector('textarea[aria-label="Step 1"]')?.value==='Warm synthetic rice.'`, 'required instruction completed');
+    states.missingInstructionsCompleted = { ...await state(), counters: await counters() };
+    states.approvalEnabledAfterCompletingMissingInstructions = states.missingInstructionsCompleted.approveDisabled === false;
+    states.instructionEditStayedFragmentOnly = states.missingInstructionsCompleted.counters.full_page_executions === baseline.full_page_executions;
+    states.noDraftWriteDuringCompletion = states.missingInstructionsCompleted.counters.durable_writes === baseline.durable_writes;
+    states.screenshots.push(await screenshot(cdp, 'd1-correction-approval-enabled.png'));
+    evidence.headerStateRegression = states;
+    console.log(JSON.stringify(evidence, null, 2));
+    ws.close(); await stopBrowser(); await fixture.close();
+    if (!states.initialCompleteRecipeWasSavedAndEligible || !states.headerRefreshedAfterEdit || !states.headerUpdatedAfterMakingIncomplete
+        || !states.approvalDisabledAfterMakingIncomplete || !states.approvalEnabledAfterCompletingMissingInstructions
+        || !states.titleEditWasFragmentOnly || !states.incompleteEditStayedFragmentOnly
+        || !states.instructionEditStayedFragmentOnly || !states.noDraftWriteDuringEditorInteraction
+        || !states.noDraftWriteDuringCompletion) process.exit(1);
+    process.exit(0);
+  }
   if (arg('inspect') === 'true') {
     if (viewportWidth <= 900) {
       await fillLabel(cdp, 'Ingredient 1', 'probe edit');

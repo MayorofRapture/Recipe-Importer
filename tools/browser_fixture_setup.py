@@ -65,16 +65,28 @@ def prepare(root: Path, scenario: str, run_id: str, nonce: str) -> dict:
         cookbook_batch_id = cookbook_batch["batch_id"]
         cookbook_filename = staged_cookbook["original_filename"]
 
-    if scenario == "p0":
-        manual_source = sources / "synthetic-manual-instructions.png"
-        manual_image = Image.new("RGB", (600, 800), "white")
-        ImageDraw.Draw(manual_image).text(
-            (60, 70), "Synthetic Manual Directions\n\n1 cup synthetic beans\n\nNo directions on source.",
-            fill="black", spacing=18)
-        manual_image.save(manual_source)
+    if scenario in {"p0", "review-state"}:
+        manual_source = sources / ("synthetic-manual-instructions.pdf" if scenario == "review-state"
+                                   else "synthetic-manual-instructions.png")
+        if scenario == "review-state":
+            manual_document = fitz.open()
+            page = manual_document.new_page(width=600, height=800)
+            page.insert_text((60, 70), "Synthetic Manual Directions")
+            page.insert_text((60, 105), "1 cup synthetic beans")
+            directions_page = manual_document.new_page(width=600, height=800)
+            directions_page.insert_text((60, 70), "1. Stir the synthetic beans.\n2. Serve warm.")
+            manual_document.save(manual_source)
+            manual_document.close()
+        else:
+            manual_image = Image.new("RGB", (600, 800), "white")
+            ImageDraw.Draw(manual_image).text(
+                (60, 70), "Synthetic Manual Directions\n\n1 cup synthetic beans\n\nNo directions on source.",
+                fill="black", spacing=18)
+            manual_image.save(manual_source)
         manual_recipe = RecipeCandidate(
             name="Synthetic Manual Directions", ingredients=["1 cup synthetic beans"],
-            instructions=[], requires_review=True,
+            instructions=( ["Stir the synthetic beans.", "Serve warm."]
+                           if scenario == "review-state" else []), requires_review=True,
         )
         manual_batch = ExtractionBatch(recipes=[manual_recipe])
         manual_hash = file_digest(manual_source)
@@ -83,27 +95,30 @@ def prepare(root: Path, scenario: str, run_id: str, nonce: str) -> dict:
         cache_path.write_text(json.dumps({"schema_version": 2, "source_hash": manual_hash,
                                          "batch": manual_batch.model_dump(mode="json")}),
                               encoding="utf-8")
-        ReviewStore(output / "review_events.jsonl").register_candidates(
+        registration = ReviewStore(output / "review_events.jsonl").register_candidates(
             str(manual_source), manual_hash, extraction_id, [manual_recipe])
-        view = next(item for item in load_catalog(output)
-                    if item.candidate.name == "Fried Rice")
-        manual_candidate_id = view.candidate_id
-        saved_recipe = view.candidate.model_copy(update={
-            "name": "Browser saved manual title",
-            "yield_text": "3 servings",
-            "description": "Synthetic saved description.",
-            "ingredients": ["4 cups synthetic rice", "2 synthetic eggs"],
-            "instructions": ["Heat the synthetic rice.", "Fold in the synthetic eggs."],
-            "notes": ["Synthetic saved note."],
-        })
-        ReviewStore(output / "review_events.jsonl").save_revision(
-            candidate_id=view.candidate_id, source_hash=view.source_hash,
-            extraction_id=view.extraction_id, expected_parent=0,
-            operation_id="browser-p0-manual-saved-revision",
-            recipe=saved_recipe.model_dump(mode="json"),
-            target_bindings=list(view.target_bindings),
-        )
-        Path(fixture["source"]).unlink()
+        if scenario == "p0":
+            view = next(item for item in load_catalog(output)
+                        if item.candidate.name == "Fried Rice")
+            manual_candidate_id = view.candidate_id
+            saved_recipe = view.candidate.model_copy(update={
+                "name": "Browser saved manual title",
+                "yield_text": "3 servings",
+                "description": "Synthetic saved description.",
+                "ingredients": ["4 cups synthetic rice", "2 synthetic eggs"],
+                "instructions": ["Heat the synthetic rice.", "Fold in the synthetic eggs."],
+                "notes": ["Synthetic saved note."],
+            })
+            ReviewStore(output / "review_events.jsonl").save_revision(
+                candidate_id=view.candidate_id, source_hash=view.source_hash,
+                extraction_id=view.extraction_id, expected_parent=0,
+                operation_id="browser-p0-manual-saved-revision",
+                recipe=saved_recipe.model_dump(mode="json"),
+                target_bindings=list(view.target_bindings),
+            )
+            Path(fixture["source"]).unlink()
+        else:
+            manual_candidate_id = registration[0]["candidate_id"]
 
     if scenario == "identity":
         (output / "import_state.jsonl").unlink(missing_ok=True)
@@ -187,7 +202,7 @@ def prepare(root: Path, scenario: str, run_id: str, nonce: str) -> dict:
             }}, "tags": {},
         }), encoding="utf-8")
         marker_candidates = ["Fried Rice"]
-    if scenario == "p0":
+    if scenario in {"p0", "review-state"}:
         marker_candidates.append("Synthetic Manual Directions")
     candidate_ids: dict[str, list[str]] = {}
     for view in load_catalog(output, sources):
