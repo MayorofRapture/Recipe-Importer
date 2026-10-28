@@ -30,14 +30,13 @@ except (FixtureModeError, LibraryPathConflict) as exc:
     st.stop()
 st.caption("Using the selected local library.")
 alternate_library = alternate_cwd_library(application_library)
+if alternate_library:
+    st.warning("Another populated library exists. This app is using the selected library.")
 with st.expander("Library troubleshooting"):
     st.caption(f"Selected library: {application_library}")
     if alternate_library:
-        st.warning(
-            f"Another populated library exists at {alternate_library}. This app is using "
-            f"{application_library}; set RECIPE_IMPORTER_OUTPUT_DIR to select the other library. "
-            "Libraries are never merged or moved automatically."
-        )
+        st.caption(f"Other populated library: {alternate_library}")
+        st.caption("Set RECIPE_IMPORTER_OUTPUT_DIR to select the other library. Libraries are never merged or moved automatically.")
 
 if "initial_destination" not in st.session_state:
     library = application_library
