@@ -15,14 +15,47 @@ import pymupdf as fitz
 
 from batch_store import BatchStore
 from import_recipes import file_digest
-from recipe_quality import ExtractionBatch, RecipeCandidate, Suggestion, schema_recipe
+from recipe_quality import Diagnostic, ExtractionBatch, RecipeCandidate, Suggestion, schema_recipe
 from review_store import ReviewStore, _candidate_payload, _canonical, extraction_identity
 from tests.ui_fixture_factory import write_ui_fixture
 from ui_data import load_catalog
 
 
 def prepare(root: Path, scenario: str, run_id: str, nonce: str) -> dict:
-    fixture = write_ui_fixture(root)
+    diagnostics = None
+    if scenario in {"review-d2", "review-d2-corrections"}:
+        if scenario == "review-d2-corrections":
+            diagnostics = [
+                Diagnostic(field_path="ingredients[0]", kind="ambiguous", severity="critical",
+                           detail="First row issue.", source_evidence="The first row is blurred.",
+                           suggested_action="Check the first synthetic ingredient."),
+                Diagnostic(field_path="ingredients[1]", kind="unreadable", severity="critical",
+                           detail="Second row issue.", source_evidence="The second row is smudged.",
+                           suggested_action="Check the second synthetic ingredient."),
+            ]
+        else:
+            diagnostics = [
+                Diagnostic(field_path="name", kind="missing_from_source", severity="critical",
+                           detail="The title is absent from the source.",
+                           suggested_action="Confirm a title using another source."),
+                Diagnostic(field_path="ingredients[0]", kind="ambiguous", severity="critical",
+                           detail="The amount is unclear.", source_evidence="The left edge is cropped.",
+                           suggested_action="Check the source before approving."),
+                Diagnostic(field_path="ingredients[1]", kind="unreadable", severity="critical",
+                           detail="The amount cannot be read.", source_evidence="The ink is smudged.",
+                           suggested_action="Compare the scan before approving."),
+                Diagnostic(field_path="instructions[0]", kind="not_extracted", severity="critical",
+                           detail="A visible direction was not extracted.",
+                           source_evidence="A direction appears below the ingredient list.",
+                           suggested_action="Correct the step from the source."),
+                Diagnostic(field_path="yield_text", kind="missing_from_source", severity="optional",
+                           detail="The source does not state a yield.",
+                           suggested_action="Leave blank if unknown."),
+            ]
+    fixture = write_ui_fixture(
+        root, cranberry_diagnostics=diagnostics,
+        cranberry_alternative_source_supported=scenario in {"review-d2", "review-d2-corrections"},
+    )
     output, sources = Path(fixture["output"]), Path(fixture["source"]).parent
     manual_candidate_id = ""
     expected = {"kind": "synthetic-browser-fixture", "run_id": run_id, "nonce": nonce}

@@ -15,6 +15,8 @@ function arg(name, fallback = undefined) {
 rejectArbitraryUrl();
 const candidate = arg('candidate', 'Cranberry & Caramel Date Bars');
 const stateRegression = arg('state-regression') === 'true';
+const d2Only = arg('d2-only') === 'true';
+const d2Corrections = arg('d2-corrections') === 'true';
 const evidenceArg = arg('evidence-dir');
 const editValue = arg('edited-value', '10 bars');
 const instructionValue = arg('instructions', 'Combine the ingredients.\n\nBake until set.');
@@ -26,7 +28,7 @@ if (!evidenceArg) {
 }
 const evidenceDir = await prepareEvidenceDirectory(evidenceArg);
 const fixture = await startIsolatedBrowserFixture({
-  scenario: stateRegression ? 'review-state' : 'review',
+  scenario: stateRegression ? 'review-state' : d2Corrections ? 'review-d2-corrections' : d2Only ? 'review-d2' : 'review',
   requiredCandidates: stateRegression ? ['Fried Rice', 'Synthetic Manual Directions'] : [candidate],
 });
 const url = fixture.url;
@@ -260,6 +262,10 @@ async function ensureExpanderOpen(cdp, text) {
 }
 
 async function clickProposalAction(cdp, proposedValue, action) {
+  const inlineLabel = `Proposal · ${proposedValue}`;
+  const inlineProposal = await evaluate(cdp, `!![...document.querySelectorAll('[data-testid="stExpander"]')]
+    .find(e=>e.innerText.includes(${JSON.stringify(inlineLabel)}))`);
+  if (inlineProposal) await ensureExpanderOpen(cdp, inlineLabel);
   const result = await evaluate(cdp, `(async () => {
     const value=${JSON.stringify(proposedValue)}, action=${JSON.stringify(action)};
     const targets=[...document.querySelectorAll('p,div,span')].filter(e=>e.children.length===0&&e.innerText.trim()===value)
@@ -393,7 +399,10 @@ async function verifyResponsiveLayout(cdp, evidence) {
       await waitFor(cdp, `(() => {const input=[...document.querySelectorAll('input[aria-label="Ingredient 1"]')].find(e=>e.getClientRects().length);return input?.value===${JSON.stringify(`responsive draft ${width}`)}})()`, `${width}px unsaved edit restored`);
       const retainedEdit = await evaluate(cdp, `document.querySelector('input[aria-label="Ingredient 1"]')?.value`);
       const instructionsSelected = await evaluate(cdp, `[...document.querySelectorAll('[role="tab"][aria-selected="true"]')].some(e=>e.innerText.trim()==='Instructions')`);
-      if (!instructionsSelected) await clickVisibleText(cdp, 'Instructions', '[role="tab"]');
+      if (!instructionsSelected) {
+        await clickVisibleText(cdp, 'Instructions', '[role="tab"]');
+        await waitFor(cdp, `[...document.querySelectorAll('[role="tab"][aria-selected="true"]')].some(e=>e.innerText.trim()==='Instructions')`, `${width}px Instructions tab selection before pane switch`);
+      }
       await clickPane(cdp, 'Source');
       await waitFor(cdp, `!![...document.querySelectorAll('input[aria-label="Page"]')].find(e=>e.getClientRects().length)`, `${width}px Source pane after tab round trip`);
       const retainedSource = await evaluate(cdp, `JSON.stringify({page:[...document.querySelectorAll('input[aria-label="Page"]')].find(e=>e.getClientRects().length)?.value,zoom:[...document.querySelectorAll('input[aria-label="Source view"]')].find(e=>e.getClientRects().length)?.value})`);
@@ -472,6 +481,121 @@ try {
     if (arg('inspect') === 'true') console.log(`Initial narrow panes: ${initialPanes}`);
     await clickPane(cdp, 'Recipe');
     await waitFor(cdp, `!![...document.querySelectorAll('input[aria-label="Recipe title"]')].find(e=>e.getClientRects().length)`, 'narrow Recipe pane');
+  }
+  if (d2Only) {
+    const d2Evidence = { screenshots: [], timings: { firstReviewSettledMs: Date.now() - navigationStarted } };
+    await clickVisibleText(cdp, 'Queue');
+    await waitFor(cdp, `!!document.querySelector('input[aria-label="Jump to recipe"]')`, 'recipe queue controls');
+    await clickComboOption(cdp, 'Jump to recipe', candidate);
+    const candidateId = await waitForCandidateSelected(cdp, fixture, candidate);
+    await ensureExpanderOpen(cdp, 'Issues and source notes');
+    const contextualIssues = [];
+    for (const width of [1440, 768, 320]) {
+      await cdp.send('Emulation.setDeviceMetricsOverride', { width, height: 1000, deviceScaleFactor: 1, mobile: false });
+      if (width <= 900) await clickPane(cdp, 'Recipe');
+      await waitFor(cdp, `document.documentElement.scrollWidth<=innerWidth`, `${width}px issue layout without horizontal overflow`);
+      await ensureExpanderOpen(cdp, 'Optional details');
+      await clickVisibleText(cdp, 'Ingredients', '[role="tab"]');
+      await waitFor(cdp, `!![...document.querySelectorAll('input[aria-label="Ingredient 1"]')].find(e=>e.getClientRects().length)`, `${width}px ingredient editor`);
+      const serialized = await evaluate(cdp, `JSON.stringify({
+        missing:document.body.innerText.includes('Missing from source'),
+        ambiguous:document.body.innerText.includes('Ambiguous in source'),
+        unreadable:document.body.innerText.includes('Unreadable in source'),
+        optional:document.body.innerText.includes('Optional note · Missing from source'),
+        proposal:document.body.innerText.includes('Proposal · 1 cup dates · AI-inferred · Unverified'),
+        sourceSupported:document.body.innerText.includes('Proposal · 1 cup cranberries · Source-supported · Unverified'),
+        overflow:document.documentElement.scrollWidth>innerWidth,
+        width:innerWidth
+      })`);
+      const state = JSON.parse(serialized);
+      if (!state.missing || !state.ambiguous || !state.unreadable || !state.optional
+          || !state.proposal || !state.sourceSupported || state.overflow) {
+        const body = await evaluate(cdp, `document.body.innerText.slice(-2200)`);
+        throw new Error(`Contextual ingredient issues/proposal failed at ${width}px: ${serialized}; body=${JSON.stringify(body)}`);
+      }
+      contextualIssues.push(state);
+      d2Evidence.screenshots.push(await screenshot(cdp, `d2-contextual-issues-${width}px.png`));
+      if (width <= 900) await clickPane(cdp, 'Source');
+    }
+    d2Evidence.contextualIssues = contextualIssues;
+    await cdp.send('Emulation.setDeviceMetricsOverride', { width: 1440, height: 900, deviceScaleFactor: 1, mobile: false });
+    await clickVisibleText(cdp, 'Ingredients', '[role="tab"]');
+    await waitFor(cdp, `!![...document.querySelectorAll('input[aria-label="Ingredient 1"]')].find(e=>e.getClientRects().length)`, '1440px ingredient editor after viewport return');
+    await waitFor(cdp, `document.body.innerText.includes('Proposal · 1 cup dates · AI-inferred · Unverified')`, 'pending proposal summary after viewport return');
+    await ensureExpanderOpen(cdp, 'Proposal · 1 cup dates');
+    await waitFor(cdp, `document.body.innerText.includes('AI-inferred completion')&&document.body.innerText.includes('Uncertainty: The quantity is cropped.')`, 'expandable unverified proposal details');
+    await sleep(400);
+    d2Evidence.screenshots.push(await screenshot(cdp, 'd2-proposal-details-1440x900.png'));
+    const reviewEvents = (await readFile(join(fixture.output, 'review_events.jsonl'), 'utf8'))
+      .split(/\r?\n/).filter(Boolean).map((line) => JSON.parse(line));
+    if (reviewEvents.some((event) => ['review_revision', 'review_approval', 'review_issue_resolution'].includes(event.event))) {
+      throw new Error('D2 presentation inspection wrote a recipe revision, approval, or issue decision.');
+    }
+    d2Evidence.noReviewDecisionsWritten = true;
+    d2Evidence.candidateId = candidateId;
+    console.log(JSON.stringify(d2Evidence, null, 2));
+    ws.close(); await stopBrowser(); await fixture.close();
+    process.exit(0);
+  }
+  if (d2Corrections) {
+    await clickVisibleText(cdp, 'Queue');
+    await waitFor(cdp, `!!document.querySelector('input[aria-label="Jump to recipe"]')`, 'recipe queue controls');
+    await clickComboOption(cdp, 'Jump to recipe', candidate);
+    const candidateId = await waitForCandidateSelected(cdp, fixture, candidate);
+    await clickVisibleText(cdp, 'Ingredients', '[role="tab"]');
+    await waitFor(cdp, `!![...document.querySelectorAll('input[aria-label="Ingredient 1"]')].find(e=>e.getClientRects().length)`, 'ingredient rows');
+    await ensureExpanderOpen(cdp, 'Issue details · Ambiguous in source');
+    await ensureExpanderOpen(cdp, 'Issue details · Unreadable in source');
+    const rowForIssue = async (detail) => JSON.parse(await evaluate(cdp, `JSON.stringify((() => {
+      const e=[...document.querySelectorAll('[data-testid="stExpander"]')].find(x=>x.innerText.includes(${JSON.stringify(detail)}));
+      const inputs=[...document.querySelectorAll('input[aria-label^="Ingredient "]')];
+      const previous=inputs.filter(input=>input.compareDocumentPosition(e)&Node.DOCUMENT_POSITION_FOLLOWING).at(-1);
+      return previous?{label:previous.getAttribute('aria-label'),value:previous.value}:null;
+    })())`));
+    const initialRows = {
+      first: await rowForIssue('First row issue.'),
+      second: await rowForIssue('Second row issue.'),
+    };
+    if (initialRows.first?.label !== 'Ingredient 1' || initialRows.first.value !== 'dates'
+        || initialRows.second?.label !== 'Ingredient 2' || initialRows.second.value !== 'cranberries') {
+      throw new Error(`Initial row finding bindings are misplaced: ${JSON.stringify(initialRows)}.`);
+    }
+    const screenshots = [await screenshot(cdp, 'd2-f01-before-resolution.png')];
+    await clickVisibleText(cdp, 'I checked the source and corrected this field', '[data-testid="stCheckbox"]');
+    await waitFor(cdp, `[...document.querySelectorAll('button')].some(e=>e.innerText.includes('Record source correction')&&!e.disabled)`, 'source correction confirmation');
+    await clickVisibleText(cdp, 'Record source correction', 'button');
+    await waitForReviewResolution(fixture, {
+      candidateId, issueId: 'finding:0:ingredients[0]', disposition: 'source_corrected',
+    });
+    await waitFor(cdp, `!document.body.innerText.includes('First row issue.')&&document.body.innerText.includes('Second row issue.')`, 'second finding remains after first resolution');
+    const remainingBeforeReorder = await rowForIssue('Second row issue.');
+    if (remainingBeforeReorder?.label !== 'Ingredient 2' || remainingBeforeReorder.value !== 'cranberries') {
+      throw new Error(`Remaining finding moved after resolving the first issue: ${JSON.stringify(remainingBeforeReorder)}.`);
+    }
+    screenshots.push(await screenshot(cdp, 'd2-f01-after-first-resolution.png'));
+    await clickVisibleText(cdp, 'Actions', 'button');
+    await clickVisibleText(cdp, 'Move down', 'button,[role="menuitem"]');
+    await waitFor(cdp, `document.querySelector('input[aria-label="Ingredient 1"]')?.value==='cranberries'&&document.querySelector('input[aria-label="Ingredient 2"]')?.value==='dates'`, 'ingredient row reorder');
+    const remainingAfterReorder = await rowForIssue('Second row issue.');
+    if (remainingAfterReorder?.label !== 'Ingredient 1' || remainingAfterReorder.value !== 'cranberries') {
+      throw new Error(`Finding did not follow its registered row after reordering: ${JSON.stringify(remainingAfterReorder)}.`);
+    }
+    screenshots.push(await screenshot(cdp, 'd2-f01-after-row-reorder.png'));
+    await clickVisibleText(cdp, 'Defer review', 'button');
+    await waitFor(cdp, `document.body.innerText.includes('Second row issue.')`, 'deferred finding remains open');
+    const resolutionEvents = (await readFile(join(fixture.output, 'review_events.jsonl'), 'utf8'))
+      .split(/\r?\n/).filter(Boolean).map((line) => JSON.parse(line))
+      .filter((event) => event.event === 'review_issue_resolution' && event.candidate_id === candidateId);
+    if (resolutionEvents.length !== 1 || resolutionEvents[0].issue_id !== 'finding:0:ingredients[0]') {
+      throw new Error(`Resolve/defer actions wrote unexpected issue history: ${JSON.stringify(resolutionEvents)}.`);
+    }
+    console.log(JSON.stringify({
+      candidateId, firstFindingResolved: true, remainingFindingBeforeReorder: remainingBeforeReorder,
+      remainingFindingAfterReorder: remainingAfterReorder, deferKeptIssueOpen: true,
+      immutableResolutionEvents: resolutionEvents, screenshots,
+    }, null, 2));
+    ws.close(); await stopBrowser(); await fixture.close();
+    process.exit(0);
   }
   const friedRiceId = stateRegression ? null
     : await assertActiveCandidate(cdp, fixture, 'Fried Rice', { revision: 0 });
@@ -669,7 +793,7 @@ try {
   await assertActiveCandidate(cdp, fixture, candidate, { tab: 'Ingredients', revision: 0 });
   await waitFor(cdp, `document.body.innerText.includes('1 cup dates')`, 'critical ingredient proposal');
   await clickProposalAction(cdp, '1 cup dates', 'Reject; keep issue open');
-  await waitFor(cdp, `document.body.innerText.includes('Rejected')&&document.body.innerText.includes('Rejecting this proposal leaves the source issue unresolved')`, 'rejected critical proposal and unresolved source issue');
+  await waitFor(cdp, `document.body.innerText.includes('Proposal · 1 cup dates · AI-inferred · Rejected')&&document.body.innerText.includes('Rejecting this proposal leaves the source issue unresolved')`, 'rejected critical proposal and unresolved source issue');
   await waitForReviewRevision(fixture, cranberryId, 1);
   await assertActiveCandidate(cdp, fixture, candidate, { tab: 'Ingredients', revision: 1 });
   const rejectedEvent = await assertReviewEvent(fixture, {
@@ -684,6 +808,7 @@ try {
   await clickVisibleText(cdp, 'Use edited version');
   await waitForReviewRevision(fixture, cranberryId, 2);
   await waitForStable(cdp, `document.querySelector('input[aria-label="Ingredient 2"]')?.value==='2 cups cranberries'`, 'edited ingredient proposal visible');
+  await waitFor(cdp, `document.body.innerText.includes('Proposal · 1 cup cranberries · AI-inferred · Applied with edits')`, 'edited proposal summary status');
   await assertActiveCandidate(cdp, fixture, candidate, { tab: 'Ingredients', revision: 2 });
   const editedEvent = await assertReviewEvent(fixture, {
     candidateId: cranberryId, issueId: 'cranberry-quantity-alternative', disposition: 'edited',

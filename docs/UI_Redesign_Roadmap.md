@@ -1,6 +1,6 @@
 # UI redesign implementation roadmap
 
-**Status: UX-0 verification baseline completed. The Review layout redesign is not started and remains outside this milestone.** The current UI is documented in [the assessment](UI_UX_Audit.md); the behavior contract is in [the product experience](UI_Product_Experience.md).
+**Status: UX-0 completed; D1 and D2 implementations are complete and awaiting independent review.** D1 is recorded in [the D1 implementation report](wireframes/ui-redesign/D1-review-workspace-implementation.md); D2 is recorded in [the D2 implementation report](wireframes/ui-redesign/D2-contextual-review-implementation.md). The current UI assessment is [here](UI_UX_Audit.md); the behavior contract is in [the product experience](UI_Product_Experience.md).
 
 ## Guardrails for every phase
 
@@ -18,8 +18,8 @@
 The implementation sequence is intentionally split into five gates:
 
 1. **Browser/accessibility verification (UX-0):** completed. The baseline, harness corrections, focus regression, and sanitized evidence are recorded in [the audit](UI_UX_Audit.md).
-2. **Review layout (D1):** next, but not started here. Keep backend review authority and candidate identity unchanged.
-3. **Contextual issues and editing efficiency (D2):** follow the approved layout; keep proposals separate and visibly unverified.
+2. **Review layout (D1):** completed. Backend review authority and candidate identity remain unchanged.
+3. **Contextual issues and editing efficiency (D2):** implementation complete; pending independent review. Keep proposals separate and visibly unverified.
 4. **Upload and Import/History refinements (D3):** preserve job lifecycle, import eligibility, tag outcomes, and reconciliation behavior.
 5. **Performance and final usability validation (D4):** validate representative scale and recovery with synthetic data, then record evidence limits.
 
@@ -42,7 +42,7 @@ The implementation sequence is intentionally split into five gates:
 
 ## Verification and stop points
 
-For each approved phase, create or update focused tests before behavior changes, run them with the existing unittest/AppTest suite, inspect the rendered browser state, and record exact commands/counts. No phase authorizes rewriting old histories or invoking real services. Stop before D1 in this UX-0 delivery; later milestone work requires its own explicit scope.
+For each approved phase, create or update focused tests before behavior changes, run them with the existing unittest/AppTest suite, inspect the rendered browser state, and record exact commands/counts. No phase authorizes rewriting old histories or invoking real services. D1 and D2 are separately authorized and complete pending independent review. Stop before D3; later milestones require their own explicit scope.
 
 Release readiness remains a separate track: live Gemini model/quota behavior, compatibility with the installed Mealie version, and controlled range-candidate import enablement. This redesign must not enable range import.
 

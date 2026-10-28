@@ -14,6 +14,8 @@ from review_store import ReviewStore, extraction_identity
 def write_ui_fixture(
     root: Path, *, duplicate_titles: bool = False,
     duplicate_requires_review: bool = True, incomplete_fried_rice: bool = False,
+    cranberry_diagnostics: list[Diagnostic] | None = None,
+    cranberry_alternative_source_supported: bool = False,
 ) -> dict[str, Path | str]:
     output = root / "output"
     extracted = output / "extracted"
@@ -38,7 +40,7 @@ def write_ui_fixture(
         name="Cranberry & Caramel Date Bars",
         ingredients=["dates", "cranberries"],
         instructions=["Mix and bake."],
-        missing_information=[Diagnostic(
+        missing_information=cranberry_diagnostics if cranberry_diagnostics is not None else [Diagnostic(
             field_path="ingredients[0]",
             kind="ambiguous",
             severity="critical",
@@ -60,6 +62,7 @@ def write_ui_fixture(
             rationale="A separate synthetic ingredient edit for review isolation.",
             confidence="low",
             uncertainty="The quantity is cropped.",
+            classification=("source_supported" if cranberry_alternative_source_supported else "inferred"),
         ), Suggestion(
             suggestion_id="cranberry-yield",
             field_path="yield_text",

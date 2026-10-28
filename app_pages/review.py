@@ -171,11 +171,9 @@ def _apply_proposal(view, suggestion, disposition: str, final_value: str | None,
                         evidence_reference=evidence_reference)
 
 
-def _resolve_finding(view, buffer, finding, index: int, disposition: str = "source_corrected",
+def _resolve_finding(view, buffer, finding, disposition: str = "source_corrected",
                      evidence_reference: str = "") -> None:
-    binding = next((item for item in view.target_bindings
-                    if item.get("target_kind") == "finding"
-                    and item.get("field_path_at_extraction") == finding.field_path), None)
+    binding = _registered_finding_binding(view, finding)
     if binding is None:
         raise ValueError("The source issue has no unambiguous registered target.")
     if disposition == "deferred":
@@ -190,7 +188,7 @@ def _resolve_finding(view, buffer, finding, index: int, disposition: str = "sour
         disposition=disposition,
         final_value=(_current_value_for_path(current_candidate, finding.field_path)
                      if disposition == "human_completion" else None),
-        operation_id=f"ui-finding:{view.candidate_id}:{saved.revision}:{index}:{disposition}",
+        operation_id=f"ui-finding:{view.candidate_id}:{saved.revision}:{binding['issue_id']}:{disposition}",
         evidence_reference=evidence_reference,
     )
     st.session_state.review_refresh_candidate = view.candidate_id
@@ -1634,6 +1632,7 @@ def _render_editor(view, buffer) -> None:
         name_key = f"recipe_name:{view.candidate_id}"
         st.session_state.setdefault(name_key, str(buffer.get("name", view.candidate.name)))
         st.text_input("Recipe title", key=name_key, disabled=view.protected)
+        _render_field_diagnostics(view, "name")
         if view.protected:
             st.text_area("Ingredients", "\n".join(view.candidate.ingredients), disabled=True, key=f"protected_i:{view.candidate_id}")
             st.text_area("Instructions", "\n\n".join(view.candidate.instructions), disabled=True, key=f"protected_s:{view.candidate_id}")
@@ -1647,8 +1646,10 @@ def _render_editor(view, buffer) -> None:
         with st.expander("Optional details", expanded=st.session_state.get("review_show_optional_details", False)):
             st.text_input("Yield", value=str(buffer.get("yield_text", "")),
                           key=f"recipe_yield_text:{view.candidate_id}")
+            _render_field_diagnostics(view, "yield_text")
             st.text_area("Description", value=str(buffer.get("description", "")), height=84,
                          key=f"recipe_description:{view.candidate_id}")
+            _render_field_diagnostics(view, "description")
             st.text_area("Recipe notes and substitutions", value=str(buffer.get("recipe_notes", "")),
                          height=84, key=f"recipe_notes:{view.candidate_id}",
                          help="Kept separate from ingredient rows; notes are included in Mealie's recipe description.")
@@ -1774,6 +1775,7 @@ def _render_structured_section(view, buffer, field: str) -> None:
               "instructions": ("Instructions", "step", "instruction_ids", "structured_instructions", "structured_s")}
     label, kind, ids_key, value_key, widget_prefix = labels[field]
     st.markdown(f"**{label}**")
+    _render_field_diagnostics(view, field)
     if field == "instructions":
         _render_instruction_suggestion_request(view)
     _render_suggestions(view, buffer, field)
@@ -1805,6 +1807,7 @@ def _render_structured_section(view, buffer, field: str) -> None:
                                     key=f"actions_{kind}:{view.candidate_id}:{row_id}",
                                     help=f"{label} {index + 1} actions",
                                     format_func=lambda value: value)
+        _render_field_diagnostics(view, f"{field}[{index}]", row_id=row_id)
         if action:
             _mutate_row(view, buffer, value_key, ids_key, index, action)
             return
@@ -1858,6 +1861,59 @@ def _mutate_row(view, buffer, values_key: str, ids_key: str, index: int, action:
     st.rerun()
 
 
+def _diagnosis_label(finding) -> str:
+    labels = {
+        "missing_from_source": "Missing from source",
+        "unreadable": "Unreadable in source",
+        "cropped": "Cropped in source",
+        "ambiguous": "Ambiguous in source",
+        "not_extracted": "Visible but not extracted",
+    }
+    return labels.get(str(getattr(finding, "kind", "")), "Source detail needs review")
+
+
+def _render_field_diagnostics(view, field_path: str, *, row_id: str | None = None) -> None:
+    """Show concise diagnoses beside their exact fields; keep evidence expandable."""
+    findings = []
+    for finding in view.candidate.missing_information:
+        path = str(finding.field_path)
+        binding = _registered_finding_binding(view, finding)
+        if binding is None:
+            continue
+        if "[" in path:
+            target_id = str(binding.get("source_target_id") or "") if binding else ""
+            if (binding.get("source_target_kind") != "row" or not row_id
+                    or not target_id or target_id != row_id):
+                continue
+        elif row_id or path != field_path:
+            continue
+        findings.append((binding, finding))
+    for binding, finding in findings:
+        critical = finding.severity == "critical"
+        state = "Needs attention" if critical else "Optional note"
+        label = _diagnosis_label(finding)
+        st.caption(f"{state} · {label}")
+        with st.expander(f"Issue details · {label}", key=(
+                f"field_issue:{view.candidate_id}:{binding['target_id']}")):
+            st.write(finding.detail)
+            if finding.source_evidence:
+                st.caption(f"Source evidence: {finding.source_evidence}")
+            st.caption(f"Next: {finding.suggested_action}")
+
+
+def _registered_finding_binding(view, finding) -> dict | None:
+    """Return one immutable finding binding; ambiguous or unbound rows stay in Issues."""
+    matching = [item for item in view.target_bindings
+                if item.get("target_kind") == "finding"
+                and item.get("field_path_at_extraction") == finding.field_path]
+    payload = finding.model_dump(mode="json")
+    matches = [item for item in matching if item.get("original_issue") == payload]
+    matches.extend(item for item in matching
+                   if not isinstance(item.get("original_issue"), dict)
+                   and item.get("original_value") == finding.detail)
+    return matches[0] if len(matches) == 1 else None
+
+
 def _render_suggestions(view, buffer, field: str, row_id: str | None = None) -> None:
     for suggestion in view.candidate.suggestions:
         path = suggestion.field_path
@@ -1879,11 +1935,21 @@ def _render_suggestions(view, buffer, field: str, row_id: str | None = None) -> 
         can_apply = exact_row or whole_field or bool(getattr(suggestion, "generated", False))
         current = suggestion_current_value(
             suggestion, view.candidate, (*view.target_bindings, *current_bindings))
-        with st.container(border=True):
-            status = getattr(suggestion, "dynamic_status", None) or getattr(suggestion, "review_status", "pending")
-            if not can_apply and status == "pending":
-                st.caption("The original target is unavailable. Review this proposal in Issues; it cannot be applied by position.")
-                continue
+        status = getattr(suggestion, "dynamic_status", None) or getattr(suggestion, "review_status", "pending")
+        if not can_apply and status == "pending":
+            st.caption("The original target is unavailable. Review this proposal in Issues; it cannot be applied by position.")
+            continue
+        proposed = str(getattr(suggestion, "proposed_value", "")).strip()
+        short_value = proposed if len(proposed) <= 64 else proposed[:61].rstrip() + "…"
+        classification = getattr(suggestion, "classification", "inferred")
+        provenance = "Source-supported" if classification == "source_supported" else "AI-inferred"
+        summary = f"Proposal · {short_value} · {provenance}"
+        if status == "pending":
+            summary += " · Unverified"
+        else:
+            summary += f" · {suggestion_status_label(status)}"
+        with st.expander(summary, key=(
+                f"inline_proposal:{view.candidate_id}:{field}:{row_id or 'section'}:{getattr(suggestion, 'suggestion_id', '')}")):
             action = render_suggestion_card(
                 st, suggestion, current_value=current,
                 key_prefix=f"inline:{view.candidate_id}:{field}:{row_id or 'section'}",
@@ -2085,7 +2151,8 @@ def _render_findings(view, buffer) -> None:
             st.markdown("**Source and OCR notes**")
             for warning in view.warnings:
                 st.warning(warning)
-        for index, finding in enumerate(view.critical_findings):
+        for finding in view.critical_findings:
+            binding = _registered_finding_binding(view, finding)
             with st.container(border=True):
                 if st.session_state.get("review_finding_target") == (view.candidate_id, finding.field_path):
                     st.info("Review this finding")
@@ -2094,14 +2161,17 @@ def _render_findings(view, buffer) -> None:
                 if finding.source_evidence:
                     st.caption(f"Source evidence: {finding.source_evidence}")
                 st.caption(f"Next: {finding.suggested_action}")
+                if binding is None:
+                    st.info("This finding has no unique registered target. It remains open for review.")
+                    continue
                 resolution = render_critical_finding_resolution(
-                    st, finding, key_prefix=f"{view.candidate_id}:{index}:{finding.field_path}")
+                    st, finding, key_prefix=f"{view.candidate_id}:{binding['target_id']}")
                 if resolution and resolution != "deferred":
                     evidence = ("Operator verified the field against the original source scan."
                                 if resolution == "source_corrected"
                                 else "Operator explicitly accepted the current wording as inferred recipe content.")
                     _run_issue_action(lambda: _resolve_finding(
-                        view, buffer, finding, index, resolution, evidence))
+                        view, buffer, finding, resolution, evidence))
         for suggestion in view.candidate.suggestions:
             status = getattr(suggestion, "dynamic_status", None) or getattr(suggestion, "review_status", "pending")
             path = suggestion.field_path
