@@ -27,6 +27,55 @@ def _png() -> bytes:
 
 
 class StreamlitUploadTests(unittest.TestCase):
+    def test_new_user_sees_batch_creation_as_the_starting_action(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "output"
+            output.mkdir()
+            (output / ".fixture-library").write_text("synthetic test library", encoding="utf-8")
+            with patch.dict(os.environ, {
+                "RECIPE_IMPORTER_OUTPUT_DIR": str(output),
+                "RECIPE_IMPORTER_SOURCE_DIR": "",
+                "RECIPE_IMPORTER_FIXTURE_MODE": "1",
+            }):
+                app = AppTest.from_file(str(PAGE)).run(timeout=15)
+
+        self.assertFalse(app.exception)
+        self.assertTrue(any(item.label == "Create batch" for item in app.form_submit_button))
+        self.assertFalse(app.selectbox)
+
+    def test_cloud_consent_is_cleared_when_batch_source_scope_changes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "output"
+            output.mkdir()
+            (output / ".fixture-library").write_text("synthetic test library", encoding="utf-8")
+            with patch.dict(os.environ, {
+                "RECIPE_IMPORTER_OUTPUT_DIR": str(output),
+                "RECIPE_IMPORTER_SOURCE_DIR": "",
+                "RECIPE_IMPORTER_FIXTURE_MODE": "1",
+            }):
+                app = AppTest.from_file(str(PAGE)).run(timeout=15)
+                next(item for item in app.text_input if item.label == "Batch name").set_value("Consent scope")
+                next(item for item in app.form_submit_button if item.label == "Create batch").click().run(timeout=15)
+                uploader = next(item for item in app.file_uploader
+                                if item.label == "Add PDF, JPG, PNG, or WEBP scans")
+                first = ("one.png", _png(), "image/png")
+                second = ("two.png", Image.new("RGB", (25, 25), (90, 40, 120)), "image/png")
+                second_image = io.BytesIO()
+                second[1].save(second_image, format="PNG")
+                second = (second[0], second_image.getvalue(), second[2])
+                uploader.set_value([first]).run(timeout=15)
+                next(item for item in app.segmented_control
+                     if item.label == "Choose an extraction method").set_value("Gemini extraction").run(timeout=15)
+                consent = next(item for item in app.checkbox if "simulated" in item.label.lower())
+                consent.check().run(timeout=15)
+                uploader = next(item for item in app.file_uploader
+                                if item.label == "Add PDF, JPG, PNG, or WEBP scans")
+                uploader.set_value([first, second]).run(timeout=15)
+                consent = next(item for item in app.checkbox if "simulated" in item.label.lower())
+
+        self.assertFalse(app.exception)
+        self.assertFalse(consent.value)
+
     def test_failed_worker_job_exposes_retry_and_preserved_unfinished_count(self):
         with tempfile.TemporaryDirectory() as tmp:
             output = Path(tmp) / "output"

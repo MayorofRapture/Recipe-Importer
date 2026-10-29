@@ -111,6 +111,17 @@ async function chooseFiles(cdp, paths) {
   if (!node.nodeId) throw new Error('The upload file input is not available.');
   await cdp.send('DOM.setFileInputFiles', { nodeId: node.nodeId, files: paths });
 }
+async function selectReviewPane(cdp, name) {
+  const selected = await evaluate(cdp, `(() => {
+    const option=[...document.querySelectorAll('.st-key-review-pane-switcher [role="radio"]')]
+      .find(item=>item.innerText.trim()===${JSON.stringify(name)});
+    if(!option)return false; option.scrollIntoView({block:'center',inline:'nearest'}); option.focus(); option.click(); return true;
+  })()`);
+  if (!selected) throw new Error(`Could not find the ${name} Review pane.`);
+  await waitFor(cdp, `!![...document.querySelectorAll('.st-key-review-pane-switcher [role="radio"]')]
+    .find(item=>item.innerText.trim()===${JSON.stringify(name)}&&item.getAttribute('aria-checked')==='true')`,
+    `${name} Review pane`);
+}
 async function screenshot(cdp, name) {
   const replacedName = name.replace(/\d+x\d+/, `${viewport[0]}x${viewport[1]}`);
   await evaluate(cdp, `(() => {
@@ -181,6 +192,23 @@ try {
   await chooseFiles(cdp, [validFile, invalidFile]);
   await waitFor(cdp, `/Saved synthetic-recipe.png/.test(document.body.innerText) && /Could not add invalid-scan.pdf/.test(document.body.innerText)`, 'partial upload acceptance');
   await waitFor(cdp, `(() => { const b=[...document.querySelectorAll('button')].find(x=>x.innerText.includes('Start extraction')); return !!b && !b.disabled; })()`, 'enabled extraction action');
+  const uploadHierarchy = await evaluate(cdp, `(() => {
+    const text=document.body.innerText;
+    const labels=['Synthetic browser batch','Select an existing batch','Current extraction job',
+      'Files in this batch','Add PDF, JPG, PNG, or WEBP scans','Extraction','Create a batch','Cookbook PDFs'];
+    const positions=Object.fromEntries(labels.map(label=>[label,text.indexOf(label)]));
+    return {positions,viewportWidth:innerWidth,
+      documentWidth:document.documentElement.scrollWidth};
+  })()`);
+  if (uploadHierarchy.documentWidth > uploadHierarchy.viewportWidth) {
+    throw new Error(`Upload overflows the ${viewport[0]}px viewport: ${JSON.stringify(uploadHierarchy)}.`);
+  }
+  const orderedSections=['Synthetic browser batch','Select an existing batch','Current extraction job',
+    'Files in this batch','Add PDF, JPG, PNG, or WEBP scans','Extraction','Create a batch','Cookbook PDFs'];
+  const positions=orderedSections.map(label=>uploadHierarchy.positions[label]);
+  if (positions.some(position=>position < 0) || positions.some((position,index)=>index>0 && position < positions[index-1])) {
+    throw new Error(`Upload sections do not follow the D3 order: ${JSON.stringify(uploadHierarchy)}.`);
+  }
   artifacts.push(await screenshot(cdp, 'upload-partial-success-1440x900.png'));
   const errorVisible = await evaluate(cdp, `(() => { const e=[...document.querySelectorAll('div,p,span')].find(x=>x.children.length===0 && x.innerText.includes('Could not add invalid-scan.pdf')); e?.scrollIntoView({block:'center'}); return !!e; })()`);
   if (errorVisible) artifacts.push(await screenshot(cdp, 'upload-rejected-file-error-1440x900.png'));
@@ -201,6 +229,12 @@ try {
     await clickText(cdp, 'Review', 'a,button,[role="tab"],[role="button"]');
   }
   await waitFor(cdp, `([...document.querySelectorAll('input')].some(e=>e.value.includes('Synthetic demo from synthetic-recipe')) || document.body.innerText.includes('Synthetic demo from synthetic-recipe')) && /Save draft/.test(document.body.innerText)`, 'review candidate');
+  if (viewport[0] <= 900) {
+    await selectReviewPane(cdp, 'Recipe');
+    await waitFor(cdp, `!![...document.querySelectorAll('input[aria-label="Recipe title"]')].find(e=>e.getClientRects().length)`, 'narrow Recipe pane');
+  } else {
+    await waitFor(cdp, `!![...document.querySelectorAll('input[aria-label="Recipe title"]')].find(e=>e.getClientRects().length)`, 'desktop Recipe editor');
+  }
   if (viewport[0] <= 480) {
     await tabToControl(cdp, 'Collapse sidebar');
     await key(cdp, ' ', 'Space', 32);
@@ -280,7 +314,9 @@ try {
   await waitFor(cdp, `/1 recipes will be sent to Mealie/.test(document.body.innerText)`, 'import preview');
   artifacts.push(await screenshot(cdp, 'import-preview-1440x900.png'));
   await clickText(cdp, 'Import 1 recipe');
-  await waitFor(cdp, `/Imported/.test(document.body.innerText) && /History/.test(document.body.innerText)`, 'fake Mealie import and history');
+  await waitFor(cdp, `/Recipe created in Mealie/.test(document.body.innerText) && /Tag applied/.test(document.body.innerText) && /History and recovery/.test(document.body.innerText)`, 'separate fake Mealie create and tag outcomes');
+  await clickText(cdp, 'History and recovery', 'summary,button,a,[role="button"]');
+  await waitFor(cdp, `/Find in history/.test(document.body.innerText) && /Imported successfully/.test(document.body.innerText)`, 'searchable protected import history');
   await evaluate(cdp, `(() => { const text='Synthetic demo from synthetic-recipe'; const items=[...document.querySelectorAll('div,p,span')].filter(e=>e.children.length===0 && e.innerText?.includes(text)); items.sort((a,b)=>a.innerText.length-b.innerText.length)[0]?.scrollIntoView({block:'center'}); })()`);
   artifacts.push(await screenshot(cdp, 'import-history-1440x900.png'));
 
@@ -297,6 +333,29 @@ try {
         focusOutline:s.outlineStyle+' '+s.outlineWidth,focusShadow:s.boxShadow};}),
     imagesWithoutAlt:[...document.querySelectorAll('img:not([alt])')].length,text:document.body.innerText.slice(0,3000)
   }))()`);
+  if (accessible.viewport.horizontalOverflow) {
+    throw new Error(`Import & history overflows the ${viewport[0]}px viewport: ${JSON.stringify(accessible.viewport)}.`);
+  }
+  const browserReport = {
+    viewport: accessible.viewport,
+    uploadHierarchy,
+    review: reviewBaseline,
+    reviewKeyboardFocus: {
+      tabSteps: saveFocusTrail.length,
+      visible: focusedSave.visible,
+      focusShadow: focusedSave.boxShadow,
+      restoredToTitle: focusAfterSave.label === 'Recipe title',
+    },
+    importHeadings: accessible.headings.map(item => item.text),
+    importControls: accessible.controls.filter(item => [
+      'Select all eligible recipes', 'Recipes to import', 'Mealie tag (optional)',
+      'Preview import', 'Find in history', 'History page',
+    ].includes(item.name)).map(({ name, disabled, x, y, width, height }) => ({
+      name, disabled, x, y, width, height,
+    })),
+    screenshots: artifacts.map(path => path.split(/[\\/]/).at(-1)),
+  };
+  await writeFile(join(evidence, 'browser-report.json'), JSON.stringify(browserReport, null, 2), 'utf8');
   console.log(JSON.stringify({ completed: true, artifacts, final: accessible }, null, 2));
   ws.close();
 } finally {

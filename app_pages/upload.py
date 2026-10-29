@@ -2,9 +2,11 @@
 from __future__ import annotations
 
 import hashlib
+import os
 from pathlib import Path
 
 import streamlit as st
+from dotenv import dotenv_values
 
 from app_pages.common import paths
 from batch_store import BatchStore
@@ -160,6 +162,28 @@ def _job_summary(job: dict) -> str:
     if status == "failed":
         return "Extraction stopped before all files finished. Check the failure details, then retry unfinished files."
     return "All files finished extraction. Review the candidates before approval."
+
+
+def _render_batch_creation(store: BatchStore, *, expanded: bool) -> None:
+    if expanded:
+        st.subheader("Create your first batch")
+        form_context = st.container()
+    else:
+        form_context = st.expander("Create a batch", expanded=False)
+    with form_context:
+        st.caption("Keep scans and extraction progress together. A cookbook tag is applied only to future imports from this batch.")
+        with st.form("create_upload_batch", border=False):
+            new_name = st.text_input("Batch name", placeholder="For example, Sunday recipes", key="new_batch_name")
+            new_tag = st.text_input("Cookbook tag (optional)", placeholder="Applied only to recipes imported from this batch", key="new_batch_tag")
+            create_batch = st.form_submit_button("Create batch", icon=":material/create_new_folder:")
+    if create_batch:
+        try:
+            created = store.create(new_name, new_tag)
+            st.session_state["upload_batch_id"] = created["batch_id"]
+            st.session_state["upload_notice"] = f"Created {created['name']}. Add scans below."
+            st.rerun()
+        except (OSError, ValueError, RuntimeError) as exc:
+            st.error(f"The batch could not be created: {exc}")
 
 
 def _ranges_overlap(first_page: int, last_page: int, other_first: int, other_last: int) -> bool:
@@ -487,41 +511,18 @@ st.caption("Add recipe scans, choose how to read them, then review the results b
 output_dir, _source_root = paths()
 store = BatchStore(output_dir)
 batches = store.list_batches()
-
-with st.form("create_upload_batch", border=False):
-    st.subheader("Create a batch")
-    new_name = st.text_input("Batch name", placeholder="For example, Sunday recipes", key="new_batch_name")
-    new_tag = st.text_input("Cookbook tag (optional)", placeholder="Applied only to recipes imported from this batch", key="new_batch_tag")
-    create_batch = st.form_submit_button("Create batch", icon=":material/create_new_folder:")
-
-if create_batch:
-    try:
-        created = store.create(new_name, new_tag)
-        st.session_state["upload_batch_id"] = created["batch_id"]
-        st.session_state["upload_notice"] = f"Created {created['name']}. Add scans below."
-        st.rerun()
-    except (OSError, ValueError, RuntimeError) as exc:
-        st.error(f"The batch could not be created: {exc}")
-
-batches = store.list_batches()
 batch_ids = [item["batch_id"] for item in batches]
 selected_id = st.session_state.get("upload_batch_id")
 if selected_id not in batch_ids:
     selected_id = batch_ids[0] if batch_ids else ""
     st.session_state["upload_batch_id"] = selected_id
 
-if batches:
-    selected_id = st.selectbox(
-        "Select an existing batch", batch_ids,
-        format_func=lambda value: _batch_label(next(item for item in batches if item["batch_id"] == value)),
-        key="upload_batch_id",
-    )
-
 notice = st.session_state.pop("upload_notice", "")
 if notice:
     st.success(notice)
 
 if not selected_id:
+    _render_batch_creation(store, expanded=True)
     st.info("Create a batch to begin. Each accepted file is saved as soon as it passes validation.")
     st.stop()
 
@@ -531,24 +532,38 @@ if batch is None:
     st.stop()
 
 st.subheader(batch["name"])
+sources = batch.get("sources", [])
+st.caption(f"Current batch · {len(sources)} {'file' if len(sources) == 1 else 'files'}")
 if batch.get("tag"):
     st.caption(f"Cookbook tag for future imports: {batch['tag']}")
 
-uploads = st.file_uploader(
-    "Add PDF, JPG, PNG, or WEBP scans",
-    type=["pdf", "jpg", "jpeg", "png", "webp"],
-    accept_multiple_files=True,
-    key=f"upload_files_{selected_id}",
-    help="Each file is validated and saved independently, so one invalid file does not discard accepted files.",
-)
-upload_results = _stage_selected_files(store, batch, uploads)
-for result in upload_results:
-    _render_stage_result(result, store)
+if batches:
+    selected_id = st.selectbox(
+        "Select an existing batch", batch_ids,
+        format_func=lambda value: next(item for item in batches if item["batch_id"] == value)["name"],
+        key="upload_batch_id",
+    )
+    other_batches = [item for item in batches if item["batch_id"] != selected_id][:3]
+    if other_batches:
+        st.caption("Other recent batches: " + " · ".join(_batch_label(item) for item in other_batches))
 
 batch = store.get(selected_id) or batch
 sources = batch.get("sources", [])
-batch_jobs = [item for item in JobService(output_dir).list_jobs()
-              if item.get("batch_id") == selected_id]
+jobs = [item for item in JobService(output_dir).list_jobs()
+        if item.get("batch_id") == selected_id]
+active_job = next((item for item in jobs if item.get("status") in {
+    "queued", "waiting_for_worker", "running", "pausing", "paused", "quota_paused",
+}), None)
+st.markdown("#### Current extraction job")
+_render_job_panel(output_dir, selected_id)
+if active_job is not None and sources:
+    status_counts: dict[str, int] = {}
+    for source in active_job.get("sources", []):
+        label = _source_status(str(source.get("status", "")))
+        status_counts[label] = status_counts.get(label, 0) + 1
+    st.caption("Job files: " + " · ".join(f"{count} {label.casefold()}" for label, count in status_counts.items()))
+
+batch_jobs = jobs
 job_source_states = {
     source["source_id"]: source.get("status", "")
     for job in reversed(batch_jobs)
@@ -572,6 +587,22 @@ if sources:
 else:
     st.info("No files have been accepted yet. Add one or more local scans to continue.")
 
+uploads = st.file_uploader(
+    "Add PDF, JPG, PNG, or WEBP scans",
+    type=["pdf", "jpg", "jpeg", "png", "webp"],
+    accept_multiple_files=True,
+    key=f"upload_files_{selected_id}",
+    help="Each file is validated and saved independently, so one invalid file does not discard accepted files.",
+)
+source_ids_before_stage = {str(item.get("source_id", "")) for item in sources}
+upload_results = _stage_selected_files(store, batch, uploads)
+for result in upload_results:
+    _render_stage_result(result, store)
+batch = store.get(selected_id) or batch
+sources = batch.get("sources", [])
+if any(str(item.get("source_id", "")) not in source_ids_before_stage for item in sources):
+    st.rerun()
+
 st.markdown("#### Extraction")
 mode_labels = ["Local OCR", "Gemini extraction", "OCR-assisted review"]
 mode_by_label = {"Local OCR": LOCAL_OCR, "Gemini extraction": GEMINI,
@@ -591,11 +622,26 @@ else:
     else:
         st.warning("OCR-assisted review sends the selected scan and OCR text to Google for recipe structuring.")
 cloud_consent = False
+config_values = dotenv_values()
+configuration_scope = (
+    str(os.getenv("GEMINI_MODEL") or config_values.get("GEMINI_MODEL") or ""),
+    str(os.getenv("GEMINI_MODELS_JSON") or config_values.get("GEMINI_MODELS_JSON") or ""),
+    str(os.getenv("GEMINI_RPM") or config_values.get("GEMINI_RPM") or ""),
+    str(os.getenv("TESSERACT_CMD") or config_values.get("TESSERACT_CMD") or ""),
+)
+source_scope = tuple(sorted((str(item.get("source_id", "")), str(item.get("digest", "")))
+                            for item in sources))
+consent_key = f"upload_cloud_consent_{selected_id}"
+consent_scope_key = f"upload_cloud_consent_scope_{selected_id}"
+consent_scope = (selected_id, source_scope, mode, configuration_scope)
+if st.session_state.get(consent_scope_key) != consent_scope:
+    st.session_state[consent_key] = False
+    st.session_state[consent_scope_key] = consent_scope
 if mode in {GEMINI, OCR_ASSISTED}:
     consent_label = ("I understand this extraction is simulated in the demonstration library."
                      if fixture_mode() else
                      "I agree to send these recipe scans to Google for the selected extraction.")
-    cloud_consent = st.checkbox(consent_label, key=f"upload_cloud_consent_{selected_id}")
+    cloud_consent = st.checkbox(consent_label, key=consent_key)
 
 try:
     service = _job_service(output_dir)
@@ -612,11 +658,7 @@ if service is not None:
         if source.get("source_id")
     }
     new_sources = [source for source in sources if source.get("source_id") not in handled_source_ids]
-    active_job = next((item for item in jobs if item.get("status") in {
-        "queued", "waiting_for_worker", "running", "pausing", "paused", "quota_paused",
-    }), None)
     if active_job is not None:
-        _render_job_panel(output_dir, selected_id)
         if new_sources:
             st.info("New files are saved and will be available after the current extraction finishes.")
     elif new_sources or not jobs:
@@ -629,7 +671,6 @@ if service is not None:
                 st.rerun()
             except (OSError, RuntimeError, ValueError) as exc:
                 st.error(f"Extraction could not start: {exc}")
-    else:
-        _render_job_panel(output_dir, selected_id)
 
+_render_batch_creation(store, expanded=False)
 _render_cookbook_workflow(store, batch, output_dir)
