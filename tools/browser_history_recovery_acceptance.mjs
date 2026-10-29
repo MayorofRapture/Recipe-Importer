@@ -103,6 +103,24 @@ async function clickAccessible(cdp, role, name) {
   await cdp.send('Input.dispatchMouseEvent', { type: 'mousePressed', x: control.x, y: control.y, button: 'left', clickCount: 1 });
   await cdp.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x: control.x, y: control.y, button: 'left', clickCount: 1 });
 }
+async function openExpander(cdp, name) {
+  const disclosure = await evaluate(cdp, `(() => {
+    const control=[...document.querySelectorAll('button,[role="button"],summary')]
+      .find(item=>item.innerText.includes(${JSON.stringify(name)})&&item.getClientRects().length);
+    if(!control)return null;
+    const rect=control.getBoundingClientRect();
+    return {x:rect.x+rect.width/2,y:rect.y+rect.height/2};
+  })()`);
+  if (!disclosure) {
+    const diagnostic = await evaluate(cdp, `JSON.stringify({text:document.body?.innerText?.slice(-1200),
+      matching:[...document.querySelectorAll('*')].filter(item=>item.getClientRects().length&&item.innerText?.includes(${JSON.stringify(name)}))
+        .sort((a,b)=>a.innerText.length-b.innerText.length).slice(0,6).map(item=>({tag:item.tagName,role:item.getAttribute('role'),text:item.innerText.slice(0,100)}))})`);
+    throw new Error(`Could not find the ${name} history disclosure: ${diagnostic}`);
+  }
+  await cdp.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: disclosure.x, y: disclosure.y });
+  await cdp.send('Input.dispatchMouseEvent', { type: 'mousePressed', x: disclosure.x, y: disclosure.y, button: 'left', clickCount: 1 });
+  await cdp.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x: disclosure.x, y: disclosure.y, button: 'left', clickCount: 1 });
+}
 async function fillTextbox(cdp, name, value, { pressEnter = false } = {}) {
   await waitFor(cdp, async () => {
     try { await accessibleNode(cdp, 'textbox', name); return true; }
@@ -167,6 +185,8 @@ try {
   await waitFor(cdp, () => bodyIncludes(cdp, 'Demonstration library'), 'isolated synthetic app startup');
   await assertBrowserFixtureAttestation(cdp, fixture);
   await clickAccessible(cdp, 'link', 'Import & history');
+  await waitFor(cdp, () => bodyIncludes(cdp, 'Ready to import'), 'Import and history workspace');
+  await openExpander(cdp, 'History and recovery');
   await waitFor(cdp, () => bodyIncludes(cdp, 'Creation is blocked until reconciliation.'), 'uncertain historical attempt');
   await fillTextbox(cdp, 'Existing Mealie recipe slug', 'historical-existing', { pressEnter: true });
   await waitFor(cdp, async () => {

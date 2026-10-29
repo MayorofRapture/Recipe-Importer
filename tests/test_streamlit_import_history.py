@@ -322,9 +322,13 @@ class StreamlitImportHistoryTests(unittest.TestCase):
                                          "RECIPE_IMPORTER_FIXTURE_MODE": "1"}):
                 app = AppTest.from_file(str(PAGE)).run(timeout=15)
                 app.multiselect[0].set_value([view.candidate_id]).run(timeout=15)
+                next(item for item in app.text_input if item.label == "Mealie tag (optional)").set_value(
+                    "Sunday recipes").run(timeout=15)
                 next(button for button in app.button if button.label == "Preview import").click().run(timeout=15)
                 next(button for button in app.button if button.label == "Import 1 recipe").click().run(timeout=15)
                 self.assertFalse(app.exception)
+                self.assertTrue(any("Recipe created in Mealie" in item.value for item in app.success))
+                self.assertTrue(any("Tag applied" in item.value for item in app.success))
                 app.run(timeout=15)
             import json
             fake_recipes = json.loads((output / "fixture_mealie.json").read_text(encoding="utf-8"))["recipes"]
@@ -355,3 +359,4 @@ class StreamlitImportHistoryTests(unittest.TestCase):
             self.assertFalse(app.exception)
             self.assertTrue(any("Synthetic rice" in item.value for item in app.markdown))
             self.assertTrue(any("tag" in button.label.lower() for button in app.button))
+            self.assertTrue(any(item.label == "History and recovery" for item in app.expander))
