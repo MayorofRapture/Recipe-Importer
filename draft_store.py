@@ -4,10 +4,11 @@ from __future__ import annotations
 import json
 import os
 import threading
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from ui_diagnostics import count as ui_count
 
 
 @dataclass(frozen=True)
@@ -23,6 +24,7 @@ class DraftRecord:
     warnings: list[str]
     revision: int
     saved_at: str
+    repair_proposal: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> "DraftRecord":
@@ -37,6 +39,7 @@ class DraftRecord:
             warnings=[str(item) for item in value.get("warnings", [])],
             revision=int(value.get("revision", 1)),
             saved_at=str(value.get("saved_at", "")),
+            repair_proposal=dict(value.get("repair_proposal") or {}),
         )
 
 
@@ -55,6 +58,7 @@ class DraftStore:
         raw_instructions: str,
         mode: str,
         warnings: list[str],
+        repair_proposal: dict[str, Any] | None = None,
     ) -> DraftRecord:
         if not candidate_id.strip():
             raise ValueError("candidate_id must not be empty")
@@ -72,6 +76,8 @@ class DraftStore:
                 warnings=list(warnings),
                 revision=(previous.revision if previous else 0) + 1,
                 saved_at=datetime.now(timezone.utc).isoformat(),
+                repair_proposal=(dict(repair_proposal) if repair_proposal is not None
+                                 else dict(previous.repair_proposal) if previous else {}),
             )
             self.path.parent.mkdir(parents=True, exist_ok=True)
             with self.path.open("a", encoding="utf-8") as handle:
@@ -84,6 +90,7 @@ class DraftStore:
         latest: DraftRecord | None = None
         if not self.path.exists():
             return None
+        ui_count("ledger_reads")
         for line in self.path.read_text(encoding="utf-8").splitlines():
             if not line.strip():
                 continue
@@ -96,6 +103,7 @@ class DraftStore:
         records: dict[str, DraftRecord] = {}
         if not self.path.exists():
             return records
+        ui_count("ledger_reads")
         for line in self.path.read_text(encoding="utf-8").splitlines():
             if line.strip():
                 record = DraftRecord.from_dict(json.loads(line))

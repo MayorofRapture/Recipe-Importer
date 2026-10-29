@@ -19,15 +19,19 @@ from typing import Optional
 
 import requests
 from dotenv import load_dotenv
+from draft_store import DraftStore
 from google import genai
 from google.genai import types
 
 from model_routing import ModelRouter, UsageLedger, parse_model_config, validate_model_ids
 from recipe_quality import ExtractionBatch, RecipeCandidate, is_complete, needs_review, schema_recipe
 from mealie_client import MealieClient
+from library_paths import LibraryPathConflict, alternate_cwd_library, resolve_library_path
+from ui_diagnostics import count as ui_count
 import local_ocr
 from ocr_structuring import OcrLineReferences, assemble_line_references, numbered_lines
-from review_store import ReviewStore, apply_candidate_decision, apply_review_decision
+from review_store import (ReviewConflict, ReviewDecision, ReviewStore, apply_candidate_decision, apply_review_decision,
+                          extraction_identity, _state_lock)
 
 SUPPORTED = {".pdf", ".jpg", ".jpeg", ".png", ".webp"}
 INLINE_MAX_BYTES = 8 * 1024 * 1024
@@ -101,7 +105,14 @@ def _norm(value: str) -> str:
 
 
 def candidate_identity(source_hash: str, candidate: RecipeCandidate) -> str:
-    return _identity_for_title(source_hash, candidate.name)
+    payload = candidate.model_dump(mode="json")
+    if not payload.get("notes"):
+        payload.pop("notes", None)
+    fingerprint = hashlib.sha256(json.dumps(
+        payload, ensure_ascii=False,
+        sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")).hexdigest()
+    return f"{source_hash}:{fingerprint[:24]}"
 
 
 def _identity_for_title(source_hash: str, title: str) -> str:
@@ -113,8 +124,11 @@ class StateStore:
     def __init__(self, path: Path):
         self.path = path
         self.records: dict[str, dict] = {}
+        self._identity_records: dict[str, list[dict]] = {}
+        self._source_title_records: dict[tuple[str, str], list[dict]] = {}
         self.lock = threading.Lock()
         if path.exists():
+            ui_count("ledger_reads")
             for line in path.read_text(encoding="utf-8").splitlines():
                 if line.strip():
                     record = json.loads(line)
@@ -123,36 +137,102 @@ class StateStore:
                         if not record.get("identity") and key_index.isdigit() and record.get("title"):
                             record["identity"] = _identity_for_title(key_source, str(record["title"]))
                         self.records[record["key"]] = record
+        self._rebuild_indexes()
+
+    def _rebuild_indexes(self) -> None:
+        self._identity_records = {}
+        self._source_title_records = {}
+        for record in self.records.values():
+            self._index_record(record)
+
+    def _index_record(self, record: dict) -> None:
+        identity = record.get("identity")
+        if identity:
+            self._identity_records.setdefault(str(identity), []).append(record)
+        key = str(record.get("key", ""))
+        source_hash, separator, _ = key.partition(":")
+        title = _norm(str(record.get("title", "")))
+        if separator and title:
+            self._source_title_records.setdefault((source_hash, title), []).append(record)
+
+    def _unindex_record(self, record: dict) -> None:
+        identity = record.get("identity")
+        if identity:
+            matches = self._identity_records.get(str(identity), [])
+            self._identity_records[str(identity)] = [item for item in matches if item is not record]
+            if not self._identity_records[str(identity)]:
+                del self._identity_records[str(identity)]
+        key = str(record.get("key", ""))
+        source_hash, separator, _ = key.partition(":")
+        title = _norm(str(record.get("title", "")))
+        lookup = (source_hash, title)
+        if separator and title and lookup in self._source_title_records:
+            matches = self._source_title_records[lookup]
+            self._source_title_records[lookup] = [item for item in matches if item is not record]
+            if not self._source_title_records[lookup]:
+                del self._source_title_records[lookup]
 
     def get(self, key: str) -> Optional[dict]:
         with self.lock:
             return self.records.get(key)
 
+    def refresh(self) -> None:
+        """Read other UI/CLI writers' completed records under the shared lock."""
+        with self.lock:
+            with _state_lock(self.path):
+                refreshed = StateStore(self.path)
+                self.records = refreshed.records
+                self._identity_records = refreshed._identity_records
+                self._source_title_records = refreshed._source_title_records
+
     def add(self, key: str, status: str, slug: str, filename: str, title: str,
-            identity: str = "", **fields) -> None:
+            identity: str = "", *, locked: bool = False, **fields) -> None:
+        from contextlib import nullcontext
         record = {"key": key, "status": status, "slug": slug, "file": filename,
                   "title": title, "timestamp": datetime.now(timezone.utc).isoformat()}
         if identity:
             record["identity"] = identity
         record.update(fields)
         with self.lock:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            with self.path.open("a", encoding="utf-8") as fh:
-                fh.write(json.dumps(record, ensure_ascii=False) + "\n")
-                fh.flush()
-                os.fsync(fh.fileno())
+            with (nullcontext() if locked else _state_lock(self.path)):
+                self.path.parent.mkdir(parents=True, exist_ok=True)
+                with self.path.open("a", encoding="utf-8") as fh:
+                    fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+                    fh.flush()
+                    os.fsync(fh.fileno())
+            previous = self.records.get(key)
+            if previous is not None:
+                self._unindex_record(previous)
             self.records[key] = record
+            self._index_record(record)
 
     def find_candidate(self, source_hash: str, index: int,
-                       candidate: RecipeCandidate) -> Optional[dict]:
+                       candidate: RecipeCandidate, identity_aliases: tuple[str, ...] = (),
+                       allow_legacy_title_match: bool = True) -> Optional[dict]:
         identity = candidate_identity(source_hash, candidate)
         legacy = self.records.get(f"{source_hash}:{index}")
-        identity_matches = [record for record in self.records.values()
-                            if record.get("identity") == identity]
+        identities = {identity, *identity_aliases}
+        identity_matches = [record for value in identities
+                            for record in self._identity_records.get(value, ())]
         if len(identity_matches) > 1:
             raise AmbiguousCandidate(f"Multiple prior records match {candidate.name!r}; manual reconciliation required")
-        if legacy and _norm(str(legacy.get("title", ""))) == _norm(candidate.name):
+        if identity_matches:
+            return identity_matches[0]
+        title_records = self._source_title_records.get((source_hash, _norm(candidate.name)), ())
+        if len(title_records) > 1 and len({record.get("identity") for record in title_records}) == 1:
+            raise AmbiguousCandidate(f"Multiple legacy records share {candidate.name!r}; manual reconciliation required")
+        legacy_identity = _identity_for_title(source_hash, candidate.name)
+        if allow_legacy_title_match and legacy and _norm(str(legacy.get("title", ""))) == _norm(candidate.name) \
+                and legacy.get("identity") in {None, legacy_identity}:
             return legacy
+        title_matches = [record for record in title_records
+                         if record.get("identity") == legacy_identity]
+        if not allow_legacy_title_match and title_matches:
+            raise AmbiguousCandidate(f"Legacy identity for duplicate title {candidate.name!r} cannot be assigned to a sibling")
+        if len(title_matches) == 1:
+            return title_matches[0]
+        if len(title_matches) > 1:
+            raise AmbiguousCandidate(f"Multiple legacy records share {candidate.name!r}; manual reconciliation required")
         matches = identity_matches
         if not matches:
             return None
@@ -166,12 +246,15 @@ _diagnostic_log_lock = threading.Lock()
 
 
 def google_client(api_key: str):
+    from runtime_safety import require_live_services
+    require_live_services()
     if not hasattr(_thread_local, "client"):
         _thread_local.client = genai.Client(api_key=api_key)
     return _thread_local.client
 
 
 def file_digest(path: Path) -> str:
+    ui_count("source_hashes")
     digest = hashlib.sha256()
     with path.open("rb") as fh:
         while chunk := fh.read(1024 * 1024):
@@ -249,19 +332,45 @@ def _empty_response_reason(diagnostics: dict) -> str:
     return "OTHER"
 
 
-def extract(path: Path, api_key: str, model: str, gate: RateGate | None = None) -> ExtractionBatch:
+def estimate_request_tokens(path: Path) -> int:
+    """Estimate input TPM without treating compressed PDF bytes as text tokens."""
+    prompt_tokens = (len(PROMPT) + 3) // 4
+    if path.suffix.lower() == ".pdf":
+        try:
+            import pymupdf
+
+            with pymupdf.open(path) as document:
+                page_count = document.page_count
+                native_text = sum(len(page.get_text()) for page in document)
+            # Google documents 258 visual tokens per PDF page. Include native text
+            # conservatively; the exact provider count varies by model/API version.
+            return max(1, prompt_tokens + page_count * 258 + (native_text + 3) // 4)
+        except Exception:
+            # Keep malformed PDFs guarded until the provider returns a useful error.
+            return max(1, (len(PROMPT) + path.stat().st_size + 3) // 4)
+    return max(1, (len(PROMPT) + path.stat().st_size + 3) // 4)
+
+
+def extract(path: Path, api_key: str, model: str, gate: RateGate | None = None,
+            before_request=None, before_upload=None) -> ExtractionBatch:
     client = google_client(api_key)
     upload = None
+    batch = None
     try:
         if path.stat().st_size <= INLINE_MAX_BYTES:
             source = types.Part.from_bytes(data=path.read_bytes(), mime_type=file_mime(path))
         else:
+            if before_upload is not None:
+                before_upload(model)
             upload = client.files.upload(file=str(path), config=types.UploadFileConfig(mime_type=file_mime(path)))
             source = upload
+        estimated_tokens = estimate_request_tokens(path)
         for attempt in range(5):
             try:
                 if gate is not None:
                     gate.wait_turn()
+                if before_request is not None:
+                    before_request(model, estimated_tokens)
                 response = client.models.generate_content(
                     model=model, contents=[PROMPT, source],
                     config=types.GenerateContentConfig(response_mime_type="application/json",
@@ -274,30 +383,51 @@ def extract(path: Path, api_key: str, model: str, gate: RateGate | None = None) 
                         f"Gemini returned no text ({diagnostics['reason']})",
                         model=model, diagnostics=diagnostics,
                     )
-                return ExtractionBatch.model_validate_json(response.text)
+                batch = ExtractionBatch.model_validate_json(response.text)
+                return batch
             except Exception as exc:
                 text = str(exc).lower()
+                if before_request is not None and any(
+                        term in text for term in ("429", "resource_exhausted", "quota", "rate limit")):
+                    raise
                 transient = any(term in text for term in ("429", "resource_exhausted", "rate limit", "503", "502", "504", "unavailable", "deadline exceeded", "timeout"))
                 if not transient or attempt == 4:
                     raise
                 time.sleep(min(60.0, 3 * 2 ** attempt) + random.uniform(0, 1))
         raise RuntimeError("Gemini retry attempts exhausted")
     finally:
+        active_error = sys.exc_info()[1]
         if upload is not None and getattr(upload, "name", None):
             try:
                 client.files.delete(name=upload.name)
-            except Exception:
-                pass
+            except Exception as exc:
+                detail = f"Gemini uploaded-file cleanup failed: {_redact_error(exc, {'api_key': api_key})[:500]}"
+                if active_error is not None:
+                    diagnostics = getattr(active_error, "diagnostics", None)
+                    if not isinstance(diagnostics, dict):
+                        diagnostics = {}
+                    diagnostics["cleanup_error"] = detail
+                    try:
+                        setattr(active_error, "diagnostics", diagnostics)
+                    except Exception:
+                        print(detail, file=sys.stderr)
+                elif batch is not None:
+                    batch.general_warnings.append(detail)
+                else:
+                    print(detail, file=sys.stderr)
 
 
 def structure_ocr_text(text: str, api_key: str, model: str,
-                       gate: RateGate | None = None) -> OcrLineReferences:
+                       gate: RateGate | None = None, before_request=None) -> OcrLineReferences:
     """Ask Gemini for source line locations only; assemble recipe text locally."""
     client = google_client(api_key)
     for attempt in range(5):
         try:
             if gate is not None:
                 gate.wait_turn()
+            if before_request is not None:
+                request_text = OCR_STRUCTURE_PROMPT + numbered_lines(text)
+                before_request(model, max(1, (len(request_text) + 3) // 4))
             response = client.models.generate_content(
                 model=model,
                 contents=[OCR_STRUCTURE_PROMPT, numbered_lines(text)],
@@ -316,6 +446,9 @@ def structure_ocr_text(text: str, api_key: str, model: str,
             return OcrLineReferences.model_validate_json(response.text)
         except Exception as exc:
             text_lower = str(exc).lower()
+            if before_request is not None and any(
+                    term in text_lower for term in ("429", "resource_exhausted", "quota", "rate limit")):
+                raise
             transient = any(term in text_lower for term in (
                 "429", "resource_exhausted", "rate limit", "503", "502", "504",
                 "unavailable", "deadline exceeded", "timeout",
@@ -327,6 +460,8 @@ def structure_ocr_text(text: str, api_key: str, model: str,
 
 
 def import_mealie(recipe: RecipeCandidate, mealie_url: str, token: str) -> str:
+    from runtime_safety import require_live_services
+    require_live_services()
     url = mealie_url.rstrip("/") + "/api/recipes/create/html-or-json"
     response = requests.post(url, json={"data": json.dumps(schema_recipe(recipe), ensure_ascii=False), "includeTags": False, "includeCategories": False}, headers={"Authorization": f"Bearer {token}", "Accept": "application/json"}, timeout=(10, 100))
     if response.status_code != 201:
@@ -341,7 +476,12 @@ def import_mealie(recipe: RecipeCandidate, mealie_url: str, token: str) -> str:
 
 
 def _quality_issue(batch: ExtractionBatch) -> bool:
-    return not batch.recipes or any(finding.kind in {"unreadable", "cropped", "ambiguous", "not_extracted"} for candidate in batch.recipes for finding in candidate.missing_information)
+    from recipe_validation import validate_recipe
+
+    return (not batch.recipes
+            or any(finding.kind in {"unreadable", "cropped", "ambiguous", "not_extracted"}
+                   for candidate in batch.recipes for finding in candidate.missing_information)
+            or any(validate_recipe(candidate) for candidate in batch.recipes))
 
 
 def _load_cache(path: Path) -> ExtractionBatch:
@@ -640,7 +780,7 @@ def select_sources(files: list[tuple[Path, str]], state: StateStore, cache_dir: 
     return eligible[:limit] if limit else eligible
 
 
-def process_file(path: Path, digest: str, config: dict, gate: RateGate | None, state: StateStore, cache_dir: Path, extract_only: bool, retry_incomplete: bool = False, force_extract: bool = False, review_store: ReviewStore | None = None, router: ModelRouter | None = None, batch_tag: str = "", mealie_client=None) -> list[dict]:
+def process_file(path: Path, digest: str, config: dict, gate: RateGate | None, state: StateStore, cache_dir: Path, extract_only: bool, retry_incomplete: bool = False, force_extract: bool = False, review_store: ReviewStore | None = None, router: ModelRouter | None = None, batch_tag: str = "", mealie_client=None, legacy_auto_import: bool = True, approved_only: bool = False, repair_failed_tags: bool = True) -> list[dict]:
     report_fields: dict = {}
 
     def record(status: str, title: str = "", slug: str = "", note: str = "", **extra) -> dict:
@@ -724,27 +864,58 @@ def process_file(path: Path, digest: str, config: dict, gate: RateGate | None, s
     if not batch.recipes:
         return [record("NO_RECIPE", note="; ".join(batch.general_warnings), model=selected_model, route_reason=route_reason)]
     reviews = review_store or ReviewStore(cache_dir.parent / "review_events.jsonl")
+    legacy_drafts = DraftStore(cache_dir.parent / "ui_drafts.jsonl").all_latest()
+    extraction_id = extraction_identity(digest, batch.model_dump(mode="json"))
+    registrations = reviews.register_candidates(str(path), digest, extraction_id, batch.recipes)
+    title_counts = {}
+    for item in batch.recipes:
+        title_counts[_norm(item.name)] = title_counts.get(_norm(item.name), 0) + 1
     results: list[dict] = []
-    for index, candidate in enumerate(batch.recipes):
-        identity = candidate_identity(digest, candidate)
+    for index, (candidate, registration) in enumerate(zip(batch.recipes, registrations)):
+        identity = registration["candidate_id"]
+        state.refresh()
+        if reviews.identity_link_status(identity, digest, extraction_id) != "registered":
+            results.append(record("NEEDS_REVIEW", candidate.name,
+                                  note="Indistinguishable recipe candidates require explicit reconciliation.",
+                                  model=selected_model, route_reason=route_reason, candidate_id=identity))
+            continue
         try:
-            previous = state.find_candidate(digest, index, candidate)
+            previous = state.find_candidate(
+                digest, index, candidate,
+                (identity, *tuple(registration.get("legacy_aliases", ()))),
+                allow_legacy_title_match=title_counts[_norm(candidate.name)] == 1,
+            )
         except AmbiguousCandidate as exc:
             reviews.add_candidate(str(path), identity, candidate)
             results.append(record("NEEDS_REVIEW", candidate.name, note=str(exc), model=selected_model, route_reason=route_reason, candidate_id=identity))
             continue
-        decisions = reviews.decisions_for(identity)
-        if decisions:
-            candidate = apply_review_decision(candidate, decisions)
-            approved_fields = {item.field_path for item in candidate.suggestions
-                               if item.review_status in {"approved", "edited"}}
-            candidate.missing_information = [item for item in candidate.missing_information
-                                             if item.field_path not in approved_fields]
-        candidate = apply_candidate_decision(candidate, reviews.candidate_decision(identity))
+        legacy_draft = next((legacy_drafts[key] for key in
+                             (identity, *tuple(registration.get("legacy_aliases", ())))
+                             if key in legacy_drafts
+                             and legacy_drafts[key].source_hash in {"", digest}), None)
+        from review_service import project_legacy_review
+        legacy_review = project_legacy_review(
+            candidate, reviews.decisions_for(identity), reviews.candidate_decision(identity), legacy_draft,
+        )
+        candidate = legacy_review.recipe
+        effective = reviews.project(identity, digest, extraction_id, candidate, legacy_draft)
+        modern_revision = effective.revision > 0
+        if modern_revision:
+            candidate = RecipeCandidate.model_validate(effective.recipe)
         warnings = "; ".join(batch.general_warnings + candidate.warnings)
-        if previous and previous.get("status") == "IMPORTED" and batch_tag \
+        if (extract_only and previous and previous.get("status") == "IMPORTED"
+                and previous.get("tag_status") == "failed"
+                and (previous.get("tag_name") or previous.get("batch_tag")) == batch_tag):
+            results.append(record(
+                "ALREADY_DONE", candidate.name, previous.get("slug", ""),
+                "Extraction-only mode left the pending Mealie tag repair untouched.",
+                model=selected_model, route_reason=route_reason, candidate_id=identity,
+            ))
+            continue
+        if (not extract_only and repair_failed_tags and previous
+                and previous.get("status") == "IMPORTED" and batch_tag \
                 and previous.get("tag_status") == "failed" \
-                and previous.get("tag_name") == batch_tag:
+                and (previous.get("tag_name") or previous.get("batch_tag")) == batch_tag):
             try:
                 tag = mealie_client.ensure_tag(batch_tag)
                 tag_status = mealie_client.add_tag(previous.get("slug", ""), tag)
@@ -763,6 +934,16 @@ def process_file(path: Path, digest: str, config: dict, gate: RateGate | None, s
         if previous and previous.get("status") in {"IMPORTED", "UNCERTAIN"}:
             results.append(record("ALREADY_DONE" if previous["status"] == "IMPORTED" else "NEEDS_MANUAL_CHECK", candidate.name, previous.get("slug", ""), warnings, model=selected_model, route_reason=route_reason, candidate_id=identity))
             continue
+        if modern_revision and not effective.import_ready:
+            results.append(record("NEEDS_REVIEW", candidate.name,
+                                  note="The current review revision does not have an exact matching approval.",
+                                  model=selected_model, route_reason=route_reason, candidate_id=identity))
+            continue
+        if approved_only and not modern_revision:
+            results.append(record("NEEDS_REVIEW", candidate.name,
+                                  note="Import requires an explicitly approved saved review revision.",
+                                  model=selected_model, route_reason=route_reason, candidate_id=identity))
+            continue
         if candidate.missing_information or candidate.suggestions:
             reviews.add_candidate(str(path), identity, candidate)
         if not is_complete(candidate):
@@ -774,33 +955,31 @@ def process_file(path: Path, digest: str, config: dict, gate: RateGate | None, s
         if extract_only:
             results.append(record("EXTRACTED_ONLY", candidate.name, note=warnings, model=selected_model, route_reason=route_reason, candidate_id=identity))
             continue
-        try:
-            slug = import_mealie(candidate, config["mealie_url"], config["mealie_token"])
-            tag_status = ""
-            if batch_tag:
-                try:
-                    if mealie_client is None:
-                        raise RuntimeError("Batch tag requested but no Mealie tag client is configured")
-                    tag_status = mealie_client.add_tag(slug, mealie_client.ensure_tag(batch_tag))
-                except Exception as tag_exc:
-                    state.add(identity, "IMPORTED", slug, str(path), candidate.name, identity=identity,
-                              model=selected_model, route_reason=route_reason, tag_status="failed", tag_name=batch_tag,
-                              tag_note=str(tag_exc))
-                    results.append(record("TAG_FAILED", candidate.name, slug, str(tag_exc),
-                                          model=selected_model, route_reason=route_reason, candidate_id=identity))
-                    continue
-            state.add(identity, "IMPORTED", slug, str(path), candidate.name, identity=identity,
-                      model=selected_model, route_reason=route_reason, tag_status=tag_status)
-            results.append(record("IMPORTED", candidate.name, slug, warnings,
+        if not legacy_auto_import and not approved_only:
+            results.append(record("EXTRACTED_ONLY", candidate.name,
+                                  note="No import was authorized; use --legacy-auto-import or approve a revision and use --import-approved.",
                                   model=selected_model, route_reason=route_reason, candidate_id=identity))
+            continue
+        try:
+            from ui_import_service import ImportService
+            importer = ImportService(cache_dir.parent, review_path=reviews.path, state_path=state.path)
+            outcome = importer.dispatch_cli_candidate(
+                identity, candidate, path, digest, extraction_id,
+                lambda approved: import_mealie(approved, config["mealie_url"], config["mealie_token"]),
+                batch_tag=batch_tag, tag_client=mealie_client,
+            )
+            state.refresh()
+            creation = outcome.get("status", "uncertain")
+            status = ("TAG_FAILED" if creation == "created" and outcome.get("tag_status") in {"failed", "unknown"}
+                      else {"created": "IMPORTED", "already_done": "ALREADY_DONE", "imported": "ALREADY_DONE",
+                            "rejected": "IMPORT_FAILED", "not_sent": "NEEDS_REVIEW"}.get(creation, "NEEDS_MANUAL_CHECK"))
+            results.append(record(status, candidate.name, outcome.get("slug", ""),
+                                  outcome.get("reason") or warnings, model=selected_model,
+                                  route_reason=route_reason, candidate_id=identity))
         except Exception as exc:
-            error = str(exc)
-            definite_reject = any(f"HTTP {code}:" in error for code in (400, 401, 403, 404, 409, 413, 415, 422, 429))
-            if definite_reject:
-                results.append(record("IMPORT_FAILED", candidate.name, note=error, model=selected_model, route_reason=route_reason, candidate_id=identity))
-            else:
-                state.add(identity, "UNCERTAIN", "", str(path), candidate.name, identity=identity, model=selected_model, route_reason=route_reason)
-                results.append(record("NEEDS_MANUAL_CHECK", candidate.name, note=f"Import outcome unclear; inspect Mealie before retrying: {error}", model=selected_model, route_reason=route_reason, candidate_id=identity))
+            results.append(record("NEEDS_MANUAL_CHECK", candidate.name,
+                                  note="Import was stopped safely; inspect local intent history before retrying: " + _redact_error(exc, config),
+                                  model=selected_model, route_reason=route_reason, candidate_id=identity))
     return results
 
 
@@ -1154,12 +1333,57 @@ def preflight_mealie(mealie_url: str, token: str) -> None:
         raise RuntimeError(f"Mealie preflight failed at {url}: {exc}") from exc
 
 
+def repair_import_tags(work: Path, batch_tag: str, client) -> list[dict]:
+    """Repair only imported identities for one explicitly selected batch tag."""
+    from ui_import_service import ImportService
+
+    tag = str(batch_tag or "").strip()
+    if not tag:
+        raise ValueError("--repair-failed-tags requires --batch-tag")
+    state = StateStore(Path(work) / "import_state.jsonl")
+    recoverable = {}
+    for key, record in state.records.items():
+        identity = str(record.get("identity") or record.get("key") or key).strip()
+        existing_tag = str(record.get("batch_tag") or record.get("tag_name") or "").strip()
+        status = str(record.get("tag_status", "")).casefold()
+        slug = str(record.get("slug", "")).strip()
+        if (identity and slug and str(record.get("status", "")).upper() == "IMPORTED"
+                and existing_tag == tag and status in {"pending", "failed", "unknown"}):
+            recoverable[identity] = record
+    service = ImportService(Path(work), client=client)
+    for record in service.history():
+        identity = str(record.get("candidate_id", "")).strip()
+        if (identity and str(record.get("batch_tag", "")).strip() == tag
+                and str(record.get("tag_status", "")).casefold() in {"pending", "failed", "unknown"}
+                and record.get("slug")):
+            recoverable.setdefault(identity, record)
+    rows = []
+    for identity, record in recoverable.items():
+        result = service.repair_tag(identity, expected_tag=tag)
+        rows.append({
+            "candidate_id": identity,
+            "title": str(record.get("title", "")),
+            "slug": str(result.get("slug") or record.get("slug", "")),
+            "tag_status": str(result.get("tag_status", result.get("creation_status", "failed"))),
+            "note": str(result.get("tag_reason") or result.get("reason", ""))[:500],
+        })
+    return rows
+
+
 def main() -> int:
     load_dotenv()
     parser = argparse.ArgumentParser(description="Batch import PDF/JPG recipes into Mealie")
     parser.add_argument("--source", default=os.getenv("RECIPE_DIR", "recipes"))
+    parser.add_argument("--output-dir", help="Select the local application library (overrides RECIPE_IMPORTER_OUTPUT_DIR)")
     parser.add_argument("--limit", type=int, default=0)
     parser.add_argument("--extract-only", action="store_true")
+    import_modes = parser.add_mutually_exclusive_group()
+    import_modes.add_argument("--legacy-auto-import", action="store_true",
+                              help="Explicitly allow legacy imports without saved review approval")
+    import_modes.add_argument("--import-approved", action="store_true",
+                              help="Import only exact revisions with current explicit review approval")
+    parser.add_argument("--repair-failed-tags", "--repair-tags", dest="repair_failed_tags", action="store_true",
+                        help="Explicitly repair pending, failed, or unknown tags for prior imports of --batch-tag")
     parser.add_argument("--ocr-only", action="store_true",
                         help="Use local OCR only; do not initialize Gemini or connect to Mealie")
     parser.add_argument("--ocr-structure", action="store_true",
@@ -1178,13 +1402,35 @@ def main() -> int:
     parser.add_argument("--review-suggestion")
     parser.add_argument("--review-status", choices=["pending", "approved", "edited", "rejected"])
     parser.add_argument("--review-value")
+    parser.add_argument("--candidate-ids",
+                        help="Comma-separated exact candidate IDs to scope --import-approved")
     args = parser.parse_args()
     api_key = os.getenv("GEMINI_API_KEY", "").strip()
     token = os.getenv("MEALIE_TOKEN", "").strip()
     url = os.getenv("MEALIE_URL", "").strip()
     model = os.getenv("GEMINI_MODEL", "").strip()
-    work = Path(__file__).resolve().parent / "output"
-    work.mkdir(exist_ok=True)
+    try:
+        work = resolve_library_path(args.output_dir, app_root=Path(__file__).resolve().parent)
+    except LibraryPathConflict as exc:
+        parser.error(str(exc))
+    work.mkdir(parents=True, exist_ok=True)
+    print(f"Application library: {work}")
+    alternate_library = alternate_cwd_library(work)
+    if alternate_library:
+        print(f"Another populated launch-directory library exists at {alternate_library}. "
+              "Set --output-dir or RECIPE_IMPORTER_OUTPUT_DIR to select it; no libraries were moved or merged.",
+              file=sys.stderr)
+    if args.extract_only and (args.legacy_auto_import or args.import_approved or args.repair_failed_tags):
+        parser.error("--extract-only cannot be combined with import or tag-repair authorization flags")
+    if args.repair_failed_tags and (args.legacy_auto_import or args.import_approved):
+        parser.error("--repair-failed-tags is a separate operation; do not combine it with recipe import modes")
+    if args.repair_failed_tags and not args.batch_tag:
+        parser.error("--repair-failed-tags requires --batch-tag")
+    if args.repair_failed_tags and (args.review_id or args.review_suggestion or args.review_status
+                                    or args.review_value or args.backfill_tag or args.backfill_slugs):
+        parser.error("--repair-failed-tags cannot be combined with review or backfill operations")
+    if args.candidate_ids and not args.import_approved:
+        parser.error("--candidate-ids is only valid with --import-approved")
     if args.ocr_only and args.ocr_structure:
         parser.error("--ocr-only and --ocr-structure are mutually exclusive")
     if args.ocr_only:
@@ -1244,15 +1490,125 @@ def main() -> int:
         return _run_ocr_structure(
             source, work, config, router, limit=args.limit, workers=args.workers,
             force_extract=args.force_extract)
+    if args.repair_failed_tags:
+        if not token or not url:
+            parser.error("--repair-failed-tags requires MEALIE_TOKEN and MEALIE_URL")
+        try:
+            preflight_mealie(url, token)
+            client = MealieClient(url, token)
+            rows = repair_import_tags(work, args.batch_tag, client)
+        except (OSError, RuntimeError, ValueError) as exc:
+            parser.error(f"Tag repair could not start: {exc}")
+        if not rows:
+            print(f"No eligible imported recipes have a recoverable tag for {args.batch_tag!r}.", file=sys.stderr)
+            return 1
+        report = work / "last_run_report.csv"
+        fields = ["candidate_id", "title", "slug", "tag_status", "note"]
+        with report.open("w", encoding="utf-8-sig", newline="") as fh:
+            writer = csv.DictWriter(fh, fieldnames=fields, extrasaction="ignore")
+            writer.writeheader()
+            writer.writerows(rows)
+        counts: dict[str, int] = {}
+        for row in rows:
+            counts[row["tag_status"]] = counts.get(row["tag_status"], 0) + 1
+        print("Tag repair summary:", counts)
+        print(f"Report: {report}")
+        return 1 if any(row["tag_status"] not in {"tagged", "already_tagged"} for row in rows) else 0
     if args.review_id:
         if not args.review_status:
             parser.error("--review-id requires --review-status")
         reviews = ReviewStore(work / "review_events.jsonl")
-        event = reviews.candidates.get(args.review_id)
-        if not event:
+        candidate_id = reviews.canonical_candidate_id(args.review_id)
+        registrations = reviews.registrations.get(candidate_id, [])
+        registration = registrations[-1] if registrations else None
+        event = reviews.candidates.get(args.review_id) or reviews.candidates.get(candidate_id)
+        if not registration and not event:
             parser.error(f"Review candidate not found: {args.review_id}")
         try:
-            if args.review_suggestion:
+            if registration:
+                extraction_id = registration["extraction_id"]
+                source_hash = registration["source_hash"]
+                if args.review_status in {"approved", "edited"}:
+                    source_path = Path(str(registration.get("source", "")))
+                    if (not source_path.is_file()
+                            or file_digest(source_path) != source_hash):
+                        parser.error("New approval requires the original source scan to be available and hash-matching.")
+                revisions = [item for item in reviews.revisions.get(candidate_id, [])
+                             if item.get("extraction_id") == extraction_id]
+                current_revision = max((int(item["revision"]) for item in revisions), default=0)
+                candidate = RecipeCandidate.model_validate(
+                    max(revisions, key=lambda item: int(item["revision"]))["recipe"]
+                    if revisions else registration["candidate"]
+                )
+                row_bindings = (max(revisions, key=lambda item: int(item["revision"]))["target_bindings"]
+                                if revisions else [
+                                    {"target_id": item["target_id"], "field": item["field"],
+                                     "position": item["original_position"]}
+                                    for item in registration["target_bindings"]
+                                    if item.get("target_kind") == "row"
+                                ])
+                if args.review_suggestion:
+                    issue = next((item for item in registration["target_bindings"]
+                                  if item.get("issue_id") == args.review_suggestion), None)
+                    if not issue:
+                        parser.error(f"Review issue not found: {args.review_suggestion}")
+                    if current_revision == 0:
+                        snapshot = candidate.model_dump(mode="json")
+                        operation_id = "cli-save:" + hashlib.sha256(json.dumps(
+                            [candidate_id, extraction_id, snapshot], ensure_ascii=False,
+                            sort_keys=True, separators=(",", ":")
+                        ).encode("utf-8")).hexdigest()
+                        saved = reviews.save_revision(
+                            candidate_id=candidate_id, source_hash=source_hash,
+                            extraction_id=extraction_id, expected_parent=0,
+                            operation_id=operation_id, recipe=snapshot,
+                            target_bindings=row_bindings,
+                        )
+                        current_revision = int(saved["revision"])
+                    disposition = {"approved": "accepted", "edited": "edited",
+                                   "rejected": "rejected", "pending": "deferred"}[args.review_status]
+                    digest = hashlib.sha256(
+                        (disposition + str(args.review_value or "")).encode("utf-8")
+                    ).hexdigest()[:20]
+                    reviews.resolve_issue(
+                        candidate_id=candidate_id, source_hash=source_hash,
+                        extraction_id=extraction_id, revision=current_revision,
+                        issue_id=issue["issue_id"], target_id=issue["target_id"],
+                        disposition=disposition,
+                        final_value=args.review_value if disposition in {"edited", "accepted"} else None,
+                        operation_id=f"cli-issue:{candidate_id}:{extraction_id}:{current_revision}:{issue['issue_id']}:{digest}",
+                    )
+                    message = f"Recorded {args.review_status} decision for {args.review_suggestion}."
+                elif args.review_status in {"approved", "edited"}:
+                    if args.review_status == "edited":
+                        candidate = apply_candidate_decision(
+                            candidate, ReviewDecision("", "edited", args.review_value))
+                    if args.review_status == "edited" or current_revision == 0:
+                        snapshot = candidate.model_dump(mode="json")
+                        operation_material = json.dumps(snapshot, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+                        operation_id = "cli-save:" + hashlib.sha256(
+                            f"{candidate_id}:{extraction_id}:{current_revision}:{operation_material}".encode("utf-8")
+                        ).hexdigest()
+                        saved = reviews.save_revision(
+                            candidate_id=candidate_id, source_hash=source_hash,
+                            extraction_id=extraction_id, expected_parent=current_revision,
+                            operation_id=operation_id, recipe=snapshot,
+                            target_bindings=row_bindings,
+                        )
+                        current_revision = int(saved["revision"])
+                    reviews.approve_revision(
+                        candidate_id=candidate_id, source_hash=source_hash,
+                        extraction_id=extraction_id, revision=current_revision,
+                        operation_id=f"cli-approve:{candidate_id}:{extraction_id}:{current_revision}",
+                        source_path=str(registration.get("source", "")),
+                    )
+                    message = f"Approved exact revision {current_revision} for candidate {candidate_id}."
+                else:
+                    reviews.record_candidate_decision(
+                        str(registration.get("source", "")), candidate_id,
+                        args.review_status, args.review_value)
+                    message = f"Recorded {args.review_status} decision for candidate {candidate_id}."
+            elif args.review_suggestion:
                 candidate = RecipeCandidate.model_validate(event["candidate"])
                 reviews.record(event["source"], args.review_id, candidate,
                                args.review_suggestion, args.review_status,
@@ -1263,7 +1619,7 @@ def main() -> int:
                     event["source"], args.review_id, args.review_status,
                     args.review_value)
                 message = f"Recorded {args.review_status} decision for candidate {args.review_id}."
-        except ValueError as exc:
+        except (ValueError, ReviewConflict) as exc:
             parser.error(str(exc))
         reviews.write_csv(work / "needs_review.csv")
         print(message)
@@ -1279,8 +1635,96 @@ def main() -> int:
         )
         print("Tag backfill:", result)
         return 1 if any(value == "failed" for value in result.values()) else 0
+    if args.import_approved:
+        candidate_ids = list(dict.fromkeys(
+            item.strip() for item in str(args.candidate_ids or "").split(",") if item.strip()
+        ))
+        if not candidate_ids:
+            parser.error("--import-approved requires explicit --candidate-ids")
+        if args.limit < 0:
+            parser.error("--limit must be >= 0")
+        if args.limit:
+            candidate_ids = candidate_ids[:args.limit]
+        if not token or not url:
+            parser.error("--import-approved requires MEALIE_TOKEN and MEALIE_URL")
+        try:
+            preflight_mealie(url, token)
+            source_root = Path(args.source).expanduser()
+            service = __import__("ui_import_service").ImportService(
+                work, source_root=source_root if source_root.is_dir() else None,
+                client=MealieClient(url, token),
+            )
+            history_by_id = {str(item.get("candidate_id", "")): item for item in service.history()}
+            plan = service.preview(candidate_ids, args.batch_tag)
+            eligible = plan["eligible"]
+            if not eligible:
+                print("No selected candidate has a currently approved, import-eligible revision.", file=sys.stderr)
+            else:
+                print("Approved revisions selected:")
+                for item in eligible:
+                    print(f"{item['candidate_id']} · revision {item['revision']} · {item['title']}")
+            for item in plan.get("excluded", []):
+                print(f"Excluded {item['candidate_id']}: {item['reason']}", file=sys.stderr)
+            outcomes = service.dispatch(plan["plan_id"])
+        except (OSError, RuntimeError, ValueError) as exc:
+            parser.error(f"Approved import could not start: {exc}")
+        rows = [{
+            "candidate_id": item.get("candidate_id", ""), "title": item.get("title", ""),
+            "creation_status": item.get("creation_status", ""), "slug": item.get("slug", ""),
+            "tag_status": item.get("tag_status", ""), "note": item.get("reason", ""),
+            "outcome_status": "tag_incomplete" if item.get("creation_status") in {
+                "created", "already_created", "linked_existing",
+            } and item.get("tag_status") in {"pending", "failed", "unknown"} else
+                "created" if item.get("creation_status") == "created" else
+                "already_protected" if item.get("creation_status") in {"already_created", "protected"} else
+                str(item.get("creation_status", "uncertain")),
+        } for item in outcomes]
+        outcome_ids = {str(row["candidate_id"]) for row in rows}
+        for item in plan.get("excluded", []):
+            candidate_id = str(item.get("candidate_id", ""))
+            if candidate_id in outcome_ids:
+                continue
+            reason = str(item.get("reason", "Candidate was excluded by import eligibility checks."))
+            protected = any(word in reason.casefold() for word in ("protected", "already imported", "already created"))
+            prior = history_by_id.get(candidate_id, {})
+            prior_status = str(prior.get("creation_status", "")).casefold()
+            creation_status = ("uncertain" if prior_status == "uncertain" else
+                               "already_imported" if prior_status in {"created", "linked_existing"} else
+                               "excluded")
+            outcome_status = ("uncertain" if creation_status == "uncertain" else
+                              "already_imported" if creation_status == "already_imported" else
+                              "already_protected" if protected else
+                              "excluded")
+            rows.append({
+                "candidate_id": candidate_id, "title": str(prior.get("title", "")),
+                "creation_status": creation_status, "slug": str(prior.get("slug", "")),
+                "tag_status": str(prior.get("tag_status", "not_attempted")), "note": reason,
+                "outcome_status": outcome_status,
+            })
+        report = work / "last_run_report.csv"
+        with report.open("w", encoding="utf-8-sig", newline="") as fh:
+            writer = csv.DictWriter(fh, fieldnames=[
+                "candidate_id", "title", "creation_status", "slug", "tag_status", "note",
+                "outcome_status",
+            ], extrasaction="ignore")
+            writer.writeheader()
+            writer.writerows(rows)
+        counts: dict[str, int] = {}
+        for row in rows:
+            status = str(row["outcome_status"])
+            counts[status] = counts.get(status, 0) + 1
+        print("Approved import summary:", counts)
+        print(f"Report: {report}")
+        incomplete = {"tag_incomplete", "excluded", "already_protected", "not_sent", "uncertain", "rejected", "failed"}
+        return 1 if any(row["outcome_status"] in incomplete for row in rows) else 0
+    mode = ("extract-only" if args.extract_only else
+            "legacy-auto-import" if args.legacy_auto_import else
+            "approved-revision import" if args.import_approved else
+            "failed-tag repair" if args.repair_failed_tags else "review-only (safe default)")
+    print(f"Execution mode: {mode}")
     missing = ["GEMINI_API_KEY"] if not api_key else []
-    if not args.extract_only:
+    needs_mealie = args.legacy_auto_import or args.import_approved or args.repair_failed_tags
+    if needs_mealie:
         missing += [name for name, value in (("MEALIE_TOKEN", token), ("MEALIE_URL", url)) if not value]
     if missing:
         parser.error("Missing .env settings: " + ", ".join(missing))
@@ -1289,7 +1733,7 @@ def main() -> int:
     source = Path(args.source).expanduser()
     if not source.is_dir():
         parser.error(f"Recipe directory not found: {source}")
-    if not args.extract_only:
+    if needs_mealie:
         try:
             preflight_mealie(url, token)
             print("Mealie connection/token OK.")
@@ -1309,7 +1753,7 @@ def main() -> int:
     state = StateStore(work / "import_state.jsonl")
     reviews = ReviewStore(work / "review_events.jsonl")
     router = ModelRouter(models, UsageLedger(work / "gemini_usage.json"), global_rpm=args.rpm)
-    tag_client = MealieClient(url, token) if args.batch_tag and not args.extract_only else None
+    tag_client = MealieClient(url, token) if args.batch_tag and needs_mealie and not args.extract_only else None
     config = {"api_key": api_key, "mealie_token": token, "mealie_url": url,
               "model": models[0].id, "tesseract_cmd": os.getenv("TESSERACT_CMD", "").strip()}
     unique: list[tuple[Path, str]] = []
@@ -1335,8 +1779,11 @@ def main() -> int:
     try:
         with ThreadPoolExecutor(max_workers=args.workers) as executor:
             futures = {executor.submit(process_file, path, digest, config, None, state, cache_dir,
-                                        args.extract_only, args.retry_incomplete, args.force_extract,
-                                        reviews, router, args.batch_tag, tag_client): path
+                                        args.extract_only or not needs_mealie, args.retry_incomplete, args.force_extract,
+                                        reviews, router, args.batch_tag, tag_client,
+                                        legacy_auto_import=args.legacy_auto_import,
+                                        approved_only=args.import_approved,
+                                        repair_failed_tags=args.repair_failed_tags): path
                        for path, digest in selected}
             for future in as_completed(futures):
                 try:

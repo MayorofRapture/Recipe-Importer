@@ -1,0 +1,159 @@
+{
+  "viewport": {
+    "width": 320,
+    "height": 900,
+    "documentWidth": 320,
+    "horizontalOverflow": false
+  },
+  "uploadHierarchy": {
+    "positions": {
+      "Synthetic browser batch": 484,
+      "Select an existing batch": 586,
+      "Current extraction job": 612,
+      "Files in this batch": 688,
+      "Add PDF, JPG, PNG, or WEBP scans": 783,
+      "Extraction": 1022,
+      "Create a batch": 1251,
+      "Cookbook PDFs": 1267
+    },
+    "viewportWidth": 320,
+    "documentWidth": 320
+  },
+  "review": {
+    "viewport": {
+      "width": 320,
+      "height": 900,
+      "documentWidth": 320,
+      "scrollX": 0,
+      "scrollY": 0
+    },
+    "navigation": {
+      "buttonName": "Expand sidebar",
+      "button": {
+        "x": 18,
+        "y": 16,
+        "right": 46,
+        "bottom": 44,
+        "width": 28,
+        "height": 28
+      },
+      "reviewLink": {
+        "x": 20,
+        "y": 112,
+        "right": 268,
+        "bottom": 140,
+        "width": 248,
+        "height": 28
+      }
+    },
+    "recipeTitle": {
+      "x": 33,
+      "y": 244,
+      "right": 287,
+      "bottom": 280,
+      "width": 254,
+      "height": 36
+    },
+    "saveDraft": {
+      "box": {
+        "x": 16,
+        "y": 100,
+        "right": 136,
+        "bottom": 140,
+        "width": 120,
+        "height": 40
+      },
+      "visibleWithoutScrolling": true
+    },
+    "approve": {
+      "box": {
+        "x": 152,
+        "y": 100,
+        "right": 304,
+        "bottom": 140,
+        "width": 153,
+        "height": 40
+      },
+      "visibleWithoutScrolling": true
+    },
+    "sourceHeading": {
+      "x": 0,
+      "y": 0,
+      "right": 0,
+      "bottom": 0,
+      "width": 0,
+      "height": 0
+    }
+  },
+  "reviewKeyboardFocus": {
+    "tabSteps": 25,
+    "visible": true,
+    "focusShadow": "rgba(23, 100, 91, 0.5) 0px 0px 0px 3.2px",
+    "restoredToTitle": true
+  },
+  "importHeadings": [
+    "Import & history",
+    "Ready to import",
+    "History"
+  ],
+  "importControls": [
+    {
+      "name": "Select all eligible recipes",
+      "disabled": true,
+      "x": 16,
+      "y": 34,
+      "width": 171,
+      "height": 40
+    },
+    {
+      "name": "Recipes to import",
+      "disabled": true,
+      "x": 22,
+      "y": 124,
+      "width": 249,
+      "height": 28
+    },
+    {
+      "name": "Mealie tag (optional)",
+      "disabled": false,
+      "x": 17,
+      "y": 204,
+      "width": 286,
+      "height": 36
+    },
+    {
+      "name": "Preview import",
+      "disabled": true,
+      "x": 16,
+      "y": 258,
+      "width": 117,
+      "height": 40
+    },
+    {
+      "name": "Find in history",
+      "disabled": false,
+      "x": 34,
+      "y": 654,
+      "width": 252,
+      "height": 36
+    },
+    {
+      "name": "History page",
+      "disabled": false,
+      "x": 34,
+      "y": 738,
+      "width": 188,
+      "height": 36
+    }
+  ],
+  "screenshots": [
+    "upload-created-320x900.png",
+    "upload-partial-success-320x900.png",
+    "upload-rejected-file-error-320x900.png",
+    "upload-complete-320x900.png",
+    "review-candidate-320x900.png",
+    "review-draft-restored-320x900.png",
+    "import-preview-320x900.png",
+    "import-history-320x900.png"
+  ]
+}

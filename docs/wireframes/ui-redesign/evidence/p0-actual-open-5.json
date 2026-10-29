@@ -1,0 +1,14 @@
+{
+  "url": "http://127.0.0.1:8931/review",
+  "action": "tabs",
+  "coldStartupMs": 1963,
+  "sourceGate": {
+    "usable": true,
+    "skeletons": 0,
+    "imageWidth": 1460
+  },
+  "samples": [],
+  "summary": {
+    "count": 0
+  }
+}

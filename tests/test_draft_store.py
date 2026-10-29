@@ -6,6 +6,19 @@ from draft_store import DraftStore
 
 
 class DraftStoreTests(unittest.TestCase):
+    def test_repair_proposal_is_durable_and_preserved_by_later_recipe_drafts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "drafts.jsonl"
+            store = DraftStore(path)
+            proposal = {"base_revision": 0, "notes": ["Use jam instead."]}
+            store.save("candidate", "hash", "scan.jpg", {"name": "Cake"}, "", "", "structured", [],
+                       repair_proposal=proposal)
+            store.save("candidate", "hash", "scan.jpg", {"name": "Cake", "description": "Updated"},
+                       "", "", "structured", [])
+            restored = DraftStore(path).latest("candidate")
+
+        self.assertEqual(restored.repair_proposal, proposal)
+
     def test_drafts_survive_restart_and_increment_revisions(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "drafts.jsonl"

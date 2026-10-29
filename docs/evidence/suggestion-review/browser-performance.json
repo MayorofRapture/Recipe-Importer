@@ -1,0 +1,272 @@
+{
+    "captured_at":  "2026-10-17T15:57:00-04:00",
+    "url":  "http://127.0.0.1:8920/",
+    "browser":  "Chromium headless shell, CDP",
+    "fixture":  "synthetic local demonstration library; 500 recipes, 700 import-state rows, 521 review events, 50 UI drafts, 75 queue events; fixture mode; no Gemini or live Mealie",
+    "viewport":  "1440x1000 CSS px, device scale factor 1",
+    "raster_fit_preview_natural_width_px":  1200,
+    "counter_scope":  "durable_writes counts draft-save attempts; navigation queue/visit events and resume-cursor writes are separate",
+    "first_click_included":  true,
+    "interactions":  [
+                         {
+                             "action":  "tabs",
+                             "count":  5,
+                             "median_ms":  176,
+                             "p95_ms":  186,
+                             "worst_ms":  186,
+                             "first_sample_ms":  186,
+                             "samples":  [
+                                             {
+                                                 "action":  "Ingredients-\u003eInstructions",
+                                                 "latency_ms":  186,
+                                                 "full_page_executions":  0,
+                                                 "fragment_executions":  1,
+                                                 "catalog_loads":  0,
+                                                 "source_hashes":  0,
+                                                 "ledger_reads":  0,
+                                                 "preview_renders":  0,
+                                                 "durable_writes":  0
+                                             },
+                                             {
+                                                 "action":  "Instructions-\u003eIngredients",
+                                                 "latency_ms":  176,
+                                                 "full_page_executions":  0,
+                                                 "fragment_executions":  1,
+                                                 "catalog_loads":  0,
+                                                 "source_hashes":  0,
+                                                 "ledger_reads":  0,
+                                                 "preview_renders":  0,
+                                                 "durable_writes":  0
+                                             },
+                                             {
+                                                 "action":  "Ingredients-\u003eInstructions",
+                                                 "latency_ms":  174,
+                                                 "full_page_executions":  0,
+                                                 "fragment_executions":  1,
+                                                 "catalog_loads":  0,
+                                                 "source_hashes":  0,
+                                                 "ledger_reads":  0,
+                                                 "preview_renders":  0,
+                                                 "durable_writes":  0
+                                             },
+                                             {
+                                                 "action":  "Instructions-\u003eIngredients",
+                                                 "latency_ms":  181,
+                                                 "full_page_executions":  0,
+                                                 "fragment_executions":  1,
+                                                 "catalog_loads":  0,
+                                                 "source_hashes":  0,
+                                                 "ledger_reads":  0,
+                                                 "preview_renders":  0,
+                                                 "durable_writes":  0
+                                             },
+                                             {
+                                                 "action":  "Ingredients-\u003eInstructions",
+                                                 "latency_ms":  161,
+                                                 "full_page_executions":  0,
+                                                 "fragment_executions":  1,
+                                                 "catalog_loads":  0,
+                                                 "source_hashes":  0,
+                                                 "ledger_reads":  0,
+                                                 "preview_renders":  0,
+                                                 "durable_writes":  0
+                                             }
+                                         ]
+                         },
+                         {
+                             "action":  "bulk",
+                             "count":  5,
+                             "median_ms":  175,
+                             "p95_ms":  206,
+                             "worst_ms":  206,
+                             "first_sample_ms":  206,
+                             "samples":  [
+                                             {
+                                                 "action":  "open bulk instructions",
+                                                 "latency_ms":  206,
+                                                 "full_page_executions":  0,
+                                                 "fragment_executions":  2,
+                                                 "catalog_loads":  0,
+                                                 "source_hashes":  0,
+                                                 "ledger_reads":  0,
+                                                 "preview_renders":  0,
+                                                 "durable_writes":  0
+                                             },
+                                             {
+                                                 "action":  "open bulk instructions",
+                                                 "latency_ms":  189,
+                                                 "full_page_executions":  0,
+                                                 "fragment_executions":  2,
+                                                 "catalog_loads":  0,
+                                                 "source_hashes":  0,
+                                                 "ledger_reads":  0,
+                                                 "preview_renders":  0,
+                                                 "durable_writes":  0
+                                             },
+                                             {
+                                                 "action":  "open bulk instructions",
+                                                 "latency_ms":  175,
+                                                 "full_page_executions":  0,
+                                                 "fragment_executions":  2,
+                                                 "catalog_loads":  0,
+                                                 "source_hashes":  0,
+                                                 "ledger_reads":  0,
+                                                 "preview_renders":  0,
+                                                 "durable_writes":  0
+                                             },
+                                             {
+                                                 "action":  "open bulk instructions",
+                                                 "latency_ms":  167,
+                                                 "full_page_executions":  0,
+                                                 "fragment_executions":  2,
+                                                 "catalog_loads":  0,
+                                                 "source_hashes":  0,
+                                                 "ledger_reads":  0,
+                                                 "preview_renders":  0,
+                                                 "durable_writes":  0
+                                             },
+                                             {
+                                                 "action":  "open bulk instructions",
+                                                 "latency_ms":  175,
+                                                 "full_page_executions":  0,
+                                                 "fragment_executions":  2,
+                                                 "catalog_loads":  0,
+                                                 "source_hashes":  0,
+                                                 "ledger_reads":  0,
+                                                 "preview_renders":  0,
+                                                 "durable_writes":  0
+                                             }
+                                         ]
+                         },
+                         {
+                             "action":  "skip",
+                             "count":  5,
+                             "median_ms":  585,
+                             "p95_ms":  1205,
+                             "worst_ms":  1205,
+                             "first_sample_ms":  1205,
+                             "samples":  [
+                                             {
+                                                 "action":  "navigate next",
+                                                 "latency_ms":  1205,
+                                                 "full_page_executions":  1,
+                                                 "fragment_executions":  1,
+                                                 "catalog_loads":  1,
+                                                 "source_hashes":  1,
+                                                 "ledger_reads":  4,
+                                                 "preview_renders":  1,
+                                                 "durable_writes":  0
+                                             },
+                                             {
+                                                 "action":  "navigate next",
+                                                 "latency_ms":  545,
+                                                 "full_page_executions":  1,
+                                                 "fragment_executions":  1,
+                                                 "catalog_loads":  1,
+                                                 "source_hashes":  1,
+                                                 "ledger_reads":  4,
+                                                 "preview_renders":  1,
+                                                 "durable_writes":  0
+                                             },
+                                             {
+                                                 "action":  "navigate next",
+                                                 "latency_ms":  597,
+                                                 "full_page_executions":  1,
+                                                 "fragment_executions":  1,
+                                                 "catalog_loads":  1,
+                                                 "source_hashes":  1,
+                                                 "ledger_reads":  4,
+                                                 "preview_renders":  1,
+                                                 "durable_writes":  0
+                                             },
+                                             {
+                                                 "action":  "navigate next",
+                                                 "latency_ms":  585,
+                                                 "full_page_executions":  1,
+                                                 "fragment_executions":  1,
+                                                 "catalog_loads":  1,
+                                                 "source_hashes":  1,
+                                                 "ledger_reads":  4,
+                                                 "preview_renders":  1,
+                                                 "durable_writes":  0
+                                             },
+                                             {
+                                                 "action":  "navigate next",
+                                                 "latency_ms":  582,
+                                                 "full_page_executions":  1,
+                                                 "fragment_executions":  1,
+                                                 "catalog_loads":  1,
+                                                 "source_hashes":  1,
+                                                 "ledger_reads":  4,
+                                                 "preview_renders":  1,
+                                                 "durable_writes":  0
+                                             }
+                                         ]
+                         },
+                         {
+                             "action":  "back",
+                             "count":  5,
+                             "median_ms":  539,
+                             "p95_ms":  1143,
+                             "worst_ms":  1143,
+                             "first_sample_ms":  532,
+                             "samples":  [
+                                             {
+                                                 "action":  "navigate previous",
+                                                 "latency_ms":  532,
+                                                 "full_page_executions":  1,
+                                                 "fragment_executions":  1,
+                                                 "catalog_loads":  1,
+                                                 "source_hashes":  1,
+                                                 "ledger_reads":  4,
+                                                 "preview_renders":  1,
+                                                 "durable_writes":  0
+                                             },
+                                             {
+                                                 "action":  "navigate previous",
+                                                 "latency_ms":  559,
+                                                 "full_page_executions":  1,
+                                                 "fragment_executions":  1,
+                                                 "catalog_loads":  1,
+                                                 "source_hashes":  1,
+                                                 "ledger_reads":  4,
+                                                 "preview_renders":  1,
+                                                 "durable_writes":  0
+                                             },
+                                             {
+                                                 "action":  "navigate previous",
+                                                 "latency_ms":  517,
+                                                 "full_page_executions":  1,
+                                                 "fragment_executions":  1,
+                                                 "catalog_loads":  1,
+                                                 "source_hashes":  1,
+                                                 "ledger_reads":  4,
+                                                 "preview_renders":  1,
+                                                 "durable_writes":  0
+                                             },
+                                             {
+                                                 "action":  "navigate previous",
+                                                 "latency_ms":  539,
+                                                 "full_page_executions":  1,
+                                                 "fragment_executions":  1,
+                                                 "catalog_loads":  1,
+                                                 "source_hashes":  1,
+                                                 "ledger_reads":  4,
+                                                 "preview_renders":  1,
+                                                 "durable_writes":  0
+                                             },
+                                             {
+                                                 "action":  "navigate previous",
+                                                 "latency_ms":  1143,
+                                                 "full_page_executions":  1,
+                                                 "fragment_executions":  1,
+                                                 "catalog_loads":  1,
+                                                 "source_hashes":  1,
+                                                 "ledger_reads":  4,
+                                                 "preview_renders":  1,
+                                                 "durable_writes":  0
+                                             }
+                                         ]
+                         }
+                     ]
+}
