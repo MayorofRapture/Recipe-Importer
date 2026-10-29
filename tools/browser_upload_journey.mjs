@@ -122,6 +122,48 @@ async function selectReviewPane(cdp, name) {
     .find(item=>item.innerText.trim()===${JSON.stringify(name)}&&item.getAttribute('aria-checked')==='true')`,
     `${name} Review pane`);
 }
+async function createAdditionalBatch(cdp, name) {
+  const opened = await evaluate(cdp, `(() => {
+    const details=[...document.querySelectorAll('details')].find(item=>item.querySelector('summary')?.innerText.includes('Create a batch'));
+    if(!details)return false;
+    if(!details.open)details.querySelector('summary').click();
+    return details.open;
+  })()`);
+  if (!opened) throw new Error('Could not open the returning-user batch form.');
+  await waitFor(cdp, `!!document.querySelector('input[aria-label="Batch name"]')?.getClientRects().length`, 'new-batch form');
+  await fillByLabel(cdp, 'Batch name', name);
+  const submitted = await evaluate(cdp, `(() => {
+    const button=[...document.querySelectorAll('button')].find(item=>item.innerText.includes('Create batch')&&item.getClientRects().length);
+    if(!button||button.disabled)return false;
+    button.click();
+    return true;
+  })()`);
+  if (!submitted) throw new Error(`Could not submit the form for ${name}.`);
+  await waitFor(cdp, `document.body.innerText.includes(${JSON.stringify(`Created ${name}. Add scans below.`)})`,
+    `creation result for ${name}`);
+  await waitFor(cdp, `([...document.querySelectorAll('h1,h2,h3,h4')].some(e=>e.innerText.trim()===${JSON.stringify(name)}))`,
+    `newly selected batch ${name}`);
+}
+async function selectBatch(cdp, name) {
+  await clickText(cdp, 'Select an existing batch', '[role="combobox"]');
+  await waitFor(cdp, `!![...document.querySelectorAll('[role="option"]')].find(e=>e.innerText.trim()===${JSON.stringify(name)})`,
+    `batch option ${name}`);
+  await clickText(cdp, name, '[role="option"]');
+  await waitFor(cdp, `([...document.querySelectorAll('h1,h2,h3,h4')].some(e=>e.innerText.trim()===${JSON.stringify(name)}))`,
+    `selected batch ${name}`);
+}
+async function navigate(cdp, name) {
+  const visible = await evaluate(cdp, `!![...document.querySelectorAll('a')].find(e=>e.innerText.includes(${JSON.stringify(name)})&&e.getClientRects().length&&e.getBoundingClientRect().right>0)`);
+  if (!visible) {
+    await clickText(cdp, 'Expand sidebar', 'button');
+    await waitFor(cdp, `!![...document.querySelectorAll('a')].find(e=>e.innerText.includes(${JSON.stringify(name)})&&e.getBoundingClientRect().right>0)`,
+      `${name} navigation link`);
+  }
+  await clickText(cdp, name, 'a,button,[role="tab"],[role="button"]');
+  if (viewport[0] <= 480) {
+    await waitFor(cdp, `!document.querySelector('button[aria-label="Collapse sidebar"]')`, 'narrow navigation closed');
+  }
+}
 async function screenshot(cdp, name) {
   const replacedName = name.replace(/\d+x\d+/, `${viewport[0]}x${viewport[1]}`);
   await evaluate(cdp, `(() => {
@@ -217,6 +259,26 @@ try {
   await clickText(cdp, 'Start extraction');
   await waitFor(cdp, `/Extraction is complete/.test(document.body.innerText)`, 'synthetic background extraction');
   artifacts.push(await screenshot(cdp, 'upload-complete-1440x900.png'));
+
+  if (arg('verify-batch-resume') === 'true') {
+    await createAdditionalBatch(cdp, 'Synthetic second batch');
+    await waitFor(cdp, `/Current batch · 0 files/.test(document.body.innerText)`, 'empty second batch selection');
+    await selectBatch(cdp, 'Synthetic browser batch');
+    await waitFor(cdp, `/synthetic-recipe.png/.test(document.body.innerText)`, 'original batch file remains after switching');
+    await selectBatch(cdp, 'Synthetic second batch');
+    await navigate(cdp, 'Review');
+    await waitFor(cdp, `/Recipe review|Review recipes|Review/.test(document.body.innerText)`, 'Review after batch navigation');
+    await navigate(cdp, 'Upload');
+    await waitFor(cdp, `([...document.querySelectorAll('h1,h2,h3,h4')].some(e=>e.innerText.trim()==='Synthetic second batch'))`,
+      'second batch selection restored after navigation');
+    await selectBatch(cdp, 'Synthetic browser batch');
+    console.log(JSON.stringify({ returningBatchJourney: {
+      secondBatchCreatedAndSelected: true,
+      originalFilePreservedAfterSwitch: true,
+      selectionRestoredAfterNavigation: true,
+      batchesCreated: 2,
+    } }));
+  }
 
   if (viewport[0] <= 480) {
     await tabToControl(cdp, 'Expand sidebar');

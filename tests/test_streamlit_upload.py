@@ -27,6 +27,69 @@ def _png() -> bytes:
 
 
 class StreamlitUploadTests(unittest.TestCase):
+    def test_returning_user_can_create_batches_without_changing_existing_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "output"
+            output.mkdir()
+            (output / ".fixture-library").write_text("synthetic test library", encoding="utf-8")
+            store = BatchStore(output)
+            original = store.create("Original batch")
+            original_source = store.stage(original["batch_id"], "original.png", _png())
+            original_snapshot = store.get(original["batch_id"])
+            with patch.dict(os.environ, {
+                "RECIPE_IMPORTER_OUTPUT_DIR": str(output),
+                "RECIPE_IMPORTER_SOURCE_DIR": "",
+                "RECIPE_IMPORTER_FIXTURE_MODE": "1",
+            }):
+                app = AppTest.from_file(str(PAGE)).run(timeout=15)
+                self.assertFalse(app.exception)
+                self.assertEqual(app.selectbox[0].value, original["batch_id"])
+
+                def create_batch(name: str) -> dict:
+                    next(item for item in app.text_input if item.label == "Batch name").set_value(name)
+                    next(item for item in app.form_submit_button if item.label == "Create batch").click().run(timeout=15)
+                    self.assertFalse(app.exception)
+                    batches = store.list_batches()
+                    self.assertEqual(len(batches), len(created) + 2)
+                    selected = next(item for item in batches if item["name"] == name)
+                    self.assertEqual(next(item for item in app.selectbox
+                                           if item.label == "Select an existing batch").value,
+                                     selected["batch_id"])
+                    created.append(selected)
+                    return selected
+
+                created = []
+                second = create_batch("Second batch")
+                self.assertEqual(store.get(original["batch_id"]), original_snapshot)
+                self.assertEqual(store.get(original["batch_id"])["sources"][0]["source_id"],
+                                 original_source["source_id"])
+                third = create_batch("Third batch")
+
+                next(item for item in app.selectbox
+                     if item.label == "Select an existing batch").set_value(original["batch_id"]).run(timeout=15)
+                self.assertFalse(app.exception)
+                self.assertEqual(next(item for item in app.selectbox
+                                      if item.label == "Select an existing batch").value,
+                                 original["batch_id"])
+                self.assertTrue(any("original.png" in item.value for item in app.markdown))
+                next(item for item in app.selectbox
+                     if item.label == "Select an existing batch").set_value(second["batch_id"]).run(timeout=15)
+                self.assertFalse(app.exception)
+                self.assertEqual(next(item for item in app.selectbox
+                                      if item.label == "Select an existing batch").value,
+                                 second["batch_id"])
+                next(item for item in app.selectbox
+                     if item.label == "Select an existing batch").set_value(third["batch_id"]).run(timeout=15)
+                app.switch_page("review.py").run(timeout=15)
+                self.assertFalse(app.exception)
+                app.switch_page("upload.py").run(timeout=15)
+
+            self.assertFalse(app.exception)
+            self.assertEqual(next(item for item in app.selectbox
+                                  if item.label == "Select an existing batch").value,
+                             third["batch_id"])
+            self.assertEqual(len(store.list_batches()), 3)
+
     def test_new_user_sees_batch_creation_as_the_starting_action(self):
         with tempfile.TemporaryDirectory() as tmp:
             output = Path(tmp) / "output"

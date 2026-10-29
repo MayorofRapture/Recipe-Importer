@@ -179,7 +179,7 @@ def _render_batch_creation(store: BatchStore, *, expanded: bool) -> None:
     if create_batch:
         try:
             created = store.create(new_name, new_tag)
-            st.session_state["upload_batch_id"] = created["batch_id"]
+            st.session_state["upload_pending_batch_id"] = created["batch_id"]
             st.session_state["upload_notice"] = f"Created {created['name']}. Add scans below."
             st.rerun()
         except (OSError, ValueError, RuntimeError) as exc:
@@ -512,9 +512,11 @@ output_dir, _source_root = paths()
 store = BatchStore(output_dir)
 batches = store.list_batches()
 batch_ids = [item["batch_id"] for item in batches]
-selected_id = st.session_state.get("upload_batch_id")
+pending_selected_id = st.session_state.pop("upload_pending_batch_id", None)
+selected_id = pending_selected_id or st.session_state.get("upload_batch_id")
 if selected_id not in batch_ids:
     selected_id = batch_ids[0] if batch_ids else ""
+if st.session_state.get("upload_batch_id") != selected_id:
     st.session_state["upload_batch_id"] = selected_id
 
 notice = st.session_state.pop("upload_notice", "")
